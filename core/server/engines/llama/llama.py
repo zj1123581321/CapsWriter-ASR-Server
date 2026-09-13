@@ -398,7 +398,7 @@ def bind_llama_lib():
     llama_sampler_init_min_p.restype = ctypes.c_void_p
 
     llama_sampler_init_penalties = llama.llama_sampler_init_penalties
-    llama_sampler_init_penalties.argtypes = [ctypes.c_int32, ctypes.c_float, ctypes.c_float, ctypes.c_float]
+    llama_sampler_init_penalties.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_float, ctypes.c_float, ctypes.c_float]
     llama_sampler_init_penalties.restype = ctypes.c_void_p
 
     llama_sampler_accept = llama.llama_sampler_accept
@@ -695,7 +695,7 @@ class LlamaSampler:
         if has_penalty:
             # llama.cpp 会自动管理历史 rings
             llama_sampler_chain_add(self.ptr, llama_sampler_init_penalties(
-                penalty_last_n, repeat_penalty, frequency_penalty, presence_penalty
+                n_vocab, penalty_last_n, repeat_penalty, frequency_penalty, presence_penalty
             ))
 
         # 3. 采样过滤器 (顺序很重要)
