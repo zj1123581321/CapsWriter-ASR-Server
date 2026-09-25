@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import os
+import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -65,9 +66,12 @@ def final_result(**overrides):
 @asynccontextmanager
 async def fake_v2_server(handler, *, health=None, status=200):
     state = {"connections": 0, "frames": [], "final_received": False}
-    health_body = json.dumps(
-        health or {"protocol_version": 2, "encodings": ["flac", "ogg_opus", "f32le", "s16le"]}
-    ).encode()
+    if isinstance(health, bytes):
+        health_body = health
+    else:
+        health_body = json.dumps(
+            health or {"protocol_version": 2, "encodings": ["flac", "ogg_opus", "f32le", "s16le"]}
+        ).encode()
 
     async def process_request(connection, request):
         path = request.path if hasattr(request, "path") else connection
@@ -210,6 +214,8 @@ async def test_progress_is_received_before_upload_finishes(tmp_path, monkeypatch
 @pytest.mark.parametrize("status,health,expected_code", [
     (426, None, "server_too_old"),
     (200, {"protocol_version": 1, "encodings": ["flac"]}, "server_too_old"),
+    (200, {"protocol_version": "2", "encodings": ["flac"]}, "server_too_old"),
+    (200, b"not json", "server_too_old"),
     (200, {"protocol_version": 2, "encodings": ["f32le"]}, "unsupported_encoding"),
 ])
 async def test_health_gate_rejects_before_websocket(tmp_path, status, health, expected_code):
@@ -297,3 +303,49 @@ async def test_transcode_failure_uses_decode_failed(monkeypatch, tmp_path):
     with pytest.raises(AsrError) as caught:
         await _transcode(tmp_path / "source.wav", "flac")
     assert caught.value.code == "decode_failed"
+
+
+def test_cli_help_exits_successfully():
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "sdk"))
+    result = subprocess.run(
+        [sys.executable, "-m", "capswriter_asr", "--help"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "--url" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_cli_writes_srt_txt_and_json_with_legacy_srt_layout(tmp_path):
+    audio_path = make_audio(tmp_path / "clip.wav")
+    out_dir = tmp_path / "outputs"
+
+    async def finish_with_legacy_fixture(ws, state):
+        await accept_and_finish(ws, state)
+
+    async with fake_v2_server(finish_with_legacy_fixture) as (url, _state):
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "capswriter_asr",
+            str(audio_path),
+            "--url",
+            url,
+            "--out-dir",
+            str(out_dir),
+            "--format",
+            "srt,txt,json",
+            env=dict(os.environ, PYTHONPATH=str(REPO_ROOT / "sdk")),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+    assert process.returncode == 0, (stdout, stderr)
+    assert (out_dir / "clip.srt").read_text(encoding="utf-8") == (
+        "1\n00:00:00,000 --> 00:00:01,600\n你好，世界。\n"
+    )
+    assert (out_dir / "clip.txt").read_text(encoding="utf-8") == "你好，世界。"
+    assert json.loads((out_dir / "clip.json").read_text(encoding="utf-8"))["type"] == "result"
