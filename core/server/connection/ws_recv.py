@@ -6,6 +6,7 @@ WebSocket 接收处理模块
 """
 
 import asyncio
+import binascii
 import json
 import time
 from base64 import b64decode
@@ -13,6 +14,13 @@ from base64 import b64decode
 import websockets
 
 from ..state import console
+from ..state import (
+    begin_task,
+    ensure_server_runtime,
+    register_segment_submission,
+    transition_terminal,
+    set_task_draining,
+)
 from ..schema import Task
 from config_server import ServerConfig as Config
 from core.protocol import AudioMessage
@@ -20,6 +28,7 @@ from core.constants import AudioFormat
 from core.tools.my_status import Status
 from .segmenter import get_cut_finder
 from .. import logger
+from .ws_send import queue_error_and_close
 
 
 # 麦克风接收状态指示器
@@ -56,7 +65,7 @@ class AudioCache:
         self.search_to = 0.0
 
 
-async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str) -> None:
+async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, state) -> None:
     """缓冲达到阈值后切分并提交识别任务。
 
     seg_cut_snap 开启时，在名义切点附近吸附"最不像人声"的断点下刀
@@ -72,7 +81,7 @@ async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socke
     if not Config.seg_cut_snap:
         # 固定时长盲切（原始行为）
         while cache.duration >= nominal + overlap * 2:
-            _cut_and_submit(msg, cache, queue_in, socket_id, cut=nominal)
+            _cut_and_submit(msg, cache, queue_in, socket_id, state, cut=nominal)
         return
 
     w_before, w_after = Config.seg_search_before, Config.seg_search_after
@@ -104,10 +113,10 @@ async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socke
             logger.info(f"切点吸附: [{lo:.1f}, {hi:.1f}]s 内无可信静音断点，取最低分点 {cut:.2f}s 下刀")
 
         cache.search_to = 0.0
-        _cut_and_submit(msg, cache, queue_in, socket_id, cut=cut)
+        _cut_and_submit(msg, cache, queue_in, socket_id, state, cut=cut)
 
 
-def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, cut: float) -> None:
+def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, state, cut: float) -> None:
     """从缓冲区头部切出 [0, cut+overlap] 提交识别，缓冲区前移 cut 秒。"""
     n_stride = int(round(cut * AudioFormat.SAMPLE_RATE))
     n_segment = n_stride + int(round(msg.seg_overlap * AudioFormat.SAMPLE_RATE))
@@ -132,6 +141,7 @@ def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: s
     )
     cache.offset += stride_bytes / AudioFormat.BYTES_PER_SECOND
     queue_in.put(task)
+    register_segment_submission(state, (socket_id, msg.task_id), time.monotonic())
     logger.debug(
         f"提交音频片段，任务ID: {msg.task_id}, 切点: {cut:.2f}s, "
         f"偏移: {cache.offset}s, 缓冲区: {len(cache.chunks)} bytes"
@@ -163,7 +173,7 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
 
     try:
         # base64 解码音频数据（float32, 16kHz, mono）
-        data = b64decode(msg.data)
+        data = b64decode(msg.data, validate=True)
         cache.chunks += data
         cache.byte_count += len(data)
 
@@ -176,7 +186,7 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
                 logger.info(f"开始接收音频文件，任务ID: {msg.task_id}")
 
             # 若缓冲已达到分段阈值，将片段作为任务提交
-            await _submit_segments(msg, cache, queue_in, socket_id)
+            await _submit_segments(msg, cache, queue_in, socket_id, app.state)
 
         else:  # is_final
             # 打印状态消息
@@ -201,6 +211,7 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
                 language=msg.language,
             )
             queue_in.put(task)
+            register_segment_submission(app.state, (socket_id, msg.task_id), time.monotonic())
             logger.debug(f"提交最终片段，任务ID: {msg.task_id}, 数据大小: {len(cache.chunks)} bytes")
 
             # 重置缓冲区
@@ -230,21 +241,75 @@ async def ws_recv(websocket, app) -> None:
     console.print(f'[bold green]客户端已连接: {remote[0]}:{remote[1]}[/bold green]\n')
     logger.info(f"新客户端连接: {websocket}, ID: {socket_id}")
 
+    ensure_server_runtime(state)
+    outbound = asyncio.Queue(maxsize=256)
+    state.out_queues[socket_id] = outbound
+    sender = asyncio.create_task(_send_connection(websocket, outbound, socket_id))
+    state.sender_tasks[socket_id] = sender
+
     # 创建音频缓冲区
     cache = AudioCache()
 
     # 接收并处理消息
     try:
         async for raw_message in websocket:
-            # 使用协议类解析消息
+            task_id = ''
             try:
                 data = json.loads(raw_message)
+                if isinstance(data, dict) and isinstance(data.get('task_id'), str):
+                    task_id = data['task_id']
+                _validate_audio_dict(data)
                 msg = AudioMessage.from_dict(data)
-                # 处理音频数据
-                await message_handler(websocket, msg, cache, app)
             except Exception as e:
-                logger.error(f"消息解析失败: {str(e)}")
+                logger.warning(f"客户端 {socket_id} 发送坏请求: {type(e).__name__}: {e}")
+                active = state.connection_tasks.get(socket_id)
+                if active:
+                    transition_terminal(state, active, 'FAILED')
+                await queue_error_and_close(
+                    state, websocket, socket_id, task_id, 'bad_request',
+                    f"{type(e).__name__}: {e}", False,
+                )
+                return
+
+            key = (socket_id, msg.task_id)
+            active = state.connection_tasks.get(socket_id)
+            if active is not None and active != key:
+                transition_terminal(state, active, 'FAILED')
+                begin_task(state, key)
+                transition_terminal(state, key, 'FAILED')
+                await queue_error_and_close(
+                    state, websocket, socket_id, msg.task_id, 'task_conflict',
+                    f"连接上任务 {active[1]} 尚未终结，不能开始任务 {msg.task_id}", False,
+                )
+                return
+
+            if active is None:
+                begin_task(state, key)
+            record = state.tasks[key]
+            if record.status in {'DONE', 'FAILED'}:
+                logger.warning(f"丢弃终态任务 {msg.task_id} 的迟到上行帧")
                 continue
+            if msg.is_final and not set_task_draining(state, key):
+                logger.warning(f"丢弃任务 {msg.task_id} 重复的 is_final 帧")
+                continue
+
+            try:
+                await message_handler(websocket, msg, cache, app)
+            except binascii.Error as e:
+                transition_terminal(state, key, 'FAILED')
+                await queue_error_and_close(
+                    state, websocket, socket_id, msg.task_id, 'decode_failed',
+                    f"{type(e).__name__}: {e}", False,
+                )
+                return
+            except Exception as e:
+                logger.error(f"连接 {socket_id} 处理任务异常", exc_info=True)
+                transition_terminal(state, key, 'FAILED')
+                await queue_error_and_close(
+                    state, websocket, socket_id, msg.task_id, 'internal',
+                    f"{type(e).__name__}: {e}", True,
+                )
+                return
 
         logger.info(f"客户端正常关闭连接: {socket_id}")
 
@@ -257,6 +322,13 @@ async def ws_recv(websocket, app) -> None:
     except Exception as e:
         console.print("Exception:", e)
         logger.error(f"WebSocket 接收异常，客户端ID {socket_id}: {e}", exc_info=True)
+        active = state.connection_tasks.get(socket_id)
+        if active:
+            transition_terminal(state, active, 'FAILED')
+            await queue_error_and_close(
+                state, websocket, socket_id, active[1], 'internal',
+                f"{type(e).__name__}: {e}", True,
+            )
     finally:
         # 清理资源
         status_mic.stop()
@@ -264,9 +336,63 @@ async def ws_recv(websocket, app) -> None:
         sockets.pop(socket_id, None)
         if socket_id in sockets_id:
             sockets_id.remove(socket_id)
+        active = state.connection_tasks.get(socket_id)
+        if active:
+            transition_terminal(state, active, 'FAILED')
+        for key in [key for key in state.tasks if key[0] == socket_id]:
+            state.tasks.pop(key, None)
+            state.pending_segments.pop(key, None)
+        state.connection_tasks.pop(socket_id, None)
+        state.out_queues.pop(socket_id, None)
+        state.sender_tasks.pop(socket_id, None)
+        if not sender.done():
+            sender.cancel()
+            try:
+                await sender
+            except asyncio.CancelledError:
+                pass
 
         console.print(f'[bold red]客户端已断开: {remote[0]}:{remote[1]}[/bold red]\n')
 
         # 注意：session 清理由 TaskHandler 在子进程中定期执行
         # （通过检查 sockets_id 判断客户端是否已断开）
         logger.debug(f"客户端资源已清理: {socket_id}")
+
+
+async def _send_connection(websocket, outbound: asyncio.Queue, socket_id: str) -> None:
+    """每个 WebSocket 独立发送，避免慢连接阻塞其它结果。"""
+    try:
+        while True:
+            payload = await outbound.get()
+            try:
+                await websocket.send(payload)
+            finally:
+                outbound.task_done()
+    except websockets.ConnectionClosed:
+        logger.debug(f"连接 {socket_id} 的发送协程随 socket 关闭")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error(f"连接 {socket_id} 的发送协程异常", exc_info=True)
+        await websocket.close()
+
+
+def _validate_audio_dict(data) -> None:
+    if not isinstance(data, dict):
+        raise TypeError("音频帧必须是 JSON 对象")
+    required = ('task_id', 'source', 'data', 'is_final', 'time_start')
+    missing = [name for name in required if name not in data]
+    if missing:
+        raise KeyError(f"缺少必需字段: {', '.join(missing)}")
+    string_fields = ('task_id', 'source', 'data', 'context', 'language')
+    for name in string_fields:
+        if name in data and not isinstance(data[name], str):
+            raise TypeError(f"字段 {name} 必须是字符串")
+    if type(data['is_final']) is not bool:
+        raise TypeError("字段 is_final 必须是布尔值")
+    if data['source'] not in {'mic', 'file'}:
+        raise ValueError("字段 source 只能是 mic 或 file")
+    number_fields = ('time_start', 'seg_duration', 'seg_overlap')
+    for name in number_fields:
+        if name in data and (isinstance(data[name], bool) or not isinstance(data[name], (int, float))):
+            raise TypeError(f"字段 {name} 必须是数字")

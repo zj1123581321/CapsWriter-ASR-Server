@@ -85,6 +85,8 @@ class Result:
     timestamps: List[float] = field(default_factory=list)
     
     is_final: bool = False
+    error_code: str = ''
+    error_message: str = ''
 
 @dataclass
 class RecognitionSession:

@@ -85,7 +85,6 @@ async def test_three_connections_keep_results_separate(fake_asr_server):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason="中间段推理异常被 TaskHandler 吞掉并仍可能返回缺段 final，由 T2 修复")
 @pytest.mark.parametrize("fake_asr_server", [{"fail_on_call": 2}], indirect=True)
 async def test_inference_failure_must_error_or_close_without_incomplete_final(fake_asr_server):
     task_id = str(uuid.uuid4())
@@ -103,8 +102,11 @@ async def test_inference_failure_must_error_or_close_without_incomplete_final(fa
         )
         messages, closed = await collect_terminal(websocket, task_id=task_id, timeout=5)
 
-    assert closed or any(message.get("type") == "error" for message in messages)
+    errors = [message for message in messages if message.get("type") == "error"]
+    assert errors and errors[0]["code"] == "inference_failed"
+    assert errors[0]["retryable"] is True
     assert not any(message.get("is_final") for message in messages)
+    assert len(fake_asr_server.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -125,35 +127,29 @@ async def test_final_payload_is_split_to_configured_segment_size(fake_asr_server
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason="WorkerState 仅按 task_id 建会话导致跨连接同 ID 串结果，由 T2 修复")
 @pytest.mark.parametrize(
-    "fake_asr_server", [{"delay_on_call": 1, "delay_seconds": 0.5}], indirect=True
+    "fake_asr_server", [{"delay_on_call": 1, "delay_seconds": 0.2}], indirect=True
 )
 async def test_same_task_id_on_two_connections_must_not_cross_results(fake_asr_server):
     task_id = str(uuid.uuid4())
-    async with (
-        websockets.connect(fake_asr_server.url, max_size=None, ping_interval=None, open_timeout=5) as ws_a,
-        websockets.connect(fake_asr_server.url, max_size=None, ping_interval=None, open_timeout=5) as ws_b,
-    ):
-        await send_audio(
-            ws_a,
+    messages_a, messages_b = await asyncio.gather(
+        transcribe(
+            fake_asr_server.url,
             make_encoded_audio(0.5),
             task_id=task_id,
             seg_duration=0.5,
             seg_overlap=0,
-            finalize=False,
-        )
-        await fake_asr_server.wait_for_calls(1, timeout=5)
-        await send_audio(
-            ws_b,
-            make_encoded_audio(1.0, 480_000),
+        ),
+        transcribe(
+            fake_asr_server.url,
+            make_encoded_audio(0.5, 480_000),
             task_id=task_id,
             seg_duration=0.5,
             seg_overlap=0,
-        )
-        messages_a, closed_a = await collect_terminal(ws_a, task_id=task_id, timeout=5)
-
-    assert not closed_a and messages_a[-1].get("is_final") is True
+        ),
+    )
     spans_a = decode_spans(messages_a[-1]["text"])
-    assert spans_a
-    assert all(start_ms < 1000 for start_ms, _ in spans_a), f"连接 A 收到其它连接的区间: {spans_a!r}"
+    spans_b = decode_spans(messages_b[-1]["text"])
+    assert spans_a and spans_b
+    assert all(0 <= start < 1000 and end <= 500 for start, end in spans_a), spans_a
+    assert all(30_000 <= start < 31_000 and end <= 30_500 for start, end in spans_b), spans_b
