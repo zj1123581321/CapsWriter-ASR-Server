@@ -39,3 +39,10 @@
 - 本段结论：全量测试为 163 passed、3 skipped、1 xfailed；契约和基线专项为 14 passed、1 xfailed。三项回归红验均因断言失败转红，注入已逐处还原。
 - 关键决策与已否决方案：保留 T2b 末帧切段 xfail；OCR 主审与备用审查均未完成，按 skipped 记录并交主脑审查。
 - 下一步唯一动作：推送分支并创建 draft PR。
+
+### 里程碑 7：远端交付
+
+- 当前阶段：交付完成
+- 本段结论：分支已推送，GitHub #15 已核实为 open draft PR，base 为 master，远端 head 与本地 SHA 一致。
+- 关键决策与已否决方案：保持 draft，不标 ready、不合并。
+- 下一步唯一动作：主脑读取 diff 并抽跑验收测试。
