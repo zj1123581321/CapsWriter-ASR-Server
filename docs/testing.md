@@ -10,3 +10,9 @@
   - 注：二者从各生产仓 untracked 的 `tools/test_ws_client.py`(文件名被 `.gitignore` 的 `test_*.py` 规则挡住,无法入库)收编泛化而来,现入主线 `scripts/`(`_` 前缀避开该规则)。
 - **独立转录客户端**: [`scripts/transcribe_client.py`](scripts/transcribe_client.py) — 单文件零仓内依赖 CLI，拷到任意设备连局域网/Tailscale ASR 服务端转录本地音频并落 srt/txt/json；依赖 `soundfile numpy websockets`，非 16k mono wav 需系统 `ffmpeg`。
 
+## 服务端端到端测试骨架
+- `fake_asr_server` fixture 启动真实 `ws_recv`/`ws_send`、`TaskHandler` 和识别子进程，监听随机端口，不加载模型。
+- 假引擎把音频绝对起点和长度编码进文本；`fail_on_call` 指定调用序号抛错，`delay_on_call` 与 `delay_seconds` 指定调用序号及阻塞时长。
+- 调用记录包含顺序、`task_id` 和 `socket_id`；可用 `supports_punc`、`supports_timestamps` 调整能力声明。
+- 运行：`python -m pytest tests/test_server_e2e_baseline.py -v`。
+- `scripts/_baseline_asr.py --server ws://host:port --wav input.wav --out baseline.json [--ref reference.txt]` 保存真实服务端文本、CER 和时间戳；输入 WAV 需为 16 kHz。
