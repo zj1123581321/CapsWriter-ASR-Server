@@ -42,9 +42,12 @@ Start-ScheduledTask -TaskName $TaskName
 $healthUrl = "http://127.0.0.1:$Port/health"
 $lastStatus = $null
 $lastPayload = $null
-for ($elapsed = 0; $elapsed -lt $HealthTimeout; $elapsed += $HealthInterval) {
+$healthTimer = [Diagnostics.Stopwatch]::StartNew()
+while ($healthTimer.Elapsed.TotalSeconds -lt $HealthTimeout) {
+    $remainingSeconds = [Math]::Ceiling($HealthTimeout - $healthTimer.Elapsed.TotalSeconds)
+    $requestTimeout = [Math]::Max(1, [Math]::Min(5, [int]$remainingSeconds))
     try {
-        $response = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -SkipHttpErrorCheck
+        $response = Invoke-WebRequest -Uri $healthUrl -TimeoutSec $requestTimeout -SkipHttpErrorCheck
     } catch {
         $response = $null
     }
@@ -54,7 +57,13 @@ for ($elapsed = 0; $elapsed -lt $HealthTimeout; $elapsed += $HealthInterval) {
         if ($response.Content) { $lastPayload = $response.Content | ConvertFrom-Json }
         if ($lastStatus -eq 200) { break }
     }
-    Start-Sleep -Seconds $HealthInterval
+    $remainingMilliseconds = [int][Math]::Max(
+        0,
+        ($HealthTimeout - $healthTimer.Elapsed.TotalSeconds) * 1000
+    )
+    if ($remainingMilliseconds -gt 0) {
+        Start-Sleep -Milliseconds ([Math]::Min($HealthInterval * 1000, $remainingMilliseconds))
+    }
 }
 
 $actualGitSha = if ($null -ne $lastPayload) { [string]$lastPayload.git_sha } else { '' }

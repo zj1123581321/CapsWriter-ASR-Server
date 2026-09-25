@@ -60,9 +60,13 @@ health_file="$(mktemp)"
 trap 'rm -f -- "$health_file"' EXIT
 health_url="http://127.0.0.1:${port}/health"
 health_status="000"
-elapsed=0
-while (( elapsed <= health_timeout )); do
-    if health_status="$(curl --silent --show-error --connect-timeout 2 --max-time 5 \
+health_deadline=$((SECONDS + health_timeout))
+while (( SECONDS < health_deadline )); do
+    request_timeout=$((health_deadline - SECONDS))
+    if (( request_timeout > 5 )); then
+        request_timeout=5
+    fi
+    if health_status="$(curl --silent --show-error --connect-timeout "$request_timeout" --max-time "$request_timeout" \
         --output "$health_file" --write-out '%{http_code}' "$health_url")"; then
         if [[ "$health_status" == 200 ]]; then
             break
@@ -70,11 +74,15 @@ while (( elapsed <= health_timeout )); do
     else
         health_status="000"
     fi
-    if (( elapsed >= health_timeout )); then
+    remaining=$((health_deadline - SECONDS))
+    if (( remaining <= 0 )); then
         break
     fi
-    sleep "$health_interval"
-    elapsed=$((elapsed + health_interval))
+    sleep_seconds="$health_interval"
+    if (( sleep_seconds > remaining )); then
+        sleep_seconds="$remaining"
+    fi
+    sleep "$sleep_seconds"
 done
 
 health_summary() {
