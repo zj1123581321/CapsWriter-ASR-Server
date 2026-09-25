@@ -41,7 +41,7 @@ def build_health_payload(state, process_manager) -> dict:
 
     llama_build = None
     if model.lower() in {"qwen_asr", "fun_asr_nano"} or aligner == "loaded":
-        from core.server.engines.llama.build_info import LLAMA_BUILD
+        from core.server.engines.llama_build_info import LLAMA_BUILD
 
         llama_build = LLAMA_BUILD
 

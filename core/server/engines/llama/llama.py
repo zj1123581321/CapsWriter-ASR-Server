@@ -16,7 +16,7 @@ from typing import List, Union, Set, Optional
 from pathlib import Path
 from os.path import relpath
 from . import logger
-from .build_info import LLAMA_BUILD
+from ..llama_build_info import LLAMA_BUILD
 
 # =========================================================================
 # Configuration
