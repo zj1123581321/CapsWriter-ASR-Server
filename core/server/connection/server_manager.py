@@ -99,3 +99,5 @@ class SocketManager:
         if self._server:
             self._server.close()
         self._is_running = False
+        if self.app.loop.is_running():
+            self.app.loop.call_soon_threadsafe(self.app.loop.stop)
