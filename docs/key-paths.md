@@ -1,51 +1,11 @@
-## 关键路径 (Key Paths)
-- **代理配置**: [`config_proxy.py`](config_proxy.py) — 后端列表、监听地址、健康检查参数。
-- **服务端配置**: [`config_server.py`](config_server.py) — 模型选择、网络、格式化、对齐器。
-- **客户端配置**: [`config_client.py`](config_client.py) — 快捷键、音频、热词、LLM、输出、UDP。
-- **热词**:
-    - [`hot.txt`](hot.txt) - 统一 RAG 音素匹配（中英文）
-    - [`hot-rule.txt`](hot-rule.txt) - 规则替换
-    - [`hot-server.txt`](hot-server.txt) - 服务端热词
-- **LLM角色**: [`LLM/*.py`](LLM/) (根目录, 定义 Role/Prompt/Model)
-    - [`default.py`](LLM/default.py) - 默认角色（热词、润色，process=False）
-    - [`翻译.py`](LLM/翻译.py) - 翻译角色（ollama/gemma3:12b）
-    - [`高级翻译.py`](LLM/高级翻译.py) - 高级翻译（deepseek/deepseek-chat）
-    - [`大助理.py`](LLM/大助理.py) - 大助理（zhipu/glm-4.5-air）
-    - [`小助理.py`](LLM/小助理.py) - 小助理（lmstudio/local-model）
-- **服务端核心**: [`core/server/`](core/server/)
-    - [`app.py`](core/server/app.py) - `CapsWriterServer` 门面类
-    - [`state.py`](core/server/state.py) - `ServerState` / `WorkerState` 共享状态
-    - [`schema.py`](core/server/schema.py) - `Task` / `Result` / `RecognitionSession` 数据结构
-    - [`connection/server_manager.py`](core/server/connection/server_manager.py) - `SocketManager` WebSocket 服务端生命周期
-    - [`connection/ws_recv.py`](core/server/connection/ws_recv.py) - 音频接收与切片
-    - [`connection/ws_send.py`](core/server/connection/ws_send.py) - 识别结果发送
-    - [`worker/process_manager.py`](core/server/worker/process_manager.py) - `ProcessManager` 子进程管理
-    - [`worker/worker.py`](core/server/worker/worker.py) - `RecognizerWorker` 推理循环
-    - [`worker/model_loader.py`](core/server/worker/model_loader.py) - `ModelLoader` 模型加载
-    - [`worker/pipeline.py`](core/server/worker/pipeline.py) - `TaskPipeline` 识别流水线
-    - [`engines/`](core/server/engines/) - ASR 引擎实现（见下方模型支持）
-    - [`merger/`](core/server/merger/) - 文本/Token 合并算法
-    - [`formatter/text_formatter.py`](core/server/formatter/text_formatter.py) - `TextFormatter` 后处理
-- **代理核心**: [`core/proxy/`](core/proxy/)
-    - [`proxy_server.py`](core/proxy/proxy_server.py) - `ProxyServer` WS 监听 + 客户端连接处理
-    - [`router.py`](core/proxy/router.py) - `TaskRouter` per-task 路由 + 后端连接生命周期
-    - [`backend.py`](core/proxy/backend.py) - `BackendState` 后端状态跟踪
-- **客户端核心**: [`core/client/`](core/client/)
-    - [`app.py`](core/client/app.py) - `CapsWriterClient` 门面类
-    - [`state.py`](core/client/state.py) - `ClientState` 共享状态
-    - [`connection/websocket_manager.py`](core/client/connection/websocket_manager.py) - `WebSocketManager`
-    - [`audio/`](core/client/audio/) - `AudioStreamManager` / `Recorder` / `FileManager`
-    - [`shortcut/`](core/client/shortcut/) - `ShortcutManager`（pynput）快捷键系统
-    - [`output/result_processor.py`](core/client/output/result_processor.py) - `ResultProcessor` 后处理核心
-    - [`output/text_output.py`](core/client/output/text_output.py) - `TextOutput` 上屏
-    - [`hotword/`](core/client/hotword/) - 热词系统（Phoneme RAG + Rule + Rectification）
-    - [`llm/`](core/client/llm/) - LLM 子系统（角色加载、上下文、API 调用）
-    - [`manager/`](core/client/manager/) - `MicRunner` / `FileRunner` / `TrayManager`
-    - [`transcribe/`](core/client/transcribe/) - `FileTranscriber` 文件转录
-    - [`diary/diary_writer.py`](core/client/diary/diary_writer.py) - `DiaryWriter` 日记归档
-    - [`udp/`](core/client/udp/) - UDP 广播与远程控制
-- **共享工具**: [`core/tools/`](core/tools/) — ITN、格式化、信号处理、窗口检测、简繁转换
-- **UI 组件**: [`core/ui/`](core/ui/) — Toast、Tray、对话框（热词/纠错）
-- **协议**: [`core/protocol.py`](core/protocol.py) — `AudioMessage` + `RecognitionMessage`
-- **日志**: `logs/client_latest.log` & `logs/server_latest.log`（排查问题唯一入口）
+## 关键路径
 
+- [服务端入口](../start_server.py) — 初始化并启动 ASR Server。
+- [Proxy 入口](../start_proxy.py) — 初始化并启动 ASR Proxy。
+- [服务端配置](../config_server.py) — 网络、模型、并发、分段和 GPU 参数。
+- [Proxy 配置](../config_proxy.py) — 后端地址、权重与监听参数。
+- [服务端核心](../core/server/) — WebSocket、任务处理、worker 与引擎管理。
+- [Proxy 核心](../core/proxy/) — 后端连接、健康状态与任务路由。
+- [SDK](../sdk/) — Python 文件转录 API 和命令行。
+- [模型支持](models.md) — 引擎与辅助模型列表。
+- [部署说明](../deploy/README.md) — 依赖安装、进程托管、更新与回滚。

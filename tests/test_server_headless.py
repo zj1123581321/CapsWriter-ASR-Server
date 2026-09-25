@@ -4,7 +4,7 @@
 
 验证服务端作为局域网守护进程（pm2 / systemd / Windows 计划任务）运行时：
 1. 端口被占用 → 立即以退出码 1 退出，无任何「按回车」交互；
-2. 导入 server、proxy 及 server app 不加载 tkinter / UI / pystray；
+2. 导入 server、proxy 及 server app 时 tkinter 被屏蔽且 UI 包未加载；
 3. 一次 SIGTERM 即触发 stop() 清理并以退出码 0 退出（仅 POSIX）；
 4. 服务端源码不再含 input() 交互路径；
 5. 环境变量 CW_LOG_LEVEL 可覆盖 server logger 级别。
@@ -58,7 +58,7 @@ import core.server
 import core.proxy
 import core.server.app
 
-bad = [m for m in ('core.ui', 'core.server.ui', 'pystray') if m in sys.modules]
+bad = [m for m in ('core.server.ui',) if m in sys.modules]
 print('BAD_MODULES:', bad)
 sys.exit(1 if bad else 0)
 '''

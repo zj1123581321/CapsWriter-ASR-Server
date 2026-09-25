@@ -37,8 +37,8 @@ def test_file_logger_uses_dated_rotating_handler(tmp_path):
         Logger._loggers.pop(logger_name, None)
 
 
-def test_default_log_dir_is_repo_root_without_config_client(tmp_path):
-    """log_dir=None 时默认目录为仓库根 logs/，不再依赖 config_client（服务端无头化）。"""
+def test_default_log_dir_is_repo_root(tmp_path):
+    """log_dir=None 时默认目录为仓库根 logs/。"""
     logger_name = "test-default-dir"
     logger = Logger.setup(logger_name, log_dir=None, level="INFO")
     log_file = Path(__file__).resolve().parents[1] / "logs" / "test-default-dir_latest.log"

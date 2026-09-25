@@ -80,7 +80,7 @@ class CapsWriterServer:
 
     def _register_exit_signals(self):
         """
-        注册退出信号处理（服务端专用，不用 core.tools.signal_handler）
+        注册退出信号处理（服务端专用）
 
         无头守护（pm2 / systemd / Windows 计划任务）下没有「第二次按键」的
         交互机会，SIGINT / SIGTERM 任一收到一次即触发 stop() 清理（停子进程、

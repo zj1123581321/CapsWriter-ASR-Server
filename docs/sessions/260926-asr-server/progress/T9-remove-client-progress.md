@@ -11,3 +11,9 @@
 - 本段结论：删除 `core/client/**`、`core/ui/**`、`core/server/ui/**`，从 `config_server.py` 和 `core/server/app.py` 移除托盘配置与调用；无头测试通过（`7 passed`），子进程先将 `sys.modules['tkinter'] = None` 再导入 server、proxy 和 app。
 - 关键决策与已否决方案：`scripts/_verify_file_transcribe.py` 仍是卡面入口集合中的服务端验证脚本，故移除其对客户端 `ResultHandler` 的引用，保留脚本自身生成 SRT 的既有逻辑；此改动超出精确 `Scope-Globs`，会在报告列为偏差。
 - 下一步唯一动作：删除余下客户端配置与打包资产，并按可达性复核遗漏模块。
+
+## 里程碑 3：仓库文档与剩余客户端文件清理
+- 当前阶段：服务端定位改写完成，进入全量验证。
+- 本段结论：删除 LLM 角色文件、客户端配置/入口、客户端依赖清单、双用途 PyInstaller 与 zip 打包文件、客户端专属工具和文档/图片；保留服务端部署与模型文档。可跟踪 `.py` 数为 358 → 254，AST 入口可达 179 个模块；README 为 35 行且三条要求链接均存在。无 tkinter 的 server/proxy 导入命令输出 `ok`。
+- 关键决策与已否决方案：AST 仍列出 5 个 `core/server/engines/**` 非 export 文件不可达，但卡面禁止改动整个引擎目录，故原样保留并在报告列出；未达 Python 模块对应的 `core/tools/zhconv/zhcdict.json` 保留，因为该非代码文件不在 AST 删除规则内，删除它会使总代码行差超过 20,000 硬预算。`models/Ollama-Polish.py` 位于卡面清理范围之外，保留并报告。更新 `requirements-server*.txt` 去掉已无调用方的托盘依赖，属 Scope-Globs 外的必要偏差。
+- 下一步唯一动作：运行卡面指定的完整 pytest 命令并完成末次静态/grep 验收。
