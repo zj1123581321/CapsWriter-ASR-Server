@@ -16,6 +16,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 #   CW_MODEL_TYPE             ASR 引擎：qwen_asr(默认)/qwen_asr_mlx/fun_asr_nano/sensevoice/paraformer
 #   CW_PORT                   WebSocket 监听端口：6016(默认)
 #   CW_ADDR                   WebSocket 监听地址：0.0.0.0(默认)
+#   CW_LOG_LEVEL              服务端日志级别：DEBUG(默认)/INFO/WARNING/ERROR/CRITICAL
+#   CW_MAX_INFLIGHT_SEGMENTS  每任务已提交未出结果段数上限：4(默认)
+#   CW_MAX_TASKS              全局活动任务上限：8(默认)
+#   CW_DRAIN_BATCH            Worker 每轮从队列取入任务上限：16(默认)
+#   CW_UPLOAD_IDLE_SECONDS    上传空闲超时秒数：300(默认)
+#   CW_SEGMENT_TIMEOUT        单段推理看门狗秒数：600(默认)
 #   --- GPU/后端加速 ---
 #   CW_ONNX_PROVIDER          ONNX 后端：CPU(默认)/CUDA/DML/TRT   —— SenseVoice/FunASR/Qwen
 #   CW_LLM_USE_GPU            GGUF LLM 是否用 GPU：0(默认)/1       —— FunASR/Qwen
@@ -44,6 +50,10 @@ def _env_bool(key: str, default: bool = False) -> bool:
 class ServerConfig:
     addr = _env_str('CW_ADDR', '0.0.0.0')   # 监听地址，环境变量可覆盖
     port = _env_str('CW_PORT', '6016')       # 监听端口，环境变量可覆盖（同机多实例靠它区分）
+    max_inflight_segments = int(_env_str('CW_MAX_INFLIGHT_SEGMENTS', '4'))
+    max_tasks = int(_env_str('CW_MAX_TASKS', '8'))
+    drain_batch = int(_env_str('CW_DRAIN_BATCH', '16'))
+    upload_idle_seconds = float(_env_str('CW_UPLOAD_IDLE_SECONDS', '300'))
 
     # 语音模型选择：'qwen_asr', 'qwen_asr_mlx', 'fun_asr_nano', 'sensevoice', 'paraformer'
     #   'qwen_asr_mlx' 为 Apple MLX 版 Qwen3-ASR，仅 Apple Silicon (arm64 macOS) 可用

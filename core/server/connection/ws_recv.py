@@ -53,6 +53,7 @@ class AudioCache:
         self.search_to: float = 0.0 # 切点吸附已搜索到的位置（秒），避免重复扫描
         self.task_id: str | None = None
         self.segmentation_params: tuple[float, float] | None = None
+        self.started = False
 
     @property
     def duration(self) -> float:
@@ -72,6 +73,7 @@ class AudioCache:
         self.search_to = 0.0
         self.task_id = None
         self.segmentation_params = None
+        self.started = False
 
 
 def _engine_segment_limit() -> float | None:
@@ -143,7 +145,7 @@ async def _submit_segments(
     socket_id: str,
     state=None,
     is_final: bool = False,
-) -> None:
+) -> bool:
     """缓冲达到阈值后切分并提交识别任务。
 
     seg_cut_snap 开启时，在名义切点附近吸附"最不像人声"的断点下刀
@@ -165,8 +167,12 @@ async def _submit_segments(
             if is_final
             else cache.duration >= nominal + overlap * 2
         ):
-            _cut_and_submit(msg, cache, queue_in, socket_id, cut=nominal, state=state)
-        return
+            if not await _cut_and_submit(
+                msg, cache, queue_in, socket_id, cut=nominal, state=state,
+                websocket=state.sockets.get(socket_id) if state is not None else None,
+            ):
+                return False
+        return True
 
     w_before, w_after = Config.seg_search_before, Config.seg_search_after
     max_cut = max(Config.seg_max_cut, nominal + w_after)
@@ -179,15 +185,15 @@ async def _submit_segments(
     while True:
         if is_final:
             if cache.duration <= final_limit:
-                return
+                return True
         elif cache.duration < nominal + w_after + overlap:
-            return
+            return True
 
         if msg.source == 'file':
             hi = min(cache.duration - overlap, max_cut)
             # 弹性等待期间没有新增可搜索区域时，等下一条消息再扫
             if not is_final and hi < max_cut and hi <= cache.search_to:
-                return
+                return True
         else:
             hi = nominal + w_after
 
@@ -198,17 +204,59 @@ async def _submit_segments(
         if not is_final and not confident and msg.source == 'file' and hi < max_cut:
             cache.search_to = hi
             logger.debug(f"切点吸附: [{lo:.1f}, {hi:.1f}]s 无可信断点，等待更多音频延长搜索")
-            return
+            return True
         if confident:
             logger.debug(f"切点吸附: 名义 {nominal}s，在 {cut:.2f}s 找到静音断点")
         else:
             logger.info(f"切点吸附: [{lo:.1f}, {hi:.1f}]s 内无可信静音断点，取最低分点 {cut:.2f}s 下刀")
 
         cache.search_to = 0.0
-        _cut_and_submit(msg, cache, queue_in, socket_id, cut=cut, state=state)
+        if not await _cut_and_submit(
+            msg, cache, queue_in, socket_id, cut=cut, state=state,
+            websocket=state.sockets.get(socket_id) if state is not None else None,
+        ):
+            return False
 
 
-def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, cut: float, state=None) -> None:
+async def _acquire_segment_slot(state, key, websocket) -> bool:
+    """等待本任务的结果名额；终态或断连会取消等待并丢弃信号量。"""
+    record = state.tasks.get(key)
+    if record is None or record.status in {'DONE', 'FAILED'} or record.segment_slots is None:
+        return False
+
+    semaphore = record.segment_slots
+    acquire = asyncio.create_task(semaphore.acquire())
+    terminal = asyncio.create_task(record.terminal_event.wait())
+    closed = asyncio.create_task(websocket.wait_closed())
+    waiters = (acquire, terminal, closed)
+    paused_at = asyncio.get_running_loop().time()
+    try:
+        done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        if terminal in done or closed in done or record.status in {'DONE', 'FAILED'}:
+            if acquire.done() and acquire.result():
+                semaphore.release()
+            if closed in done:
+                transition_terminal(state, key, 'FAILED')
+            return False
+        return True
+    finally:
+        if record.status == 'RECEIVING' and record.idle_deadline is not None:
+            record.idle_deadline += asyncio.get_running_loop().time() - paused_at
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+
+
+async def _cut_and_submit(
+    msg: AudioMessage,
+    cache: AudioCache,
+    queue_in,
+    socket_id: str,
+    cut: float,
+    state=None,
+    websocket=None,
+) -> bool:
     """从缓冲区头部切出 [0, cut+overlap] 提交识别，缓冲区前移 cut 秒。"""
     n_stride = int(round(cut * AudioFormat.SAMPLE_RATE))
     n_segment = n_stride + int(round(msg.seg_overlap * AudioFormat.SAMPLE_RATE))
@@ -233,6 +281,10 @@ def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: s
         language=msg.language,
     )
     cache.offset += stride_bytes / AudioFormat.BYTES_PER_SECOND
+    if state is not None and not await _acquire_segment_slot(
+        state, (socket_id, msg.task_id), websocket
+    ):
+        return False
     queue_in.put(task)
     if state is not None:
         register_segment_submission(state, (socket_id, msg.task_id), time.monotonic())
@@ -240,9 +292,10 @@ def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: s
         f"提交音频片段，任务ID: {msg.task_id}, 切点: {cut:.2f}s, "
         f"偏移: {cache.offset}s, 缓冲区: {len(cache.chunks)} bytes"
     )
+    return True
 
 
-async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) -> None:
+async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) -> bool:
     """
     处理客户端发送的音频消息
 
@@ -251,7 +304,8 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
     queue_in = app.state.queue_in
 
     global status_mic
-    is_start = not bool(cache.chunks)
+    is_start = not cache.started
+    cache.started = True
     socket_id = str(websocket.id)
 
     # 麦克风首次消息 → GPU 加速
@@ -280,7 +334,8 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
                 logger.info(f"开始接收音频文件，任务ID: {msg.task_id}")
 
             # 若缓冲已达到分段阈值，将片段作为任务提交
-            await _submit_segments(msg, cache, queue_in, socket_id, app.state)
+            if not await _submit_segments(msg, cache, queue_in, socket_id, app.state):
+                return False
 
         else:  # is_final
             # 打印状态消息
@@ -291,9 +346,10 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
                 logger.info(f"音频文件接收完毕，任务ID: {msg.task_id}, 时长: {cache.total_duration:.2f}s")
 
             # 最后一帧也先走相同分段规则；吸附文件任务此时不再等待后续音频。
-            await _submit_segments(
+            if not await _submit_segments(
                 msg, cache, queue_in, socket_id, app.state, is_final=True
-            )
+            ):
+                return False
 
             # 剩余缓冲作为最后一段提交。
             _assert_segment_within_limit(cache.duration)
@@ -310,6 +366,10 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
                 context=msg.context,
                 language=msg.language,
             )
+            if not await _acquire_segment_slot(
+                app.state, (socket_id, msg.task_id), websocket
+            ):
+                return False
             queue_in.put(task)
             register_segment_submission(app.state, (socket_id, msg.task_id), time.monotonic())
             logger.debug(f"提交最终片段，任务ID: {msg.task_id}, 数据大小: {len(cache.chunks)} bytes")
@@ -320,6 +380,7 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
     except Exception as e:
         logger.error(f"音频数据处理错误，任务ID: {msg.task_id}: {e}", exc_info=True)
         raise
+    return True
 
 
 async def ws_recv(websocket, app) -> None:
@@ -352,7 +413,30 @@ async def ws_recv(websocket, app) -> None:
 
     # 接收并处理消息
     try:
-        async for raw_message in websocket:
+        while True:
+            active = state.connection_tasks.get(socket_id)
+            record = state.tasks.get(active) if active else None
+            try:
+                if record is not None and record.status == 'RECEIVING':
+                    remaining = max(
+                        0.0,
+                        record.idle_deadline - asyncio.get_running_loop().time(),
+                    )
+                    raw_message = await asyncio.wait_for(
+                        websocket.recv(), timeout=remaining
+                    )
+                else:
+                    raw_message = await websocket.recv()
+            except TimeoutError:
+                if active is not None:
+                    await queue_error_and_close(
+                        state, websocket, socket_id, active[1], 'bad_request',
+                        'upload idle timeout', False,
+                    )
+                return
+            except websockets.ConnectionClosedOK:
+                break
+
             task_id = ''
             try:
                 data = json.loads(raw_message)
@@ -388,8 +472,22 @@ async def ws_recv(websocket, app) -> None:
                 return
 
             if active is None:
-                begin_task(state, key)
+                active_count = sum(
+                    item.status not in {'DONE', 'FAILED'}
+                    for item in state.tasks.values()
+                )
+                if active_count >= Config.max_tasks:
+                    await queue_error_and_close(
+                        state, websocket, socket_id, msg.task_id, 'overloaded',
+                        f"服务端活动任务已达上限 {Config.max_tasks}", True,
+                    )
+                    return
+                begin_task(state, key, Config.max_inflight_segments)
             record = state.tasks[key]
+            if record.status == 'RECEIVING':
+                record.idle_deadline = (
+                    asyncio.get_running_loop().time() + Config.upload_idle_seconds
+                )
 
             if record.status in {'DONE', 'FAILED'}:
                 logger.warning(f"丢弃终态任务 {msg.task_id} 的迟到上行帧")
@@ -410,7 +508,8 @@ async def ws_recv(websocket, app) -> None:
                 continue
 
             try:
-                await message_handler(websocket, msg, cache, app)
+                if not await message_handler(websocket, msg, cache, app):
+                    return
             except binascii.Error as e:
                 transition_terminal(state, key, 'FAILED')
                 await queue_error_and_close(
