@@ -3,8 +3,7 @@
 CapsWriter Offline 服务端主程序门面类 (Facade)
 
 采用外观模式统一管理进程管理器 (ProcessManager) 和网络管理器 (SocketManager)。
-该类是整个服务端应用的中心指挥部，负责初始化生命周期、托盘图标、
-并协调子进程与 WebSocket 服务的启动与退出。
+该类负责初始化生命周期，并协调子进程与 WebSocket 服务的启动与退出。
 """
 
 import os
@@ -16,7 +15,6 @@ from config_server import ServerConfig as Config, __version__
 from .state import ServerState, console
 from .worker.process_manager import ProcessManager
 from .connection.server_manager import SocketManager
-from .ui.tray_manager import TrayManager
 from . import logger
 
 class CapsWriterServer:
@@ -40,7 +38,6 @@ class CapsWriterServer:
         # 基本配置与组件实例化
         self.process_manager = ProcessManager(self)
         self.socket_manager = SocketManager(self)
-        self.tray_manager = TrayManager(self)
 
         self.version = __version__
         self.is_alive = False
@@ -74,10 +71,7 @@ class CapsWriterServer:
         # 2. 终止识别子进程
         self.process_manager.stop()
 
-        # 3. 停止托盘图标
-        self.tray_manager.stop()
-
-        # 4. 最后停止协程（需在其他资源释放之后）
+        # 3. 最后停止协程（需在其他资源释放之后）
         self.loop.stop()
 
         logger.info("服务端资源清理完成")
@@ -121,8 +115,6 @@ class CapsWriterServer:
         # 注册退出信号处理
         self._register_exit_signals()
 
-        # 托盘图标
-        self.tray_manager.start()
         self._print_banner()
 
         # 拉起识别子进程

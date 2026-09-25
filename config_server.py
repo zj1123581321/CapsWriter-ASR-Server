@@ -63,7 +63,6 @@ class ServerConfig:
     format_num = True       # 输出时是否将中文数字转为阿拉伯数字
     format_spell = True     # 输出时是否调整中英之间的空格
 
-    enable_tray = False        # 是否启用托盘图标功能
     hotwords_path = Path(BASE_DIR) / 'hot-server.txt' # 全局热词配置文件路径
 
     # 日志配置

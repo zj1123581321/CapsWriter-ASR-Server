@@ -10,9 +10,7 @@
 判定：收回的 timestamps 单调递增、覆盖音频时长、且字间隔**非均匀**=真实对齐
 (aligner 或原生)；间隔严格等距则是“字符均分回退”(server 无 token 时的兜底)。
 
-srt 落盘优先复用生产 ResultHandler(真实 client 环境完整产 srt/json/txt)；脚本
-若跑在缺 client GUI 依赖的 server-only 环境，自动 fallback 用字级时间戳自包含
-生成 srt(逻辑等价)，不影响时间戳验证本身。
+srt 落盘由本脚本根据服务端返回的字级时间戳生成，不依赖桌面客户端。
 
 用法：
     python scripts/_verify_file_transcribe.py <音频文件> [--server ws://localhost:6016]
@@ -104,32 +102,27 @@ def _check_timestamps(message: RecognitionMessage, audio_dur: float) -> bool:
 
 
 def _write_srt(message: RecognitionMessage, out: Path) -> str:
-    """优先用生产 ResultHandler；缺 client GUI 依赖时 fallback 自包含生成。"""
-    try:
-        from core.client.transcribe.result_handler import ResultHandler
-        ResultHandler.save_results(out.with_suffix('.wav'), message)
-        return 'ResultHandler(真实落盘 srt/json/txt)'
-    except Exception as e:
-        ts, tokens = message.timestamps, message.tokens
+    """根据服务端返回的时间戳生成字幕文件。"""
+    ts, tokens = message.timestamps, message.tokens
 
-        def _fmt(t: float) -> str:
-            h, m, s = int(t // 3600), int(t % 3600 // 60), int(t % 60)
-            return f'{h:02d}:{m:02d}:{s:02d},{int(round((t - int(t)) * 1000)):03d}'
+    def _fmt(t: float) -> str:
+        h, m, s = int(t // 3600), int(t % 3600 // 60), int(t % 60)
+        return f'{h:02d}:{m:02d}:{s:02d},{int(round((t - int(t)) * 1000)):03d}'
 
-        lines, idx, buf, start = [], 1, '', None
-        for i, (w, t) in enumerate(zip(tokens, ts)):
-            if start is None:
-                start = t
-            buf += w
-            end_seg = w in '。！？!?' or (len(buf.strip()) >= 18 and w in '，、,;；')
-            if end_seg or i == len(tokens) - 1:
-                end = ts[i + 1] if i + 1 < len(ts) else t + 0.5
-                if buf.strip():
-                    lines.append(f'{idx}\n{_fmt(start)} --> {_fmt(end)}\n{buf.strip()}\n')
-                    idx += 1
-                buf, start = '', None
-        out.write_text('\n'.join(lines), encoding='utf-8')
-        return f'自包含生成(ResultHandler 因缺依赖跳过: {type(e).__name__})'
+    lines, idx, buf, start = [], 1, '', None
+    for i, (w, t) in enumerate(zip(tokens, ts)):
+        if start is None:
+            start = t
+        buf += w
+        end_seg = w in '。！？!?' or (len(buf.strip()) >= 18 and w in '，、,;；')
+        if end_seg or i == len(tokens) - 1:
+            end = ts[i + 1] if i + 1 < len(ts) else t + 0.5
+            if buf.strip():
+                lines.append(f'{idx}\n{_fmt(start)} --> {_fmt(end)}\n{buf.strip()}\n')
+                idx += 1
+            buf, start = '', None
+    out.write_text('\n'.join(lines), encoding='utf-8')
+    return '本脚本生成'
 
 
 def main() -> int:

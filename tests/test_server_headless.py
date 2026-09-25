@@ -4,7 +4,7 @@
 
 验证服务端作为局域网守护进程（pm2 / systemd / Windows 计划任务）运行时：
 1. 端口被占用 → 立即以退出码 1 退出，无任何「按回车」交互；
-2. `import core.server` / `import core.server.app` 不拉起 tkinter / core.ui / pystray；
+2. 导入 server、proxy 及 server app 不加载 tkinter / UI / pystray；
 3. 一次 SIGTERM 即触发 stop() 清理并以退出码 0 退出（仅 POSIX）；
 4. 服务端源码不再含 input() 交互路径；
 5. 环境变量 CW_LOG_LEVEL 可覆盖 server logger 级别。
@@ -53,10 +53,12 @@ server.start()
 # 导入隔离探测：导入服务端全部真实链路后检查 GUI 模块是否被拉起
 IMPORT_ISOLATION_PROBE = '''\
 import sys
+sys.modules['tkinter'] = None
 import core.server
+import core.proxy
 import core.server.app
 
-bad = [m for m in ('tkinter', 'core.ui', 'pystray') if m in sys.modules]
+bad = [m for m in ('core.ui', 'core.server.ui', 'pystray') if m in sys.modules]
 print('BAD_MODULES:', bad)
 sys.exit(1 if bad else 0)
 '''
@@ -112,7 +114,7 @@ def test_port_conflict_exits_1_without_input(tmp_path):
 
 
 def test_import_core_server_does_not_pull_gui_modules(tmp_path):
-    """import core.server（含 app 链路）后 tkinter / core.ui / pystray 不得出现在 sys.modules。"""
+    """导入 server/proxy（含 app 链路）不得依赖 tkinter 或 UI 模块。"""
     script = _write_probe(tmp_path, 'import_isolation_probe.py', IMPORT_ISOLATION_PROBE)
     proc = subprocess.run(
         [sys.executable, str(script)],
