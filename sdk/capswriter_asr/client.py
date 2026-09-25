@@ -317,17 +317,20 @@ async def _operation(
         duration = np.frombuffer(audio, dtype="<f4").size / _RAW_SAMPLE_RATE
     elif encoding == "s16le":
         duration = np.frombuffer(audio, dtype="<i2").size / _RAW_SAMPLE_RATE
-    return await _transcribe_connected(
-        url,
-        audio,
-        encoding=encoding,
-        language=language,
-        context=context,
-        seg_duration=seg_duration,
-        seg_overlap=seg_overlap,
-        idle_timeout=idle_timeout,
-        on_progress=on_progress,
-    )
+    try:
+        return await _transcribe_connected(
+            url,
+            audio,
+            encoding=encoding,
+            language=language,
+            context=context,
+            seg_duration=seg_duration,
+            seg_overlap=seg_overlap,
+            idle_timeout=idle_timeout,
+            on_progress=on_progress,
+        )
+    except (OSError, websockets.exceptions.WebSocketException) as exc:
+        raise AsrError("connection_lost", f"无法连接服务端 WebSocket: {exc}") from exc
 
 
 async def transcribe_file(

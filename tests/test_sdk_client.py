@@ -340,6 +340,20 @@ async def test_close_without_error_frame_maps_to_connection_lost(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_websocket_connection_failure_maps_to_connection_lost(tmp_path, monkeypatch):
+    audio_path = make_audio(tmp_path / "source.wav")
+
+    def refuse_connection(_url, **_kwargs):
+        raise OSError("connection refused")
+
+    async with fake_v2_server(accept_and_finish) as (url, _):
+        monkeypatch.setattr(sdk_client.websockets, "connect", refuse_connection)
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(audio_path, url)
+    assert caught.value.code == "connection_lost"
+
+
+@pytest.mark.asyncio
 async def test_transcode_failure_uses_decode_failed(monkeypatch, tmp_path):
     monkeypatch.setattr(sdk_client.shutil, "which", lambda _name: None)
     with pytest.raises(AsrError) as caught:
