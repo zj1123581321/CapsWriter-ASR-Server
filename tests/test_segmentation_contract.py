@@ -57,6 +57,16 @@ def test_rejects_segmentation_values_outside_allowed_range(
         )
 
 
+def test_engine_segment_limits_follow_config_without_loading_models(monkeypatch):
+    monkeypatch.setattr(ServerConfig, "model_type", "qwen_asr")
+    assert ws_recv._engine_segment_limit() == 80.0
+    monkeypatch.setattr(ServerConfig, "model_type", "qwen_asr_mlx")
+    assert ws_recv._engine_segment_limit() == 80.0
+    for model_type in ("paraformer", "sensevoice", "fun_asr_nano"):
+        monkeypatch.setattr(ServerConfig, "model_type", model_type)
+        assert ws_recv._engine_segment_limit() is None
+
+
 def test_snap_validation_accounts_for_maximum_cut_and_search_after(monkeypatch):
     monkeypatch.setattr(ServerConfig, "model_type", "qwen_asr")
     monkeypatch.setattr(ServerConfig, "seg_cut_snap", True)
