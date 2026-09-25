@@ -26,10 +26,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# PyInstaller 打包配置
-# 通常这些文件由脚本生成，可能包含本地路径
-*.manifest
-*.spec
+# 模型归档包不入库
 *.zip
 
 # 安装日志
@@ -152,7 +149,7 @@ models/*.py
 # 日志与按年归档的文件夹（如 2026/01/...）
 20*/
 
-# 日志文件夹（包含 server_*.log 和 client_*.log）
+# 服务端与 proxy 日志
 logs/
 
 # 音频文件
@@ -185,9 +182,7 @@ file_*.txt
 *summary*.txt
 *summary*.md
 
-release
-*.dll 
-*.exe
+*.dll
 
 models/**/*.cfg
 # llama.cpp 下载的二进制(按需下载，不入库)

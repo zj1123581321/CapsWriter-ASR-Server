@@ -9,10 +9,3 @@ rich
 websockets
 watchdog
 pypinyin
-
-# tray and image
-pystray
-Pillow
-
-markdown
-tkhtmlview

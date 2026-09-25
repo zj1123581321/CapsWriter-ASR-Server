@@ -105,7 +105,6 @@ class Logger:
         """
         if name not in cls._loggers:
             # 如果 logger 还没有被初始化，先创建一个默认的（INFO 级别）
-            # 之后 core_client.py/core_server.py 会用正确的级别重新初始化
             return cls.setup(name, level='INFO')
         return cls._loggers[name]
 

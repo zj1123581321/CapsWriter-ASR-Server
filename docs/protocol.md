@@ -1,8 +1,8 @@
 # CapsWriter ASR 服务协议（v2）
 状态：已评审（2026-09-26 CEO review + eng review 窄审），实现按任务卡逐步落地；本文件是服务端、proxy、SDK 的唯一契约来源。
 
-适用：server（`core/server`）、proxy（`core/proxy`）、SDK（由 `scripts/transcribe_client.py` 升级）。
-协议定义唯一来源：仓内包 `capswriter_asr/protocol.py`（可 `pip install git+…` 给下游）；`core/protocol.py` 改为从它 re-export，现有 import 不变。
+适用：server（`core/server`）、proxy（`core/proxy`）和下游 SDK。
+服务端消息数据类定义在 `core/protocol.py`；SDK 按本契约编码和解析消息。
 
 ## 0. 设计约束
 
@@ -12,7 +12,7 @@
 
 ## 1. 连接、任务与唯一终态
 
-- **一条连接同一时刻最多一个活动任务**。任务终结（final 或 error）后，同连接可开始下一个任务（兼容现麦克风客户端复用连接：`core/client/connection/websocket_manager.py:75`、`recorder.py:188`）。
+- **一条连接同一时刻最多一个活动任务**。任务终结（final 或 error）后，同连接可开始下一个任务。
 - 活动任务未终结时出现不同 `task_id` → `error{code:"task_conflict"}`。
 - 服务端内部一律以 `(socket_id, task_id)` 为任务键（修正 `state.py:70` 仅按 task_id 全局存储导致跨连接同 ID 串结果的问题）。
 
@@ -76,7 +76,7 @@
 | `flac` | 一条 FLAC 流，任意字节切分 | — | per-task ffmpeg |
 | `ogg_opus` | 一条 Ogg/Opus 流，任意字节切分 | — | per-task ffmpeg |
 
-- 单帧 base64 解码后 ≤ 64 MiB（约 17 分钟 f32le）；超限 `bad_request`。现 `transcribe_client.py:279` 整文件单帧发送的写法在 T12 改为分块，与本限制同批上线。
+- 单帧 base64 解码后 ≤ 64 MiB（约 17 分钟 f32le）；超限 `bad_request`。
 - 单任务解码后音频时长 ≤ `CW_MAX_TASK_SECONDS`（默认 14400）；按**解码后 PCM** 计，超限 `audio_too_long`。
 - ffmpeg 生命周期（asyncio 子进程，写 stdin 与读 stdout 为两个并发协程，禁止同步串行写读）：
   1. 首帧创建：`ffmpeg -nostdin -f {flac|ogg} -i pipe:0 -ar 16000 -ac 1 -f f32le pipe:1`（显式 demuxer）。
@@ -111,7 +111,7 @@ v1 字段全部保留，新增 `type:"result"`（老下游 dict.get 读取不受
 | no_backend | （proxy）无可用 v2 后端 | true |
 | internal | 其他（附异常类名） | true |
 
-- 老 v1 客户端（仓内 `core/client`，将于 T9 删除）用 `RecognitionMessage.from_dict` 解析 error 会抛 KeyError；随后连接关闭，它会停止等待，但可能误报「完成」——已知且接受，不修（客户端将删除）。
+- 老 v1 下游若用 `RecognitionMessage.from_dict` 解析 error 会抛 `KeyError`；随后连接关闭，它会停止等待，但可能误报「完成」。新接入应使用 SDK 或按本契约处理 error 帧。
 - 无法解析出 task_id 的坏帧，task_id 填空串。
 
 ## 5. /health（HTTP GET，同端口）
@@ -168,7 +168,7 @@ proxy：
 - `websockets.connect(..., ping_interval=None, max_size=None, max_queue=None)`。
 - 上传与接收并发（两个协程）；禁止「先发完再收」。
 - 分块：raw 编码每帧 ≤ 60 秒音频；压缩流每帧 256 KiB。
-- 截止时间由独立计时器强制（修正 `transcribe_client.py:282`）：
+- 截止时间由独立计时器强制：
   - `deadline_total = max(120s, 音频时长 × 1.0 + 60s)`；
   - `idle_timeout = 300s`：上传结束后无任何服务端消息，或 send 被阻塞超过此值 → 失败。
 - 失败抛 `AsrError(code, message)`：code 取服务端 error 原值；另有 `timeout`、`connection_lost`（无 error 帧的异常关闭）、`server_too_old`、`unsupported_encoding`。SDK 不自动重试。
@@ -177,9 +177,7 @@ proxy：
 
 | 客户端 \ 服务端 | v1 server | v2 server | v2 proxy（混合后端） |
 |---|---|---|---|
-| 外部老下游（缺 encoding） | 现状 | 正常；失败时 error+关连接 → 退出等待 | 可落任意后端，现状语义 |
-| 仓内 core/client 麦克风 | 现状 | 正常（顺序复用连接允许） | 同左 |
-| 仓内 transcribe_client（整文件单帧） | 现状 | >17 分钟被 bad_request 拒 → T12 同批改分块 | 同左 |
+| 下游 v1 应用（缺 encoding） | 现状 | 正常；失败时按 error 帧处理 | 可落任意健康后端 |
 | SDK v2（任意 encoding） | ServerTooOld | 正常 | 只落 v2 后端，否则 no_backend |
 
 ## 10. 本契约引出的现存缺陷（与 v2 无关，P0 修）

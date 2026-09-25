@@ -1,28 +1,23 @@
-## 数据流 (Data Flow)
-```
-[Microphone] -> sounddevice callback -> asyncio.Queue
-   |
-   v  (ShortcutManager 检测按键)
-[AudioStreamManager] 开始录音 -> WebSocketManager 发送 AudioMessage (base64 chunks)
-   |
-   v  (WebSocket, 子协议 "binary")
-[Server: SocketManager] -> ws_recv -> AudioCache 切片 -> Task -> multiprocessing.Queue
-   |
-   v
-[Worker 子进程: RecognizerWorker]
-   |-- TaskPipeline: 音频预处理 -> ASR 解码 -> 文本合并 -> 格式化
-   |-- 输出两路结果: text (简单合并) + text_accu (时间戳去重)
-   |
-   v
-[Server: ws_send] -> RecognitionMessage -> WebSocket -> Client
-   |
-   v
-[Client: ResultProcessor]
-   |-- 音素热词纠正 (FastRAG + AccuRAG)
-   |-- 正则规则替换 (hot-rule.txt)
-   |-- LLM 角色检测 -> 上下文组装 -> API 调用 -> 流式输出
-   |-- TextOutput 上屏 (type/paste) 或 Toast 显示
-   |-- DiaryWriter 日记归档
-   |-- UDP 广播识别结果
+## 服务端数据流
+
+```text
+Python SDK 或其他下游
+        |
+        | WebSocket 音频帧（proxy 可选）
+        v
+ASR Proxy（按任务选择后端）
+        |
+        v
+ASR Server 主进程
+  接收与校验 -> 解码 -> 分段 -> 有界任务队列
+                                  |
+                                  v
+                         Worker 子进程
+                         ASR / 标点 / 对齐
+                                  |
+                                  v
+ASR Server 主进程
+  合并文本与时间戳 -> 结果帧 / 错误帧 -> WebSocket 下游
 ```
 
+SDK 将音频文件转换为选定编码并分块上传；自定义下游可直接实现 [协议](protocol.md)。服务端错误、连接终态、编码能力和版本兼容规则以协议文档为准。

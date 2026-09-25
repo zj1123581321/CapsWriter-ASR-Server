@@ -1,9 +1,9 @@
 # CapsWriter-Offline 服务端依赖 —— Linux + NVIDIA(Vulkan GPU) 版
 # 与上游 requirements-server.txt 的差异：
 #   - onnxruntime-directml (Windows 专属) → onnxruntime (Linux CPU 跑 ONNX 编码器)
-#   - 补齐上游未显式声明、但运行时(qwen_asr 引擎/无头托盘 import 链)实际需要的包
+#   - 补齐上游未显式声明、但运行时实际需要的包
 #
-# 另需系统包(apt)：python3-tk  libsndfile1  libvulkan1  vulkan-tools
+# 另需系统包(apt)：libsndfile1  libvulkan1  vulkan-tools
 # GGUF 解码器 GPU 加速：llama.cpp b7798 的 Linux Vulkan .so 放入
 #   core/server/engines/llama/bin/  (libllama.so / libggml*.so / libggml-vulkan.so)
 
@@ -28,10 +28,6 @@ requests
 pyyaml
 nagisa
 soynlp
-
-# 托盘 import 链(即便 enable_tray=False 也在模块加载期被 import)
-markdown
-tkhtmlview
 
 # ============ GPU 后端：Vulkan → CUDA（RTF 0.29 → 0.041，7x）============
 # llama.cpp Linux 无 CUDA 预编译包。本机直接复用 funasr_spk_server 已编译的同版 CUDA 库：

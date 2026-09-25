@@ -35,7 +35,3 @@ requests
 pyyaml
 nagisa
 soynlp
-
-# 托盘 import 链(即便 enable_tray=False 也在模块加载期被 import)
-markdown
-tkhtmlview
