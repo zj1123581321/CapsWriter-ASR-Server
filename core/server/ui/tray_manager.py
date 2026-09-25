@@ -22,7 +22,8 @@ class TrayManager:
             return
 
         try:
-            from . import enable_min_to_tray
+            # 惰性导入：core.ui 会连带 tkinter/pystray，只在确实启用托盘时加载
+            from core.ui.tray import enable_min_to_tray
         except ImportError as e:
             logger.warning(f"托盘模块导入失败，跳过托盘功能: {e}")
             return

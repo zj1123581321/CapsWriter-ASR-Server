@@ -13,3 +13,10 @@
 - **本段结论**：`app.py` 移除对 `core.tools.signal_handler.register_signal` 的依赖（客户端双击 Ctrl+C 行为不受影响），新增 `_register_exit_signals()`：SIGINT 与 SIGTERM 任一收到一次即调用 `self.stop()`；Windows 以 `sys.platform != 'win32' and hasattr(signal, 'SIGTERM')` 判定只注册 SIGINT。退出码 0 的通路依赖既有 `stop()` 末尾 `loop.stop()` → `run_until_complete` 抛 RuntimeError → 既有 `except RuntimeError: pass` 捕获后正常收尾。
 - **关键决策与已否决方案**：否决复用 `core.tools.signal_handler` 加参数扩展——卡面明确服务端可不再使用它，且其「1 秒内两次」语义与无头需求相反。
 - **下一步唯一动作**：托盘导入链惰性化。
+
+## 里程碑 3：托盘导入链惰性化
+
+- **当前阶段**：实现
+- **本段结论**：`core/server/ui/__init__.py` 移除顶层 `from core.ui.tray import enable_min_to_tray`（该导入会连带 toast/tray→tkinter/pystray），改为仅说明惰性导入策略的文档字符串；唯一消费方 `tray_manager.py` 改为在 `enable_tray` 为真时于 `start()` 内 `from core.ui.tray import enable_min_to_tray` 惰性导入。`stop()` 原本已守卫+惰性，未动。
+- **关键决策与已否决方案**：否决「模块级 `__getattr__` 惰性导出」——唯一消费方就一处，直接改导入点更简单（反熵：新增抽象说不出第二个消费者）。
+- **下一步唯一动作**：logger 默认目录去客户端依赖 + CW_LOG_LEVEL。
