@@ -167,6 +167,43 @@ def test_sigterm_triggers_stop_and_exits_0(tmp_path):
             proc.wait()
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason='Windows 不投递 SIGTERM')
+def test_sigterm_while_event_loop_is_idle_exits_0(tmp_path):
+    """事件循环已在 selector 等待时收到 SIGTERM，也应在 5 秒内退出。"""
+    script = _write_probe(tmp_path, 'sigterm_idle_probe.py', SIGTERM_PROBE)
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_child_env(),
+        cwd=str(REPO_ROOT),
+    )
+    try:
+        ready = False
+        for line in proc.stdout:
+            if 'SERVER_READY' in line:
+                ready = True
+                break
+        assert ready, f'探测脚本未就绪即退出 (rc={proc.poll()})'
+
+        time.sleep(0.5)  # 确认事件循环已有机会进入 selector.select()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            rc = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = proc.wait()
+            raise AssertionError(f'空闲循环收到 SIGTERM 后 5 秒未退出（已 kill，rc={rc}）')
+
+        assert rc == 0, f'期望退出码 0，实际 {rc}'
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def test_server_sources_have_no_input_interaction():
     """服务端源码不再含 input() 交互路径（端口自检、模型检查均 fail fast）。"""
     for rel in ('core/server/connection/server_manager.py', 'core/server/worker/check_model.py'):
