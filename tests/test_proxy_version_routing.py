@@ -373,8 +373,12 @@ async def test_bounded_upload_queue_backpressures_client_send():
             await client_send(make_audio("slow-task"))
         assert session.outbound_queue.qsize() == 8
 
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(client_send(make_audio("slow-task")), timeout=0.05)
+        blocked_send = asyncio.create_task(client_send(make_audio("slow-task")))
+        done, _ = await asyncio.wait({blocked_send}, timeout=0.05)
+        assert not done, "上行队列满后客户端 send 应被背压挂起"
+        blocked_send.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await blocked_send
         assert session.outbound_queue.qsize() <= 8
     finally:
         release_backend.set()
