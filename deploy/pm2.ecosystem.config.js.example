@@ -1,0 +1,37 @@
+const path = require("path");
+
+const repo = path.resolve(__dirname, "..");
+const python = path.join(repo, ".venv", "bin", "python");
+
+module.exports = {
+  apps: [
+    {
+      name: "capswriter-paraformer",
+      cwd: repo,
+      script: "start_server.py",
+      interpreter: python,
+      env: { CW_MODEL_TYPE: "paraformer", CW_PORT: "6016" },
+    },
+    {
+      name: "capswriter-qwen-mlx",
+      cwd: repo,
+      script: "start_server.py",
+      interpreter: python,
+      env: {
+        CW_MODEL_TYPE: "qwen_asr_mlx",
+        CW_PORT: "6017",
+        CW_ALIGNER_LLM_USE_GPU: "1",
+      },
+    },
+    {
+      name: "capswriter-proxy",
+      cwd: repo,
+      script: "start_proxy.py",
+      interpreter: python,
+      env: {
+        CW_PROXY_PORT: "6020",
+        CW_PROXY_BACKENDS: "ws://127.0.0.1:6016,ws://127.0.0.1:6017",
+      },
+    },
+  ],
+};
