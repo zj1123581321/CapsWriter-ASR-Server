@@ -1,7 +1,6 @@
-# CapsWriter ASR 服务协议 v2（v2）
+# CapsWriter ASR 服务协议（v2）
 状态：已评审（2026-09-26 CEO review + eng review 窄审），实现按任务卡逐步落地；本文件是服务端、proxy、SDK 的唯一契约来源。
 
-状态：草案 r2，2026-09-26 /plan-eng-review 窄审 + Codex 复核后修订；落库路径 `docs/protocol.md`（随 T2 提交）。
 适用：server（`core/server`）、proxy（`core/proxy`）、SDK（由 `scripts/transcribe_client.py` 升级）。
 协议定义唯一来源：仓内包 `capswriter_asr/protocol.py`（可 `pip install git+…` 给下游）；`core/protocol.py` 改为从它 re-export，现有 import 不变。
 
