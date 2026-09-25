@@ -22,6 +22,15 @@ class NoHealthyBackendError(RuntimeError):
     """Raised when no backend can accept a new task."""
 
 
+class NoCompatibleBackendError(NoHealthyBackendError):
+    """Raised when no healthy v2 backend supports the requested encoding."""
+
+    def __init__(self, task_id: str | None, encoding):
+        self.task_id = task_id
+        self.encoding = encoding
+        super().__init__(f"没有健康且支持编码 {encoding!r} 的 v2 后端")
+
+
 def parse_audio_message(raw_message: str) -> AudioMessage:
     """Parse client AudioMessage JSON and validate the CapsWriter protocol."""
     data = json.loads(raw_message)
@@ -70,11 +79,26 @@ class TaskRouter:
         self.latency_ttl_seconds = latency_ttl_seconds
         self.task_history = task_history
 
-    def select_backend(self) -> BackendState:
+    def select_backend(
+        self,
+        encoding=None,
+        require_v2: bool = False,
+        task_id: str | None = None,
+    ) -> BackendState:
         if not self.backends:
+            if require_v2:
+                raise NoCompatibleBackendError(task_id, encoding)
             raise NoHealthyBackendError("No ASR backend is configured")
 
         healthy_backends = [backend for backend in self.backends if backend.healthy]
+        if require_v2:
+            healthy_backends = [
+                backend
+                for backend in healthy_backends
+                if backend.protocol_version >= 2 and encoding in backend.encodings
+            ]
+            if not healthy_backends:
+                raise NoCompatibleBackendError(task_id, encoding)
         if not healthy_backends:
             raise NoHealthyBackendError("所有后端均不健康，等待探活恢复")
 
@@ -108,11 +132,19 @@ class TaskRouter:
         return session.backend if session else None
 
     async def route_client_message(self, raw_message: str, client_ws) -> None:
-        msg = parse_audio_message(raw_message)
+        data = json.loads(raw_message)
+        msg = AudioMessage.from_dict(data)
         session = self.task_sessions.get(msg.task_id)
         if session is None:
-            session = await self._open_task_session(msg.task_id, client_ws)
+            session = await self._open_task_session(
+                msg.task_id,
+                client_ws,
+                encoding=data.get("encoding"),
+                require_v2="encoding" in data,
+            )
         await session.outbound_queue.put(raw_message)
+        if self.task_sessions.get(msg.task_id) is not session:
+            return
 
     async def close_all(self) -> None:
         task_ids = list(self.task_sessions)
@@ -142,7 +174,8 @@ class TaskRouter:
                 audio_duration=audio_duration,
                 inference_latency=inference_latency,
             )
-        await session.outbound_queue.put(None)
+        while not session.outbound_queue.empty():
+            session.outbound_queue.get_nowait()
 
         current = asyncio.current_task()
         for task in (session.client_to_backend_task, session.backend_to_client_task):
@@ -161,12 +194,22 @@ class TaskRouter:
             session.backend.active_tasks,
         )
 
-    async def _open_task_session(self, task_id: str, client_ws) -> TaskSession:
+    async def _open_task_session(
+        self,
+        task_id: str,
+        client_ws,
+        encoding=None,
+        require_v2: bool = False,
+    ) -> TaskSession:
         start_time = monotonic()
         tried = set()
         last_error = None
         while True:
-            backend = self.select_backend()
+            backend = self.select_backend(
+                encoding=encoding,
+                require_v2=require_v2,
+                task_id=task_id,
+            )
             if backend.id in tried:
                 raise NoHealthyBackendError(
                     f"所有后端连接失败: task_id={task_id} tried={tried}"
@@ -200,7 +243,7 @@ class TaskRouter:
             break
 
         backend.record_connect_success()
-        outbound_queue = asyncio.Queue()
+        outbound_queue = asyncio.Queue(maxsize=8)
         session = TaskSession(
             task_id=task_id,
             backend=backend,
@@ -245,8 +288,6 @@ class TaskRouter:
         try:
             while True:
                 raw_message = await outbound_queue.get()
-                if raw_message is None:
-                    return
                 await backend_ws.send(raw_message)
         except asyncio.CancelledError:
             raise
@@ -298,6 +339,7 @@ class TaskRouter:
             except Exception:
                 logger.debug("客户端连接关闭失败: task_id=%s", task_id, exc_info=True)
             raise
+        await self.close_session(task_id, status="failed")
 
     def _record_backend_latency(self, backend: BackendState, raw_message: str) -> None:
         try:

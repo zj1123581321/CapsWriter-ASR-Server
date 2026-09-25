@@ -109,6 +109,10 @@ async def test_status_endpoint_returns_backend_info():
             ),
         ],
     )
+    async def skip_health_probe():
+        return None
+
+    proxy._probe_backends = skip_health_probe
 
     async with proxy.serve() as proxy_ws_server:
         proxy_port = proxy_ws_server.sockets[0].getsockname()[1]
@@ -125,6 +129,8 @@ async def test_status_endpoint_returns_backend_info():
         "id": "backend-0",
         "url": "ws://127.0.0.1:6017",
         "healthy": True,
+        "protocol_version": 1,
+        "git_sha": None,
         "active_tasks": 2,
         "avg_latency": 0.0,
         "latency_samples": 0,
@@ -136,6 +142,8 @@ async def test_status_endpoint_returns_backend_info():
         "id": "backend-1",
         "url": "ws://127.0.0.1:6018",
         "healthy": False,
+        "protocol_version": 1,
+        "git_sha": None,
         "active_tasks": 0,
         "avg_latency": 1.23,
         "latency_samples": 4,
@@ -211,15 +219,11 @@ async def test_client_disconnect_records_failed_task_history():
 
 
 @pytest.mark.asyncio
-async def test_health_probe_recovers_backend_when_it_comes_back():
-    """Background health probe should mark an unhealthy backend as healthy
-    when it can connect again, without sacrificing a real task."""
-    probe_count = 0
+async def test_health_probe_recognizes_legacy_backend_http_426():
+    """An old server's ordinary HTTP 426 response marks it as a healthy v1 backend."""
 
     async def backend_handler(ws):
-        nonlocal probe_count
-        probe_count += 1
-        await ws.close()
+        await ws.recv()
 
     backends = [
         BackendState(id="good", url="ws://127.0.0.1:1"),
@@ -230,13 +234,13 @@ async def test_health_probe_recovers_backend_when_it_comes_back():
 
     assert backends[1].healthy is False
 
-    async with websockets.serve(backend_handler, "127.0.0.1", 0, max_size=None) as recovered_server:
-        port = recovered_server.sockets[0].getsockname()[1]
+    async with websockets.serve(backend_handler, "127.0.0.1", 0, max_size=None) as legacy_server:
+        port = legacy_server.sockets[0].getsockname()[1]
         backends[1].url = f"ws://127.0.0.1:{port}"
 
         async with proxy.serve():
             await asyncio.sleep(0.3)
 
     assert backends[1].healthy is True
+    assert backends[1].protocol_version == 1
     assert backends[1].consecutive_failures == 0
-    assert probe_count >= 1

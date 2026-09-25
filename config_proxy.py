@@ -47,4 +47,5 @@ class ProxyConfig:
 
     max_connect_failures = 3
     cooldown_seconds = 60
+    probe_interval = 30.0
     log_level = "DEBUG"

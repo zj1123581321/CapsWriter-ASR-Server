@@ -51,6 +51,19 @@ def test_backend_success_resets_failures_and_health():
     assert backend.consecutive_failures == 0
 
 
+def test_connect_success_does_not_override_failed_health_probe():
+    backend = BackendState(id="backend-0", url="ws://localhost:6016")
+
+    backend.record_health_failure()
+    backend.record_connect_success()
+
+    assert backend.healthy is False
+
+    backend.record_legacy_health()
+
+    assert backend.healthy is True
+
+
 def test_backend_connect_failure_records_failure_time(monkeypatch):
     monkeypatch.setattr("core.proxy.backend.time.time", lambda: 123.0)
     backend = BackendState(

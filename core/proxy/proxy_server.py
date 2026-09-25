@@ -11,12 +11,27 @@ import time
 from collections import deque
 from html import escape
 from typing import Iterable, Optional
-from urllib.parse import parse_qs, urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
+from core.tools.build_info import get_git_sha
 from core.logger import setup_logger
 
 from .backend import BackendState
-from .router import NoHealthyBackendError, TaskRouter
+from .router import NoCompatibleBackendError, NoHealthyBackendError, TaskRouter
+
+
+def _read_backend_health(url: str) -> tuple[int, bytes]:
+    parts = urlsplit(url)
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
+    health_url = urlunsplit((scheme, parts.netloc, "/health", "", ""))
+    request = Request(health_url, method="GET")
+    try:
+        with urlopen(request, timeout=5.0) as response:
+            return response.status, response.read()
+    except HTTPError as exc:
+        return exc.code, exc.read()
 
 
 class _ProbeContextManager:
@@ -26,6 +41,7 @@ class _ProbeContextManager:
         self._probe_task = None
 
     async def __aenter__(self):
+        await self._proxy._probe_backends()
         server = await self._ws_cm.__aenter__()
         self._probe_task = asyncio.create_task(self._proxy._health_probe_loop())
         return server
@@ -48,7 +64,7 @@ class ProxyServer:
         backends: Iterable[BackendState],
         cooldown_seconds: int = 60,
         log_level: str = "DEBUG",
-        probe_interval: float = 60.0,
+        probe_interval: float = 30.0,
         max_probe_interval: float = 300.0,
     ):
         self.listen_addr = listen_addr
@@ -58,6 +74,7 @@ class ProxyServer:
         self.probe_interval = probe_interval
         self.max_probe_interval = max_probe_interval
         self.logger = setup_logger("proxy", level=log_level, log_filename="proxy")
+        self.git_sha = get_git_sha()
         self._server = None
         self._probe_task = None
         self.task_history = deque(maxlen=1000)
@@ -80,6 +97,19 @@ class ProxyServer:
         from websockets.http11 import Response
 
         parsed = urlsplit(request.path)
+        if parsed.path == "/health":
+            payload = self.health_payload()
+            status_code = 200 if payload["status"] == "ok" else 503
+            reason = "OK" if status_code == 200 else "Service Unavailable"
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers = Headers(
+                [
+                    ("Content-Type", "application/json; charset=utf-8"),
+                    ("Content-Length", str(len(body))),
+                    ("Cache-Control", "no-store"),
+                ]
+            )
+            return Response(status_code, reason, headers, body)
         if parsed.path != "/status":
             return None
 
@@ -106,6 +136,8 @@ class ProxyServer:
                     "id": backend.id,
                     "url": backend.url,
                     "healthy": backend.healthy,
+                    "protocol_version": backend.protocol_version,
+                    "git_sha": backend.git_sha,
                     "active_tasks": backend.active_tasks,
                     "avg_latency": backend.avg_latency,
                     "latency_samples": backend.latency_samples,
@@ -126,12 +158,46 @@ class ProxyServer:
             "generated_at": time.time(),
         }
 
+    def health_payload(self) -> dict:
+        healthy_v2_backends = [
+            backend
+            for backend in self.backends
+            if backend.healthy and backend.protocol_version >= 2
+        ]
+        encodings = sorted(
+            {
+                encoding
+                for backend in healthy_v2_backends
+                for encoding in backend.encodings
+            }
+        )
+        return {
+            "status": "ok" if healthy_v2_backends else "unavailable",
+            "protocol_version": 2,
+            "role": "proxy",
+            "git_sha": self.git_sha,
+            "encodings": encodings,
+            "backends": [
+                {
+                    "url": backend.url,
+                    "healthy": backend.healthy,
+                    "protocol_version": backend.protocol_version,
+                    "model": backend.model,
+                    "encodings": list(backend.encodings),
+                    "git_sha": backend.git_sha,
+                }
+                for backend in self.backends
+            ],
+        }
+
     def status_html(self, payload: dict) -> str:
         backend_rows = "\n".join(
             "<tr>"
             f"<td>{escape(backend['id'])}</td>"
             f"<td>{escape(backend['url'])}</td>"
             f"<td>{'yes' if backend['healthy'] else 'no'}</td>"
+            f"<td>{backend['protocol_version']}</td>"
+            f"<td>{escape(str(backend['git_sha'] or ''))}</td>"
             f"<td>{backend['active_tasks']}</td>"
             f"<td>{backend['avg_latency']:.3f}</td>"
             f"<td>{backend['latency_samples']}</td>"
@@ -177,7 +243,7 @@ class ProxyServer:
   </div>
   <h2>Backends</h2>
   <table>
-    <thead><tr><th>ID</th><th>URL</th><th>Healthy</th><th>Active</th><th>Avg latency</th><th>Samples</th><th>Weight</th><th>Failures</th><th>Last failure</th></tr></thead>
+    <thead><tr><th>ID</th><th>URL</th><th>Healthy</th><th>Protocol</th><th>Git SHA</th><th>Active</th><th>Avg latency</th><th>Samples</th><th>Weight</th><th>Failures</th><th>Last failure</th></tr></thead>
     <tbody>{backend_rows}</tbody>
   </table>
   <h2>Recent Tasks</h2>
@@ -200,43 +266,69 @@ class ProxyServer:
             await asyncio.Future()
 
     async def _health_probe_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.probe_interval)
+            await self._probe_backends()
+
+    async def _probe_backends(self) -> None:
+        await asyncio.gather(*(self._probe_backend(backend) for backend in self.backends))
+
+    async def _probe_backend(self, backend: BackendState) -> None:
+        try:
+            status_code, body = await asyncio.wait_for(
+                asyncio.to_thread(_read_backend_health, backend.url),
+                timeout=5.0,
+            )
+        except (OSError, URLError, TimeoutError) as exc:
+            await self._probe_legacy_websocket(backend, exc)
+            return
+
+        if status_code == 503:
+            backend.record_health_failure()
+            self.logger.debug("后端 /health 返回 503: backend=%s url=%s", backend.id, backend.url)
+            return
+        if status_code != 200:
+            backend.record_legacy_health()
+            return
+
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            backend.record_legacy_health()
+            return
+        if not isinstance(payload, dict) or type(payload.get("protocol_version")) is not int:
+            backend.record_legacy_health()
+            return
+        encodings = payload.get("encodings", [])
+        payload["encodings"] = (
+            encodings
+            if isinstance(encodings, list) and all(isinstance(item, str) for item in encodings)
+            else []
+        )
+        backend.record_health(payload)
+
+    async def _probe_legacy_websocket(self, backend: BackendState, http_error: Exception) -> None:
         import websockets
 
-        backoff: dict[str, float] = {}
-        while True:
-            unhealthy = [b for b in self.backends if not b.healthy]
-            if not unhealthy:
-                await asyncio.sleep(self.probe_interval)
-                continue
-            for backend in unhealthy:
-                interval = backoff.get(backend.id, self.probe_interval)
-                try:
-                    ws = await asyncio.wait_for(
-                        websockets.connect(
-                            backend.url, max_size=None, ping_interval=None,
-                        ),
-                        timeout=5.0,
-                    )
-                    await ws.close()
-                    backend.consecutive_failures = 0
-                    backend.healthy = True
-                    backoff.pop(backend.id, None)
-                    self.logger.info(
-                        "探活成功，后端恢复健康: backend=%s url=%s",
-                        backend.id,
-                        backend.url,
-                    )
-                except Exception:
-                    new_interval = min(interval * 2, self.max_probe_interval)
-                    backoff[backend.id] = new_interval
-                    self.logger.debug(
-                        "探活失败: backend=%s url=%s next_probe=%.0fs",
-                        backend.id,
-                        backend.url,
-                        new_interval,
-                    )
-            next_sleep = min(backoff.get(b.id, self.probe_interval) for b in unhealthy if not b.healthy) if any(not b.healthy for b in unhealthy) else self.probe_interval
-            await asyncio.sleep(next_sleep)
+        kwargs = {"uri": backend.url, "max_size": None, "ping_interval": None}
+        version_parts = tuple(int(part) for part in websockets.__version__.split(".")[:2])
+        if version_parts >= (14, 0):
+            kwargs["proxy"] = None
+        try:
+            ws = await asyncio.wait_for(websockets.connect(**kwargs), timeout=5.0)
+        except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as exc:
+            backend.record_health_failure()
+            self.logger.debug(
+                "后端 HTTP 探测失败且 WebSocket 不可用: backend=%s url=%s http_error=%s ws_error=%s",
+                backend.id,
+                backend.url,
+                http_error,
+                exc,
+            )
+            return
+        await ws.close()
+        backend.record_legacy_health()
+        self.logger.debug("后端无 /health，按 v1 记录: backend=%s url=%s", backend.id, backend.url)
 
     async def handle_client(self, client_ws) -> None:
         remote = getattr(client_ws, "remote_address", None)
@@ -250,6 +342,21 @@ class ProxyServer:
             async for raw_message in client_ws:
                 try:
                     await router.route_client_message(raw_message, client_ws)
+                except NoCompatibleBackendError as exc:
+                    await client_ws.send(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "task_id": exc.task_id,
+                                "code": "no_backend",
+                                "message": str(exc),
+                                "retryable": True,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    await client_ws.close(code=4000, reason="no_backend")
+                    break
                 except NoHealthyBackendError:
                     self.logger.error("没有健康后端可用，关闭客户端连接: %s", remote)
                     await client_ws.close(code=1013, reason="No healthy ASR backend")
@@ -282,6 +389,7 @@ def build_proxy_from_config(config: Optional[object] = None) -> ProxyServer:
         backends,
         cooldown_seconds=getattr(config, "cooldown_seconds", 60),
         log_level=getattr(config, "log_level", "DEBUG"),
+        probe_interval=getattr(config, "probe_interval", 30.0),
     )
 
 

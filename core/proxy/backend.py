@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar
 from time import monotonic
 
@@ -26,6 +26,11 @@ class BackendState:
     weight: float = 1.0
     active_tasks: int = 0
     healthy: bool = True
+    health_probe_failed: bool = False
+    protocol_version: int = 1
+    encodings: list[str] = field(default_factory=list)
+    model: str | None = None
+    git_sha: str | None = None
     consecutive_failures: int = 0
     last_failure_time: float = 0.0
     last_result_time: float = 0.0
@@ -51,7 +56,33 @@ class BackendState:
 
     def record_connect_success(self) -> None:
         self.consecutive_failures = 0
+        self.healthy = not self.health_probe_failed
+
+    def record_health(self, payload: dict) -> None:
         self.healthy = True
+        self.health_probe_failed = False
+        self.protocol_version = payload["protocol_version"]
+        self.encodings = payload.get("encodings", [])
+        self.model = payload.get("model")
+        self.git_sha = payload.get("git_sha")
+        self.consecutive_failures = 0
+
+    def record_legacy_health(self) -> None:
+        self.healthy = True
+        self.health_probe_failed = False
+        self.protocol_version = 1
+        self.encodings = []
+        self.model = None
+        self.git_sha = None
+        self.consecutive_failures = 0
+
+    def record_health_failure(self) -> None:
+        self.healthy = False
+        self.health_probe_failed = True
+        self.protocol_version = 1
+        self.encodings = []
+        self.model = None
+        self.git_sha = None
 
     def record_connect_failure(self, refresh_cooldown: bool = True) -> None:
         self.consecutive_failures += 1
