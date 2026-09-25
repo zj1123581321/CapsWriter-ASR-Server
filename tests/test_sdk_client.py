@@ -28,6 +28,7 @@ sys.path.insert(0, str(REPO_ROOT / "sdk"))
 import capswriter_asr.client as sdk_client
 from capswriter_asr import AsrError, Transcript, transcribe_file
 from capswriter_asr.client import _transcode
+from capswriter_asr.outputs import _fmt_timestamp, write_srt
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -409,6 +410,28 @@ def test_sdk_package_does_not_import_server_core():
                 assert all(not alias.name.startswith("core") for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 assert not (node.module or "").startswith("core")
+
+
+def test_legacy_srt_segmentation_and_timestamp_rounding(tmp_path):
+    transcript = Transcript(
+        text="你好，世界！测试完毕。",
+        tokens=["你", "好", "，", "世", "界", "！", "测", "试", "完", "毕", "。"],
+        timestamps=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        duration=1.5,
+        raw={},
+    )
+    out = tmp_path / "legacy.srt"
+    write_srt(transcript, out)
+    assert out.read_text(encoding="utf-8") == (
+        "1\n00:00:00,000 --> 00:00:00,600\n你好，世界！\n\n"
+        "2\n00:00:00,600 --> 00:00:01,500\n测试完毕。\n"
+    )
+    assert [_fmt_timestamp(value) for value in (3661.5, 1.9999, 59.9995, 0.1234)] == [
+        "01:01:01,500",
+        "00:00:02,000",
+        "00:01:00,000",
+        "00:00:00,123",
+    ]
 
 
 @pytest.mark.asyncio
