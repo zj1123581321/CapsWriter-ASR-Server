@@ -73,9 +73,22 @@ class SocketManager:
         ) as server:
             self._server = server  # 保存 server 引用，用于外部关闭
 
-            # 4. 进入识别结果发送循环 (作为主阻塞任务)
-            logger.info("WebSocket 发送协程已就绪")
-            await ws_send(self.app)
+            # sender 与 worker 看门狗并行；任一异常结束都让服务端主循环退出。
+            logger.info("WebSocket 发送协程与推理进程看门狗已就绪")
+            sender_task = asyncio.create_task(ws_send(self.app))
+            monitor_task = asyncio.create_task(self.app.process_manager.monitor())
+            tasks = {sender_task, monitor_task}
+            try:
+                done, _ = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    await task
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             
         self._is_running = False
         logger.info("SocketManager: WebSocket 服务已退出")

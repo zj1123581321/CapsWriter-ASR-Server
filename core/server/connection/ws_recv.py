@@ -265,6 +265,10 @@ async def ws_recv(websocket, app) -> None:
                 active = state.connection_tasks.get(socket_id)
                 if active:
                     transition_terminal(state, active, 'FAILED')
+                if task_id and active != (socket_id, task_id):
+                    malformed_key = (socket_id, task_id)
+                    begin_task(state, malformed_key)
+                    transition_terminal(state, malformed_key, 'FAILED')
                 await queue_error_and_close(
                     state, websocket, socket_id, task_id, 'bad_request',
                     f"{type(e).__name__}: {e}", False,

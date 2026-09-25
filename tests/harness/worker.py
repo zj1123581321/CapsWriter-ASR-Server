@@ -8,4 +8,5 @@ from tests.harness.fake_engine import ProgrammableFakeEngine
 def run_fake_worker(queue_in, queue_out, sockets_id, options, calls):
     handler = TaskHandler(queue_in, queue_out, sockets_id, WorkerState())
     handler.set_engine(ProgrammableFakeEngine(calls=calls, **options))
+    queue_out.put(True)
     handler.loop()

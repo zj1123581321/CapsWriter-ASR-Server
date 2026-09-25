@@ -53,6 +53,7 @@ async def test_twenty_seconds_are_covered_without_gaps(fake_asr_server):
         chunk_seconds=0.5,
     )
     final = messages[-1]
+    assert final["type"] == "result"
     assert final["is_final"] is True
     assert final["task_id"] == task_id
     assert_gapless(decode_spans(final["text"]), 20_000, fake_asr_server.calls)

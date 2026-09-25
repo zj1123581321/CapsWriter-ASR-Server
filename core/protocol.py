@@ -91,7 +91,7 @@ class RecognitionMessage:
     
     def to_json(self) -> str:
         """序列化为 JSON 字符串"""
-        return json.dumps(asdict(self), ensure_ascii=False)
+        return json.dumps(self.to_dict(), ensure_ascii=False)
     
     def to_dict(self) -> dict:
         """转换为字典"""
