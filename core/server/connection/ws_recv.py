@@ -65,7 +65,7 @@ class AudioCache:
         self.search_to = 0.0
 
 
-async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, state) -> None:
+async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, state=None) -> None:
     """缓冲达到阈值后切分并提交识别任务。
 
     seg_cut_snap 开启时，在名义切点附近吸附"最不像人声"的断点下刀
@@ -81,7 +81,7 @@ async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socke
     if not Config.seg_cut_snap:
         # 固定时长盲切（原始行为）
         while cache.duration >= nominal + overlap * 2:
-            _cut_and_submit(msg, cache, queue_in, socket_id, state, cut=nominal)
+            _cut_and_submit(msg, cache, queue_in, socket_id, cut=nominal, state=state)
         return
 
     w_before, w_after = Config.seg_search_before, Config.seg_search_after
@@ -113,10 +113,10 @@ async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socke
             logger.info(f"切点吸附: [{lo:.1f}, {hi:.1f}]s 内无可信静音断点，取最低分点 {cut:.2f}s 下刀")
 
         cache.search_to = 0.0
-        _cut_and_submit(msg, cache, queue_in, socket_id, state, cut=cut)
+        _cut_and_submit(msg, cache, queue_in, socket_id, cut=cut, state=state)
 
 
-def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, state, cut: float) -> None:
+def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, cut: float, state=None) -> None:
     """从缓冲区头部切出 [0, cut+overlap] 提交识别，缓冲区前移 cut 秒。"""
     n_stride = int(round(cut * AudioFormat.SAMPLE_RATE))
     n_segment = n_stride + int(round(msg.seg_overlap * AudioFormat.SAMPLE_RATE))
@@ -141,7 +141,8 @@ def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: s
     )
     cache.offset += stride_bytes / AudioFormat.BYTES_PER_SECOND
     queue_in.put(task)
-    register_segment_submission(state, (socket_id, msg.task_id), time.monotonic())
+    if state is not None:
+        register_segment_submission(state, (socket_id, msg.task_id), time.monotonic())
     logger.debug(
         f"提交音频片段，任务ID: {msg.task_id}, 切点: {cut:.2f}s, "
         f"偏移: {cache.offset}s, 缓冲区: {len(cache.chunks)} bytes"
