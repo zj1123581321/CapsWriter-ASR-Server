@@ -149,7 +149,7 @@ def _get_health(url: str) -> tuple[int, bytes]:
         return exc.code, exc.read()
 
 
-async def _check_server(url: str, encoding: str) -> None:
+async def _check_server(url: str, encoding: str, model: str | None = None) -> None:
     try:
         status, body = await asyncio.to_thread(_get_health, _health_url(url))
     except (TimeoutError, OSError, urllib.error.URLError) as exc:
@@ -170,6 +170,8 @@ async def _check_server(url: str, encoding: str) -> None:
     encodings = health.get("encodings", [])
     if not isinstance(encodings, list) or encoding not in encodings:
         raise AsrError("unsupported_encoding", f"服务端不支持编码 {encoding}")
+    if model is not None and health.get("role") == "server" and health.get("model") != model:
+        raise AsrError("bad_request", f"请求模型 {model!r} 与服务端模型 {health.get('model')!r} 不符")
 
 
 def _audio_frames(data: bytes, encoding: str):
@@ -195,6 +197,7 @@ def _audio_frame(
     seg_overlap: float,
     language: str | None,
     context: str | None,
+    model: str | None,
 ) -> str:
     frame = {
         "task_id": task_id,
@@ -212,6 +215,8 @@ def _audio_frame(
         frame["language"] = language
     if context is not None:
         frame["context"] = context
+    if model is not None:
+        frame["model"] = model
     return json.dumps(frame, ensure_ascii=False)
 
 
@@ -254,6 +259,7 @@ async def _transcribe_connected(
     samples_total: int,
     language: str | None,
     context: str | None,
+    model: str | None,
     seg_duration: float,
     seg_overlap: float,
     idle_timeout: float,
@@ -281,6 +287,7 @@ async def _transcribe_connected(
                     seg_overlap=seg_overlap,
                     language=language,
                     context=context,
+                    model=model,
                 )
                 try:
                     await asyncio.wait_for(ws.send(frame), timeout=idle_timeout)
@@ -323,6 +330,7 @@ async def _operation(
     encoding: str,
     language: str | None,
     context: str | None,
+    model: str | None,
     seg_duration: float,
     seg_overlap: float,
     idle_timeout: float,
@@ -331,7 +339,7 @@ async def _operation(
 ) -> Transcript:
     duration = await _audio_duration(path)
     set_deadline(max(120.0, duration + 60.0))
-    await _check_server(url, encoding)
+    await _check_server(url, encoding, model)
     audio = await _transcode(path, encoding)
     if encoding == "f32le":
         samples_total = np.frombuffer(audio, dtype="<f4").size
@@ -349,6 +357,7 @@ async def _operation(
             samples_total=samples_total,
             language=language,
             context=context,
+            model=model,
             seg_duration=seg_duration,
             seg_overlap=seg_overlap,
             idle_timeout=idle_timeout,
@@ -370,6 +379,7 @@ async def transcribe_file(
     deadline_total=None,
     idle_timeout=300.0,
     on_progress=None,
+    model=None,
 ) -> Transcript:
     """转录音频文件；不会降级或自动重试。"""
     started = time.monotonic()
@@ -392,6 +402,7 @@ async def transcribe_file(
             seg_overlap=seg_overlap,
             idle_timeout=idle_timeout,
             on_progress=on_progress,
+            model=model,
             set_deadline=set_deadline,
         )
 
@@ -438,6 +449,7 @@ def transcribe_file_sync(
     deadline_total=None,
     idle_timeout=300.0,
     on_progress=None,
+    model=None,
 ) -> Transcript:
     """同步入口，适用于非 asyncio 调用方。"""
     return asyncio.run(
@@ -452,5 +464,6 @@ def transcribe_file_sync(
             deadline_total=deadline_total,
             idle_timeout=idle_timeout,
             on_progress=on_progress,
+            model=model,
         )
     )

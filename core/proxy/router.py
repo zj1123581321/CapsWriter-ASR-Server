@@ -25,10 +25,14 @@ class NoHealthyBackendError(RuntimeError):
 class NoCompatibleBackendError(NoHealthyBackendError):
     """Raised when no healthy v2 backend supports the requested encoding."""
 
-    def __init__(self, task_id: str | None, encoding):
+    def __init__(self, task_id: str | None, encoding, model: str | None = None):
         self.task_id = task_id
         self.encoding = encoding
-        super().__init__(f"没有健康且支持编码 {encoding!r} 的 v2 后端")
+        self.model = model
+        details = f"编码 {encoding!r} 的 v2 后端"
+        if model is not None:
+            details += f"（model={model!r}）"
+        super().__init__(f"没有健康且支持{details}")
 
 
 def parse_audio_message(raw_message: str) -> AudioMessage:
@@ -84,10 +88,11 @@ class TaskRouter:
         encoding=None,
         require_v2: bool = False,
         task_id: str | None = None,
+        model: str | None = None,
     ) -> BackendState:
         if not self.backends:
-            if require_v2:
-                raise NoCompatibleBackendError(task_id, encoding)
+            if require_v2 or model is not None:
+                raise NoCompatibleBackendError(task_id, encoding, model)
             raise NoHealthyBackendError("No ASR backend is configured")
 
         healthy_backends = [backend for backend in self.backends if backend.healthy]
@@ -95,10 +100,13 @@ class TaskRouter:
             healthy_backends = [
                 backend
                 for backend in healthy_backends
-                if backend.protocol_version >= 2 and encoding in backend.encodings
+                if backend.protocol_version >= 2
+                and (encoding is None or encoding in backend.encodings)
             ]
-            if not healthy_backends:
-                raise NoCompatibleBackendError(task_id, encoding)
+        if model is not None:
+            healthy_backends = [backend for backend in healthy_backends if backend.model == model]
+        if (require_v2 or model is not None) and not healthy_backends:
+            raise NoCompatibleBackendError(task_id, encoding, model)
         if not healthy_backends:
             raise NoHealthyBackendError("所有后端均不健康，等待探活恢复")
 
@@ -140,7 +148,8 @@ class TaskRouter:
                 msg.task_id,
                 client_ws,
                 encoding=data.get("encoding"),
-                require_v2="encoding" in data,
+                require_v2="encoding" in data or msg.model is not None,
+                model=msg.model,
             )
         await session.outbound_queue.put(raw_message)
         if self.task_sessions.get(msg.task_id) is not session:
@@ -200,6 +209,7 @@ class TaskRouter:
         client_ws,
         encoding=None,
         require_v2: bool = False,
+        model: str | None = None,
     ) -> TaskSession:
         start_time = monotonic()
         tried = set()
@@ -209,6 +219,7 @@ class TaskRouter:
                 encoding=encoding,
                 require_v2=require_v2,
                 task_id=task_id,
+                model=model,
             )
             if backend.id in tried:
                 raise NoHealthyBackendError(
