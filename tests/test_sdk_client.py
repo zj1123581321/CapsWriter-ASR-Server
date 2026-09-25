@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import base64
 import inspect
 import json
@@ -21,6 +22,7 @@ import websockets
 from websockets.datastructures import Headers
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SDK_PACKAGE = REPO_ROOT / "sdk" / "capswriter_asr"
 sys.path.insert(0, str(REPO_ROOT / "sdk"))
 
 import capswriter_asr.client as sdk_client
@@ -358,6 +360,23 @@ async def test_transcode_failure_uses_decode_failed(monkeypatch, tmp_path):
     monkeypatch.setattr(sdk_client.shutil, "which", lambda _name: None)
     with pytest.raises(AsrError) as caught:
         await _transcode(tmp_path / "source.wav", "flac")
+    assert caught.value.code == "decode_failed"
+
+
+def test_sdk_package_does_not_import_server_core():
+    for source in SDK_PACKAGE.glob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert all(not alias.name.startswith("core") for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                assert not (node.module or "").startswith("core")
+
+
+@pytest.mark.asyncio
+async def test_missing_audio_raises_decode_failed(tmp_path):
+    with pytest.raises(AsrError) as caught:
+        await transcribe_file(tmp_path / "missing.wav", "ws://127.0.0.1:1")
     assert caught.value.code == "decode_failed"
 
 
