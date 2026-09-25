@@ -12,6 +12,7 @@ import websockets
 from config_server import ServerConfig as Config
 from .ws_recv import ws_recv
 from .ws_send import ws_send
+from .health import process_request
 from .. import logger # Server module logger
 
 
@@ -66,6 +67,7 @@ class SocketManager:
             Config.addr,
             Config.port,
             max_size=None,
+            process_request=functools.partial(process_request, app=self.app),
             # 禁用 keepalive ping：超长音频上传/识别期间，客户端忙于连续发送大帧，
             # pong 无法在默认 20s 内送达，服务端会误判超时并以 1011 断连
             # （与 core/proxy/proxy_server.py 的 serve 保持一致）

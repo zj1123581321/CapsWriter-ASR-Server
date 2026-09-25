@@ -12,11 +12,12 @@ import websockets
 
 from core.server.connection.ws_recv import ws_recv
 from core.server.connection.ws_send import ws_send
+from core.server.connection.health import process_request as health_process_request
 from core.server.state import ServerState
 from core.server.worker.process_manager import ProcessManager
 
 from tests.harness.fake_engine import IDENTITY_MARKER
-from tests.harness.worker import run_fake_worker
+from tests.harness.worker import run_health_fake_worker
 
 
 class ObservedTaskQueue:
@@ -84,7 +85,7 @@ def run_managed_fake_server(
         ServerConnection.send = stall_first
     app = SimpleNamespace(state=state)
     worker = multiprocessing.Process(
-        target=run_fake_worker,
+        target=run_health_fake_worker,
         args=(queue_in, queue_out, state.sockets_id, options, calls),
         daemon=True,
     )
@@ -94,9 +95,7 @@ def run_managed_fake_server(
     process_manager._process = worker
     process_manager.is_alive = True
     app.process_manager = process_manager
-    ready = queue_out.get(timeout=15)
-    if ready is not True:
-        raise AssertionError(f"假 worker 就绪信号异常: {ready!r}")
+    process_manager._wait_for_models()
 
     async def serve():
         from core.tools.daemon_executor import SimpleDaemonExecutor
@@ -107,6 +106,7 @@ def run_managed_fake_server(
             0,
             max_size=None,
             ping_interval=None,
+            process_request=functools.partial(health_process_request, app=app),
         )
         info_queue.put((server.sockets[0].getsockname()[1], worker.pid))
         sender = asyncio.create_task(ws_send(app))

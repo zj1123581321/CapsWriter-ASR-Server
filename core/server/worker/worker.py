@@ -78,7 +78,10 @@ class RecognizerWorker:
         )
         
         # 4. 通知主进程模型已加载成功
-        self.handler.queue_out.put(True)
+        self.handler.queue_out.put({
+            "loaded": True,
+            "aligner": self.loader.aligner_status,
+        })
         
         # 5. Windows 下物理内存清理 (优化项)
         if system() == 'Windows':
