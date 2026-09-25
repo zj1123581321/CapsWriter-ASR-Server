@@ -17,3 +17,9 @@
 - 本段结论：删除 LLM 角色文件、客户端配置/入口、客户端依赖清单、双用途 PyInstaller 与 zip 打包文件、客户端专属工具和文档/图片；保留服务端部署与模型文档。可跟踪 `.py` 数为 358 → 254，AST 入口可达 179 个模块；README 为 35 行且三条要求链接均存在。无 tkinter 的 server/proxy 导入命令输出 `ok`。
 - 关键决策与已否决方案：AST 仍列出 5 个 `core/server/engines/**` 非 export 文件不可达，但卡面禁止改动整个引擎目录，故原样保留并在报告列出；未达 Python 模块对应的 `core/tools/zhconv/zhcdict.json` 保留，因为该非代码文件不在 AST 删除规则内，删除它会使总代码行差超过 20,000 硬预算。`models/Ollama-Polish.py` 位于卡面清理范围之外，保留并报告。更新 `requirements-server*.txt` 去掉已无调用方的托盘依赖，属 Scope-Globs 外的必要偏差。
 - 下一步唯一动作：运行卡面指定的完整 pytest 命令并完成末次静态/grep 验收。
+
+## 里程碑 4：完整测试通过
+- 当前阶段：实现与主验证完成。
+- 本段结论：卡面 Verify-Command 输出 `213 passed, 3 skipped, 81 warnings in 57.81s`；无 tkinter 导入冒烟输出 `ok`。现存跳过项是需平台/模型资源的集成用例。
+- 关键决策与已否决方案：不删除测试套件中的服务端无头测试与 SDK 测试；仓库内没有独立 Windows 桌面客户端测试文件。
+- 下一步唯一动作：完成最终 grep/预算/状态取证，生成报告并推送 draft PR。
