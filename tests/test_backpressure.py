@@ -313,6 +313,9 @@ async def test_backpressure_pauses_upload_idle_timer(monkeypatch, server_factory
 
             release.set()
             await asyncio.sleep(0.05)
+            assert record.status == "RECEIVING", (
+                f"背压结束后任务仍应接收上传；实际状态={record.status}"
+            )
             await websocket.send(audio_frame("paused-idle", data=data, is_final=True, seg_duration=5))
             results = await collect_results(websocket, 3)
             assert len(results) == 3
