@@ -157,6 +157,8 @@ async def test_inflight_limit_stops_reads_and_returns_all_results(monkeypatch, s
     monkeypatch.setattr(ServerConfig, "max_tasks", 8)
     release = multiprocessing.Event()
     server = await server_factory(release_event=release, delay_seconds=1)
+    sending = None
+    receiver = None
     try:
         task_id = "twenty-segments"
         data = base64.b64encode(bytes(15 * 16000 * 4)).decode("ascii")
@@ -183,9 +185,8 @@ async def test_inflight_limit_stops_reads_and_returns_all_results(monkeypatch, s
                 assert asyncio.get_running_loop().time() < deadline
                 await asyncio.sleep(0.01)
 
-            with pytest.raises(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(sending), timeout=0.2)
-            assert not sending.done(), "背压生效前 20 帧发送已完成"
+            await asyncio.sleep(0.2)
+            assert not sending.done(), f"背压生效前发送协程应挂起；实际 done={sending.done()}"
 
             in_flight_samples = []
             for _ in range(20):
@@ -202,6 +203,12 @@ async def test_inflight_limit_stops_reads_and_returns_all_results(monkeypatch, s
             assert results[-1]["is_final"] is True
     finally:
         release.set()
+        for task in (sending, receiver):
+            if task is not None and not task.done():
+                task.cancel()
+        pending_tasks = [task for task in (sending, receiver) if task is not None]
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         await server.stop()
 
 
