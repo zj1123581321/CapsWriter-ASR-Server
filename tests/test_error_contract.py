@@ -73,11 +73,11 @@ async def test_intermediate_inference_failure_stops_later_segments(fake_asr_serv
     ) as websocket:
         await send_audio(
             websocket,
-            make_audio(2.0),
+            make_audio(10.0),
             task_id=task_id,
-            seg_duration=0.5,
+            seg_duration=5.0,
             seg_overlap=0,
-            chunk_seconds=0.5,
+            chunk_seconds=5.0,
         )
         messages, closed = await collect_terminal(websocket, task_id=task_id, timeout=5)
         assert closed is False
@@ -130,9 +130,9 @@ async def test_same_connection_can_start_next_task_after_final(fake_asr_server):
                 websocket,
                 make_audio(0.5),
                 task_id=task_id,
-                seg_duration=0.5,
+                seg_duration=5.0,
                 seg_overlap=0,
-                chunk_seconds=0.5,
+                chunk_seconds=5.0,
             )
             messages, closed = await collect_terminal(websocket, task_id=task_id, timeout=5)
             assert not closed
@@ -149,12 +149,12 @@ async def test_final_segment_inference_failure_is_error(fake_asr_server):
     ) as websocket:
         await send_audio(
             websocket,
-            make_audio(2.0),
+            make_audio(20.0),
             task_id=task_id,
-            seg_duration=0.5,
+            seg_duration=5.0,
             seg_overlap=0,
-            chunk_seconds=0.5,
-            final_frame_seconds=0.5,
+            chunk_seconds=5.0,
+            final_frame_seconds=5.0,
         )
         messages, closed = await collect_terminal(websocket, task_id=task_id, timeout=5)
         errors = [message for message in messages if message.get("type") == "error"]
@@ -181,9 +181,9 @@ async def test_worker_killed_closes_clients_and_exits_main_nonzero():
                 websocket,
                 make_audio(1.0),
                 task_id="kill-worker",
-                seg_duration=0.5,
+                seg_duration=5.0,
                 seg_overlap=0,
-                chunk_seconds=0.5,
+                chunk_seconds=5.0,
             )
             await server.wait_for_calls(1)
             os.kill(server.worker_pid, signal.SIGKILL)
@@ -215,9 +215,9 @@ async def test_segment_watchdog_errors_and_exits_main_nonzero(monkeypatch):
                 websocket,
                 make_audio(1.0),
                 task_id="watchdog",
-                seg_duration=0.5,
+                seg_duration=5.0,
                 seg_overlap=0,
-                chunk_seconds=0.5,
+                chunk_seconds=5.0,
             )
             messages, closed = await collect_terminal(
                 websocket, task_id="watchdog",
@@ -242,11 +242,11 @@ async def test_slow_consumer_does_not_block_another_connection():
         ) as slow:
             await send_audio(
                 slow,
-                make_audio(0.8),
+                make_audio(5.0),
                 task_id="slow",
-                seg_duration=0.2,
+                seg_duration=5.0,
                 seg_overlap=0,
-                chunk_seconds=0.8,
+                chunk_seconds=5.0,
                 finalize=False,
             )
             slow.transport.pause_reading()
@@ -275,9 +275,9 @@ async def test_slow_consumer_does_not_block_another_connection():
                     normal,
                     make_audio(1.0),
                     task_id="normal",
-                    seg_duration=0.5,
+                    seg_duration=5.0,
                     seg_overlap=0,
-                    chunk_seconds=0.5,
+                    chunk_seconds=5.0,
                 )
                 normal_messages, normal_closed = await collect_terminal(
                     normal, task_id="normal", timeout=10
