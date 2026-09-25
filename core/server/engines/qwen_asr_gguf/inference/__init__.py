@@ -1,9 +1,6 @@
 # coding=utf-8
 from .. import logger
-try:
-    from ...llama import llama
-except:
-    ...
+from ...llama import llama
 
 from .asr import QwenASREngine
 from .aligner import QwenForcedAligner

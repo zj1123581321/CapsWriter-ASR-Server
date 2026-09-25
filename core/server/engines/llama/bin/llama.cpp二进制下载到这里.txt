@@ -1,17 +1,18 @@
-llama.cpp 预编译二进制下载（用于 GGUF LLM Decoder 推理：qwen_asr 解码器 / ForceAligner 解码器）
+llama.cpp 预编译动态库（GGUF 解码与 ForceAligner）
 
-⚠️ 版本必须锁定 b7798（ctypes 绑定按该版 C API 编写，换版本可能符号对不上）。
-加载器已自动适配平台（core/server/engines/llama/llama.py），下载后把解压出的
-所有动态库放进本文件夹即可（加载器只显式加载 libggml / libggml-base / libllama，
-其余后端库由 ggml_backend_load_all() 自动发现，含 GPU 后端）。
+代码固定使用 llama.cpp b10621。必须将发行包中的动态库解压到本目录的 b10621/ 子目录；不要放在 bin/ 根目录。启动时会校验版本目录及 ggml、ggml-base、llama 三个库，目录缺失或库文件缺失会直接报错。其它后端动态库也请一并保留在同一目录，供 ggml_backend_load_all() 发现。
 
-各平台下载地址（同一个 release tag b7798）：
-- Windows (Vulkan): https://github.com/ggml-org/llama.cpp/releases/download/b7798/llama-b7798-bin-win-vulkan-x64.zip
-- macOS (Apple Silicon, Metal):
-    https://github.com/ggml-org/llama.cpp/releases/download/b7798/llama-b7798-bin-macos-arm64.tar.gz
-    解压后把 *.dylib 拷进本目录；macOS 需清除下载隔离标记：
-        xattr -dr com.apple.quarantine core/server/engines/llama/bin/
-    Metal 加速由 libggml-metal.dylib 自动启用，无需额外配置。
-- Linux: 见 requirements-server-linux.txt 内 GPU 后端说明（CUDA/Vulkan）。
+官方 release 下载地址格式：
+https://github.com/ggml-org/llama.cpp/releases/download/b10621/<资产文件名>
 
-放好后，文件转录的字级时间戳（.srt）由 ForceAligner 走此后端生成。
+已核实的资产与核心库文件名：
+- macOS Apple Silicon (Metal)：llama-b10621-bin-macos-arm64.tar.gz
+  - libggml.dylib、libggml-base.dylib、libllama.dylib
+- Windows x64 Vulkan：llama-b10621-bin-win-vulkan-x64.zip
+  - ggml.dll、ggml-base.dll、llama.dll
+- Windows x64 CPU：llama-b10621-bin-win-cpu-x64.zip
+  - ggml.dll、ggml-base.dll、llama.dll
+- Linux x64 CPU：llama-b10621-bin-ubuntu-x64.tar.gz
+  - libggml.so、libggml-base.so、libllama.so
+
+按版本存放可以保留旧版动态库；升级代码要求的新版本后，再单独下载并解压对应资产，不覆盖旧版本目录。回滚代码时旧版本目录仍可直接使用。

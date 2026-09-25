@@ -100,14 +100,17 @@ class TaskPipeline:
             caps = self.recognizer.capabilities
             if (task.type == 'file'
                 and EngineCapabilities.TIMESTAMPS not in caps 
-                and self.aligner 
                 and stream.result.text.strip()):
-                
+                if not self.aligner:
+                    raise RuntimeError(f"文件任务缺少对齐器: task={task.task_id}")
                 logger.debug(f"🚩 [Pipeline] 正在对文件分片执行对齐补齐...")
                 align_res = self.aligner.align(audio=samples, text=stream.result.text, language=task.language, offset_sec=0.0)
-                if align_res and align_res.items:
-                    stream.result.tokens = [it.text for it in align_res.items]
-                    stream.result.timestamps = [it.start_time for it in align_res.items]
+                if not align_res or not align_res.items:
+                    raise RuntimeError(
+                        f"对齐器未返回时间戳: task={task.task_id}, 文本长度={len(stream.result.text)}"
+                    )
+                stream.result.tokens = [it.text for it in align_res.items]
+                stream.result.timestamps = [it.start_time for it in align_res.items]
 
 
             # 6. 精确 Token 级拼接 (即便没有对齐器，原生支持时间戳的模型也会走这里)
@@ -148,6 +151,10 @@ class TaskPipeline:
             
             # 如果依然没有 tokens (麦克风跳过了对齐)，则用 text 回退
             if not result.tokens and result.text:
+                if task.type == 'file':
+                    raise RuntimeError(
+                        f"文件任务没有真实时间戳: task={task.task_id}, 文本长度={len(result.text)}"
+                    )
                 result.text_accu = result.text
                 chars = list(result.text_accu.replace(' ', ''))
                 if chars and result.duration > 0:
@@ -166,6 +173,5 @@ class TaskPipeline:
         except Exception as e:
             logger.error(f"推理管线错误: {e}", exc_info=True)
             raise
-
 
 

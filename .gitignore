@@ -191,8 +191,12 @@ release
 
 models/**/*.cfg
 # llama.cpp 下载的二进制(按需下载，不入库)
+# 保留改造前代码从 bin/ 根目录加载的旧库，支持首次升级回滚
 core/server/engines/llama/bin/*.so*
 core/server/engines/llama/bin/*.dylib
+core/server/engines/llama/bin/*/*.so*
+core/server/engines/llama/bin/*/*.dylib
+core/server/engines/llama/bin/*/*.dll
 .venv-test/
 .venv-mlx/
 temp/
