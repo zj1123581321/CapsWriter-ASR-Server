@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import urlopen
@@ -71,8 +73,14 @@ def test_health_payload_reports_unavailable_when_worker_is_dead():
 
 
 def _get_health(url: str) -> tuple[int, dict]:
-    with urlopen(url, timeout=5) as response:
-        return response.status, json.loads(response.read())
+    try:
+        with urlopen(url, timeout=5) as response:
+            return response.status, json.loads(response.read())
+    except HTTPError as response:
+        try:
+            return response.code, json.loads(response.read())
+        finally:
+            response.close()
 
 
 def _http_url(websocket_url: str) -> str:
@@ -156,5 +164,23 @@ async def test_health_endpoint_tracks_work_and_preserves_http_and_websocket():
         )
         assert idle["active_tasks"] == 0
         assert idle["queued_segments"] == 0
+    finally:
+        await harness.stop()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGKILL 子进程验证仅适用于 POSIX")
+@pytest.mark.asyncio
+async def test_health_returns_503_after_worker_is_killed_before_monitor_exit():
+    harness = await ManagedFakeServerHarness.start(monitor_interval=30)
+    try:
+        os.kill(harness.worker_pid, signal.SIGKILL)
+        await asyncio.sleep(0.05)
+        status_code, payload = await asyncio.to_thread(
+            _get_health, f"{_http_url(harness.url)}/health"
+        )
+
+        assert status_code == 503
+        assert payload["status"] == "unavailable"
+        assert payload["worker_alive"] is False
     finally:
         await harness.stop()
