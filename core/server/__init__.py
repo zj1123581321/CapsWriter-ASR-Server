@@ -14,11 +14,14 @@
 - ws_send: WebSocket 发送处理
 """
 
+import os
+
 from core.server.state import console
 from core.logger import get_logger, setup_logger
 from config_server import ServerConfig as Config, __version__
 
-setup_logger('server', level=Config.log_level)
+# 日志级别：无头部署可用环境变量 CW_LOG_LEVEL 覆盖（未设置或为空沿用 Config.log_level）
+setup_logger('server', level=os.environ.get('CW_LOG_LEVEL') or Config.log_level)
 logger = get_logger('server')
 
 from core.server.schema import Task, Result

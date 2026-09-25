@@ -20,3 +20,10 @@
 - **本段结论**：`core/server/ui/__init__.py` 移除顶层 `from core.ui.tray import enable_min_to_tray`（该导入会连带 toast/tray→tkinter/pystray），改为仅说明惰性导入策略的文档字符串；唯一消费方 `tray_manager.py` 改为在 `enable_tray` 为真时于 `start()` 内 `from core.ui.tray import enable_min_to_tray` 惰性导入。`stop()` 原本已守卫+惰性，未动。
 - **关键决策与已否决方案**：否决「模块级 `__getattr__` 惰性导出」——唯一消费方就一处，直接改导入点更简单（反熵：新增抽象说不出第二个消费者）。
 - **下一步唯一动作**：logger 默认目录去客户端依赖 + CW_LOG_LEVEL。
+
+## 里程碑 4：logger 去 config_client 依赖 + CW_LOG_LEVEL
+
+- **当前阶段**：实现
+- **本段结论**：`core/logger.py` 默认日志目录改为由 `logger.py` 自身 `__file__` 推导仓库根下 `logs/`（已核实 `config_server.BASE_DIR` 就是仓库根，行为等价）；`core/server/__init__.py` 在调用 `setup_logger` 处读 `CW_LOG_LEVEL`（未设置或为空沿用 `Config.log_level`），未动 `config_server.py`。初版注释里含 `config_client` 字样，卡面验收要求 grep 无输出，已改措辞。
+- **关键决策与已否决方案**：无
+- **下一步唯一动作**：提交无头化行为验收测试。
