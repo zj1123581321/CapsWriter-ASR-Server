@@ -32,6 +32,7 @@ class ProxyConfig:
 
     max_connect_failures = 3
     cooldown_seconds = 60
+    probe_interval = 30.0
     log_level = "DEBUG"
 ```
 
@@ -64,6 +65,14 @@ URI = "ws://<proxy-host>:6020"
 - 收到后端返回的最终 `RecognitionMessage`（`is_final=true`）后，代理关闭该任务的后端连接并释放负载计数。
 
 之所以每个任务独立连接，是因为 Server 端音频缓存绑定在每条 WebSocket 连接上，不按 `task_id` 隔离。代理不会复用后端连接。
+
+## 协议 v2 与 /health
+
+- 代理启动时并每隔 `probe_interval` 秒探测所有后端的 `/health`，默认 30 秒，单次 HTTP 请求最多等待 5 秒。
+- HTTP 200 且返回含整数 `protocol_version` 的 JSON 时按该版本记录；旧服务端的 426、无效响应按 v1 记录。HTTP 503 标记为不健康；HTTP 探测连接失败时再检查 WebSocket，连通则按 v1 记录。
+- 首帧带 `encoding` 的任务只分配给健康、协议版本至少为 2 且支持该编码的后端；没有候选时代理发 `no_backend` 错误并以 close code 4000 关闭连接。不带该字段的任务仍可走健康的 v1/v2 后端。
+- `GET /health` 返回代理协议版本、Git SHA、健康 v2 后端支持编码的并集及后端版本信息；没有健康 v2 后端时返回 HTTP 503。`/status` 的 JSON 和 HTML 也显示每个后端的协议版本与 Git SHA。
+- 每个任务的上行队列最多缓存 8 帧，队列满后代理暂停读取客户端。下行直接 `await client_ws.send`；协议 v2 每条连接只有一个活动任务，因此发送等待会把背压传回后端，不需要额外的 256 帧下行队列。
 
 ## 故障处理
 
