@@ -11,7 +11,6 @@ import websockets
 
 from core.server.connection.ws_recv import ws_recv
 from core.server.connection.ws_send import ws_send
-import core.server.connection.ws_recv as ws_recv_module
 from core.server.state import ServerState
 from core.server.worker.process_manager import ProcessManager
 
@@ -60,7 +59,7 @@ class FakeServerHarness:
 
 
 def run_managed_fake_server(
-    info_queue, options, calls, observed, queue_in, queue_out, stall_first_sender
+    info_queue, options, calls, observed, queue_in, queue_out, stall_first_send
 ):
     """在独立主进程中运行真 websocket、真 worker 和真实存活监控。"""
     from config_server import ServerConfig
@@ -70,17 +69,18 @@ def run_managed_fake_server(
     state.sockets_id = manager.list()
     state.queue_in = ObservedTaskQueue(queue_in, observed)
     state.queue_out = queue_out
-    if stall_first_sender:
-        original_sender = ws_recv_module._send_connection
+    if stall_first_send:
+        from websockets.asyncio.server import ServerConnection
+        original_send = ServerConnection.send
         stalled = set()
 
-        async def stall_first(websocket, outbound, socket_id):
+        async def stall_first(websocket, message, *args, **kwargs):
             if not stalled:
-                stalled.add(socket_id)
+                stalled.add(websocket.id)
                 await asyncio.Future()
-            await original_sender(websocket, outbound, socket_id)
+            await original_send(websocket, message, *args, **kwargs)
 
-        ws_recv_module._send_connection = stall_first
+        ServerConnection.send = stall_first
     app = SimpleNamespace(state=state)
     worker = multiprocessing.Process(
         target=run_fake_worker,
@@ -144,7 +144,7 @@ def run_model_load_failure():
 class ManagedFakeServerHarness:
     """跨进程监控验收用服务端句柄。"""
     @classmethod
-    async def start(cls, options=None, *, stall_first_sender=False):
+    async def start(cls, options=None, *, stall_first_send=False):
         self = cls()
         self.manager = multiprocessing.Manager()
         self.calls = self.manager.list()
@@ -161,7 +161,7 @@ class ManagedFakeServerHarness:
                 self.observed,
                 self.queue_in,
                 self.queue_out,
-                stall_first_sender,
+                stall_first_send,
             ),
         )
         self.process.start()

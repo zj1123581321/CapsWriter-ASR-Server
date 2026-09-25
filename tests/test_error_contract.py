@@ -232,7 +232,7 @@ async def test_segment_watchdog_errors_and_exits_main_nonzero(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_slow_consumer_does_not_block_another_connection():
-    server = await ManagedFakeServerHarness.start(stall_first_sender=True)
+    server = await ManagedFakeServerHarness.start(stall_first_send=True)
     try:
         async with websockets.connect(
             server.url, max_size=None, max_queue=1, ping_interval=None
