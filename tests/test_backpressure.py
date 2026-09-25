@@ -201,6 +201,7 @@ async def test_inflight_limit_stops_reads_and_returns_all_results(monkeypatch, s
             results = await asyncio.wait_for(receiver, timeout=45)
             assert len(results) == 20
             assert results[-1]["is_final"] is True
+            assert [call["sample_count"] for call in server.calls] == [15 * 16000] * 20
     finally:
         release.set()
         for task in (sending, receiver):
