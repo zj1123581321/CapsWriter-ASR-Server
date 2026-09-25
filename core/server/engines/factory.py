@@ -73,14 +73,9 @@ class EngineFactory:
     @staticmethod
     def create_punc_engine() -> BasePuncEngine:
         """创建标点引擎 (目前使用 CT-Transformer)"""
-        try:
-            from .ct_transformer.punc_engine import CTTransformerPuncEngine
-            model_path = ModelPaths.punc_model_dir.as_posix()
-            return CTTransformerPuncEngine(model_path)
-        except Exception as e:
-            from . import logger
-            logger.warning(f"⚠️ [警告] 标点模型加载失败 (原因: {e})，系统将以【无标点模式】继续运行...")
-            return BasePuncEngine(None)
+        from .ct_transformer.punc_engine import CTTransformerPuncEngine
+        model_path = ModelPaths.punc_model_dir.as_posix()
+        return CTTransformerPuncEngine(model_path)
 
     @staticmethod
     def create_align_engine() -> BaseAlignEngine:
@@ -94,8 +89,6 @@ class EngineFactory:
             config = AlignerConfig(**align_cfg_data)
             return QwenForceAligner(config)
         except Exception as e:
-            from . import logger
-            msg = f"⚠️ [警告] 对齐模型加载失败，原因: \n\n{e}\n\n系统将以【无精确时间戳模式】继续运行...\n\n"
             # 检查模型文件是否错放到上级目录
             aligner_dir = ModelPaths.force_aligner_gguf_dir
             aligner_files = [
@@ -103,9 +96,10 @@ class EngineFactory:
                 ModelPaths.force_aligner_gguf_encoder_backend,
                 ModelPaths.force_aligner_gguf_llm_decode,
             ]
+            misplaced = None
             for parent in aligner_dir.parents:
                 if any((parent / fp.name).exists() for fp in aligner_files):
-                    msg += f"模型文件似乎错放到了上级目录，应解压到：[bold yellow]{aligner_dir}[/bold yellow]\n\n"
+                    misplaced = f"模型文件似乎错放到了上级目录，应解压到：{aligner_dir}"
                     break
-            logger.warning(msg)
-            return BaseAlignEngine(None)
+            diagnosis = f"；{misplaced}" if misplaced else ""
+            raise RuntimeError(f"对齐模型加载失败：{e}{diagnosis}") from e
