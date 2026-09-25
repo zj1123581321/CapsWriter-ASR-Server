@@ -16,12 +16,12 @@ from typing import List, Union, Set, Optional
 from pathlib import Path
 from os.path import relpath
 from . import logger
+from ..llama_build_info import LLAMA_BUILD
 
 # =========================================================================
 # Configuration
 # =========================================================================
 LOGS = True      # 是否在 logger 文件中记录 llama.cpp 的日志
-LLAMA_BUILD = "b10621"
 
 
 def _llama_lib_dir() -> Path:

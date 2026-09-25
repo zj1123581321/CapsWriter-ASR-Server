@@ -32,6 +32,8 @@ class ProcessManager:
         self._process = None
         self.app = app
         self.is_alive = False
+        self.models_ready = False
+        self.aligner_status = "not_required"
 
     def start(self):
         """
@@ -43,6 +45,8 @@ class ProcessManager:
         # 防连续触发
         if self.is_alive: return
         self.is_alive = True
+        self.models_ready = False
+        self.aligner_status = "not_required"
 
         # 1. 前置检查
         check_model()
@@ -76,15 +80,16 @@ class ProcessManager:
         return self._process
 
     def _wait_for_models(self):
-        """轮询队列直到收到模型加载成功 (True) 或发生错误"""
+        """轮询队列直到收到模型加载完成状态或发生错误"""
         logger.info("正在等待子进程加载模型...")
 
         while self.is_alive:
             try:
                 # 阻塞最多 100ms
                 status = self.app.state.queue_out.get(timeout=0.1)
-                if status is True:
-                    # 收到 True 说明模型加载成功
+                if status["loaded"] is True:
+                    self.aligner_status = status["aligner"]
+                    self.models_ready = True
                     break
             except (queue.Empty, OSError):
                 if self._process and not self._process.is_alive():

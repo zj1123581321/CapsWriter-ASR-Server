@@ -12,11 +12,12 @@ import websockets
 
 from core.server.connection.ws_recv import ws_recv
 from core.server.connection.ws_send import ws_send
+from core.server.connection.health import process_request as health_process_request
 from core.server.state import ServerState
 from core.server.worker.process_manager import ProcessManager
 
 from tests.harness.fake_engine import IDENTITY_MARKER
-from tests.harness.worker import run_fake_worker
+from tests.harness.worker import run_health_fake_worker
 
 
 class ObservedTaskQueue:
@@ -60,10 +61,15 @@ class FakeServerHarness:
 
 
 def run_managed_fake_server(
-    info_queue, options, calls, observed, queue_in, queue_out, stall_first_send
+    info_queue, options, calls, observed, queue_in, queue_out, stall_first_send,
+    monitor_interval,
 ):
     """在独立主进程中运行真 websocket、真 worker 和真实存活监控。"""
     from config_server import ServerConfig
+    if monitor_interval is not None:
+        from core.server.worker import process_manager as process_manager_module
+        process_manager_module.PROCESS_MONITOR_INTERVAL_SECONDS = monitor_interval
+
     ServerConfig.seg_cut_snap = False
     manager = multiprocessing.Manager()
     state = ServerState(queue_in=queue_in, queue_out=queue_out)
@@ -84,7 +90,7 @@ def run_managed_fake_server(
         ServerConnection.send = stall_first
     app = SimpleNamespace(state=state)
     worker = multiprocessing.Process(
-        target=run_fake_worker,
+        target=run_health_fake_worker,
         args=(queue_in, queue_out, state.sockets_id, options, calls),
         daemon=True,
     )
@@ -94,9 +100,7 @@ def run_managed_fake_server(
     process_manager._process = worker
     process_manager.is_alive = True
     app.process_manager = process_manager
-    ready = queue_out.get(timeout=15)
-    if ready is not True:
-        raise AssertionError(f"假 worker 就绪信号异常: {ready!r}")
+    process_manager._wait_for_models()
 
     async def serve():
         from core.tools.daemon_executor import SimpleDaemonExecutor
@@ -107,6 +111,7 @@ def run_managed_fake_server(
             0,
             max_size=None,
             ping_interval=None,
+            process_request=functools.partial(health_process_request, app=app),
         )
         info_queue.put((server.sockets[0].getsockname()[1], worker.pid))
         sender = asyncio.create_task(ws_send(app))
@@ -145,7 +150,9 @@ def run_model_load_failure():
 class ManagedFakeServerHarness:
     """跨进程监控验收用服务端句柄。"""
     @classmethod
-    async def start(cls, options=None, *, stall_first_send=False):
+    async def start(
+        cls, options=None, *, stall_first_send=False, monitor_interval=None
+    ):
         self = cls()
         self.manager = multiprocessing.Manager()
         self.calls = self.manager.list()
@@ -163,6 +170,7 @@ class ManagedFakeServerHarness:
                 self.queue_in,
                 self.queue_out,
                 stall_first_send,
+                monitor_interval,
             ),
         )
         self.process.start()
@@ -191,6 +199,7 @@ class ManagedFakeServerHarness:
     async def stop(self):
         if self.process.is_alive():
             self.queue_in.put(None)
+            self.queue_out.put(None)
             await asyncio.to_thread(self.process.join, 5)
         graceful_timeout = self.process.is_alive()
         if graceful_timeout:
