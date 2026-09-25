@@ -47,6 +47,32 @@ async def assert_async_processes_are_reaped(monkeypatch):
     ]
 
 
+@pytest.fixture(autouse=True)
+def fake_media_tools(tmp_path, monkeypatch):
+    """CI runner 不保证安装 ffmpeg；脚本保留真实 argv/stdout 子进程边界。"""
+    tool_dir = tmp_path / "media-tools"
+    tool_dir.mkdir()
+    args_log = tmp_path / "ffmpeg-argv.txt"
+    ffmpeg = tool_dir / "ffmpeg"
+    ffmpeg.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPSWRITER_TEST_FFMPEG_ARGV\"\n"
+        "printf 'synthetic-flac-stream'\n",
+        encoding="utf-8",
+    )
+    ffprobe = tool_dir / "ffprobe"
+    ffprobe.write_text(
+        "#!/bin/sh\nfor input; do :; done\n"
+        "if [ ! -f \"$input\" ]; then printf 'missing input\\n' >&2; exit 1; fi\n"
+        "printf '1.0\\n'\n",
+        encoding="utf-8",
+    )
+    ffmpeg.chmod(0o755)
+    ffprobe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tool_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("CAPSWRITER_TEST_FFMPEG_ARGV", str(args_log))
+    return args_log
+
+
 def make_audio(path: Path, seconds: float = 1.0) -> Path:
     samples = np.zeros(int(16000 * seconds), dtype=np.float32)
     sf.write(path, samples, 16000)
@@ -116,9 +142,21 @@ async def accept_and_finish(ws, state):
 
 
 @pytest.mark.asyncio
-async def test_flac_upload_matches_transcode_and_v2_frames(tmp_path):
+async def test_flac_upload_matches_transcode_and_v2_frames(fake_media_tools, tmp_path):
     audio_path = make_audio(tmp_path / "source.wav", 5)
     expected = await _transcode(audio_path, "flac")
+    assert fake_media_tools.read_text(encoding="utf-8").splitlines() == [
+        "-nostdin",
+        "-i",
+        str(audio_path),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-f",
+        "flac",
+        "pipe:1",
+    ]
     async with fake_v2_server(accept_and_finish) as (url, state):
         transcript = await transcribe_file(audio_path, url)
     assert isinstance(transcript, Transcript)
