@@ -25,6 +25,9 @@ TaskKey = tuple[str, str]
 @dataclass
 class TaskLifecycle:
     status: str = 'RECEIVING'
+    segment_slots: asyncio.Semaphore | None = None
+    terminal_event: asyncio.Event = field(default_factory=asyncio.Event)
+    idle_deadline: float | None = None
 
 
 class SessionMap(dict):
@@ -135,12 +138,14 @@ def ensure_server_runtime(state) -> None:
             setattr(state, name, value)
 
 
-def begin_task(state, key: TaskKey) -> None:
+def begin_task(state, key: TaskKey, max_inflight_segments: int = 4) -> None:
     ensure_server_runtime(state)
     previous = state.connection_tasks.get(key[0])
     if previous is not None:
         state.tasks.pop(previous, None)
-    state.tasks[key] = TaskLifecycle()
+    state.tasks[key] = TaskLifecycle(
+        segment_slots=asyncio.Semaphore(max_inflight_segments)
+    )
     state.connection_tasks[key[0]] = key
     state.pending_segments[key] = deque()
 
@@ -162,6 +167,8 @@ def transition_terminal(state, key: TaskKey, status: str) -> bool:
     if record is None or record.status in {'DONE', 'FAILED'}:
         return False
     record.status = status
+    record.terminal_event.set()
+    record.segment_slots = None
     if state.connection_tasks.get(key[0]) == key:
         state.connection_tasks.pop(key[0], None)
     state.pending_segments.pop(key, None)
@@ -178,5 +185,8 @@ def acknowledge_segment_result(state, key: TaskKey) -> None:
     pending = state.pending_segments.get(key)
     if pending:
         pending.popleft()
+        record = state.tasks.get(key)
+        if record is not None and record.segment_slots is not None:
+            record.segment_slots.release()
         if not pending:
             state.pending_segments.pop(key, None)

@@ -17,6 +17,7 @@ from ..schema import Result
 from ..state import WorkerState
 from .gpu_boost import GpuBoostManager
 from . import logger
+from config_server import ServerConfig as Config
 
 
 class TaskBuffer:
@@ -99,7 +100,8 @@ class TaskHandler:
         self.pipeline = TaskPipeline(recognizer, punc_model, aligner, self.state)
 
     def drain_queue(self) -> bool:
-        """Drain 队列中所有任务到缓冲区。Returns: False = 退出信号。"""
+        """单轮最多取入配置数量的任务。Returns: False = 退出信号。"""
+        drained = 0
         while True:
             # 获取任务
             try:
@@ -119,6 +121,7 @@ class TaskHandler:
             # 判断退出信号
             if task is None:
                 return False
+            drained += 1
 
             # 跳过已断开连接客户端的任务
             if task.socket_id not in self.sockets_id:
@@ -134,6 +137,8 @@ class TaskHandler:
 
             # 任务进入缓冲区
             self.buffer.enqueue(task)
+            if drained >= Config.drain_batch:
+                return True
 
     def cleanup(self):
         """清理断连 socket 的缓冲任务和 session。"""
