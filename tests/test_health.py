@@ -16,6 +16,7 @@ import websockets
 import numpy as np
 
 from config_server import ServerConfig
+from core.server.connection.audio_decoder import available_encodings
 from core.server.connection.health import build_health_payload, process_request
 from core.server.worker.worker import RecognizerWorker
 from tests.harness.client import collect_terminal, send_audio
@@ -111,9 +112,9 @@ async def test_health_endpoint_tracks_work_and_preserves_http_and_websocket():
             "queued_segments",
         }
         assert payload["status"] == "ok"
-        assert payload["protocol_version"] == 1
+        assert payload["protocol_version"] == 2
         assert payload["role"] == "server"
-        assert payload["encodings"] == ["f32le"]
+        assert payload["encodings"] == available_encodings()
         assert payload["model"] == ServerConfig.model_type
         assert isinstance(payload["git_sha"], str) and payload["git_sha"]
         if (

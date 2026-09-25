@@ -56,7 +56,12 @@ class AudioMessage:
 
     def to_json(self) -> str:
         """序列化为 JSON 字符串"""
-        return json.dumps(asdict(self), ensure_ascii=False)
+        data = asdict(self)
+        if self.encoding is None:
+            data.pop('encoding')
+        if self.samples_total is None:
+            data.pop('samples_total')
+        return json.dumps(data, ensure_ascii=False)
     
     @classmethod
     def from_dict(cls, data: dict) -> AudioMessage:

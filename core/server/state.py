@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 import asyncio
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from multiprocessing import Queue, Process
@@ -27,7 +28,16 @@ class TaskLifecycle:
     status: str = 'RECEIVING'
     segment_slots: asyncio.Semaphore | None = None
     terminal_event: asyncio.Event = field(default_factory=asyncio.Event)
+    idle_state_event: asyncio.Event = field(default_factory=asyncio.Event)
     idle_deadline: float | None = None
+    backpressured: bool = False
+    started_at: float = field(default_factory=time.monotonic)
+    samples_total: int = 0
+    segments: int = 0
+    declared_encoding: str | None = None
+    encoding: str = 'v1'
+    encoding_set: bool = False
+    error_code: str | None = None
 
 
 class SessionMap(dict):
@@ -158,7 +168,7 @@ def set_task_draining(state, key: TaskKey) -> bool:
     return True
 
 
-def transition_terminal(state, key: TaskKey, status: str) -> bool:
+def transition_terminal(state, key: TaskKey, status: str, code: str | None = None) -> bool:
     """集中完成任务唯一终态转移；已终态或未知任务不重复转移。"""
     if status not in {'DONE', 'FAILED'}:
         raise ValueError(f'非法任务终态: {status}')
@@ -167,11 +177,21 @@ def transition_terminal(state, key: TaskKey, status: str) -> bool:
     if record is None or record.status in {'DONE', 'FAILED'}:
         return False
     record.status = status
+    record.error_code = code or record.error_code
     record.terminal_event.set()
     record.segment_slots = None
     if state.connection_tasks.get(key[0]) == key:
         state.connection_tasks.pop(key[0], None)
     state.pending_segments.pop(key, None)
+    from . import logger
+    logger.info(
+        f"task_end socket={key[0]} task={key[1]} "
+        f"status={'done' if status == 'DONE' else 'failed'} "
+        f"code={record.error_code or '-'} "
+        f"duration_s={record.samples_total / 16000:.3f} "
+        f"elapsed_s={time.monotonic() - record.started_at:.3f} "
+        f"segments={record.segments} encoding={record.encoding}"
+    )
     return True
 
 
