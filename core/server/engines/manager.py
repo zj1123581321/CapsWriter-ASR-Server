@@ -17,11 +17,16 @@ class ManagedAlignerProxy(BaseAlignEngine):
         self.last_active = time.time()
         self.is_processing = False
 
+    def preload(self):
+        """启动时实际加载并校验对齐引擎。"""
+        if self.engine is None:
+            logger.info("🚩 [AlignerProxy] 正在加载对齐引擎...")
+            self.engine = EngineFactory.create_align_engine()
+            self.last_active = time.time()
+
     def align(self, audio, text, **kwargs):
         # 1. 懒加载
-        if self.engine is None:
-            logger.info("🚩 [AlignerProxy] 检测到文件任务需求，正在即时加载对齐引擎...")
-            self.engine = EngineFactory.create_align_engine()
+        self.preload()
         
         # 2. 标记运行并执行
         self.is_processing = True

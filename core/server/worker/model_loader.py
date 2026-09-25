@@ -27,6 +27,12 @@ class ModelLoader:
         self.recognizer = None
         self.punc_model = None
         self.aligner = None
+        self._aligner_status = "not_required"
+
+    @property
+    def aligner_status(self):
+        """对齐时间戳能力状态，供健康检查读取。"""
+        return self._aligner_status
 
     def load(self):
         """
@@ -46,6 +52,7 @@ class ModelLoader:
         logger.info(f"Loader 开始初始化语音系统 (引擎: {model_type})")
 
         try:
+            self._aligner_status = "not_required"
             # 2. 通过工厂实例化 ASR 核心引擎
             self.recognizer = EngineFactory.create_asr_engine(model_type)
             caps = self.recognizer.capabilities
@@ -56,7 +63,9 @@ class ModelLoader:
                 self._load_punc_model()
 
             # 4. 智能补丁：如果引擎不自带时间戳能力，则挂载对齐器插件
-            if EngineCapabilities.TIMESTAMPS not in caps:
+            if EngineCapabilities.TIMESTAMPS in caps:
+                self._aligner_status = "native"
+            else:
                 self._load_align_model()
 
             # 5. 加载热词 (如果引擎支持 HOTWORDS 能力)
@@ -69,7 +78,7 @@ class ModelLoader:
             
         except Exception as e:
             logger.error(f"Loader 加载失败: {str(e)}", exc_info=True)
-            raise e
+            raise
 
     def _load_punc_model(self):
         """加载标点补足模型插件"""
@@ -82,6 +91,8 @@ class ModelLoader:
         logger.info(f"引擎不具备时间戳能力，已挂载 Aligner 托管代理 (闲置卸载时间: {Config.aligner_idle_timeout}s)")
         # 挂载代理而非实体模型，实现按需加载与自动释放
         self.aligner = ManagedAlignerProxy(timeout_sec=Config.aligner_idle_timeout)
+        self.aligner.preload()
+        self._aligner_status = "loaded"
 
     def cleanup(self):
         """释放模型资源"""
@@ -92,3 +103,4 @@ class ModelLoader:
         self.recognizer = None
         self.punc_model = None
         self.aligner = None
+        self._aligner_status = "not_required"
