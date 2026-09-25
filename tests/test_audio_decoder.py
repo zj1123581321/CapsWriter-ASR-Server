@@ -178,6 +178,28 @@ async def test_random_bytes_fail_and_reap_ffmpeg():
 
 
 @pytest.mark.asyncio
+async def test_ffmpeg_failure_message_keeps_only_last_500_stderr_bytes(tmp_path, monkeypatch):
+    wrapper = Path(tmp_path) / "ffmpeg"
+    wrapper.write_text(
+        f"#!{sys.executable}\nimport sys\nsys.stdin.buffer.read()\nsys.stderr.write('x' * 1200)\nsys.exit(1)\n"
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    decoder = AudioDecoder("flac")
+    consumer = asyncio.create_task(_collect(decoder))
+
+    async with decoder:
+        await decoder.feed(b"input")
+        with pytest.raises(AudioDecodeError) as caught:
+            await decoder.finish()
+    await consumer
+    stderr_tail = caught.value.message.partition("ffmpeg stderr 末尾：")[2]
+
+    assert caught.value.code == "decode_failed"
+    assert stderr_tail == "x" * 500
+
+
+@pytest.mark.asyncio
 async def test_normal_finish_reaps_ffmpeg(compressed_audio):
     _, flac, _ = compressed_audio
     decoder = AudioDecoder("flac")
