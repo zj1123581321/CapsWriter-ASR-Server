@@ -48,8 +48,8 @@ async def test_twenty_seconds_are_covered_without_gaps(fake_asr_server):
         fake_asr_server.url,
         make_encoded_audio(20),
         task_id=task_id,
-        seg_duration=2.0,
-        seg_overlap=0.25,
+        seg_duration=5.0,
+        seg_overlap=0.5,
         chunk_seconds=0.5,
     )
     final = messages[-1]
@@ -66,7 +66,13 @@ async def test_three_connections_keep_results_separate(fake_asr_server):
         for start in (0, 480_000, 960_000)
     ]
     all_messages = await asyncio.gather(*(
-        transcribe(fake_asr_server.url, audio, task_id=task_id)
+        transcribe(
+            fake_asr_server.url,
+            audio,
+            task_id=task_id,
+            seg_duration=5.0,
+            seg_overlap=0.0,
+        )
         for task_id, _, audio in jobs
     ))
 
@@ -89,7 +95,7 @@ async def test_three_connections_keep_results_separate(fake_asr_server):
 @pytest.mark.parametrize("fake_asr_server", [{"fail_on_call": 2}], indirect=True)
 async def test_inference_failure_must_error_or_close_without_incomplete_final(fake_asr_server):
     task_id = str(uuid.uuid4())
-    audio = make_encoded_audio(2.0)
+    audio = make_encoded_audio(10.0)
     async with websockets.connect(
         fake_asr_server.url, max_size=None, ping_interval=None, open_timeout=5
     ) as websocket:
@@ -97,9 +103,9 @@ async def test_inference_failure_must_error_or_close_without_incomplete_final(fa
             websocket,
             audio,
             task_id=task_id,
-            seg_duration=0.5,
+            seg_duration=5.0,
             seg_overlap=0,
-            chunk_seconds=0.5,
+            chunk_seconds=5.0,
         )
         messages, closed = await collect_terminal(websocket, task_id=task_id, timeout=5)
 
@@ -111,20 +117,40 @@ async def test_inference_failure_must_error_or_close_without_incomplete_final(fa
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason="is_final 末帧缓冲区绕过分段并整块提交，由 T2b 修复")
-async def test_final_payload_is_split_to_configured_segment_size(fake_asr_server):
+async def test_final_payload_after_three_seconds_is_split_without_gaps(fake_asr_server):
     task_id = str(uuid.uuid4())
     messages = await transcribe(
         fake_asr_server.url,
-        make_encoded_audio(10.0),
+        make_encoded_audio(103.0),
         task_id=task_id,
-        seg_duration=2.0,
-        seg_overlap=0.25,
-        chunk_seconds=0.5,
-        final_frame_seconds=6.0,
+        source="mic",
+        seg_duration=72.0,
+        seg_overlap=2.0,
+        chunk_seconds=3.0,
+        final_frame_seconds=100.0,
     )
     assert messages[-1]["is_final"] is True
-    assert max(call["sample_count"] for call in list(fake_asr_server.calls)) <= round(2.25 * SAMPLE_RATE)
+    calls = list(fake_asr_server.calls)
+    assert max(call["sample_count"] for call in calls) <= 80 * SAMPLE_RATE
+    assert_gapless(decode_spans(messages[-1]["text"]), 103_000, calls)
+
+
+@pytest.mark.asyncio
+async def test_first_final_frame_with_two_hundred_seconds_is_split_without_gaps(fake_asr_server):
+    task_id = str(uuid.uuid4())
+    messages = await transcribe(
+        fake_asr_server.url,
+        make_encoded_audio(200.0),
+        task_id=task_id,
+        source="mic",
+        seg_duration=72.0,
+        seg_overlap=2.0,
+        chunk_seconds=200.0,
+        final_frame_seconds=200.0,
+    )
+    calls = list(fake_asr_server.calls)
+    assert max(call["sample_count"] for call in calls) <= 80 * SAMPLE_RATE
+    assert_gapless(decode_spans(messages[-1]["text"]), 200_000, calls)
 
 
 @pytest.mark.asyncio
@@ -138,14 +164,14 @@ async def test_same_task_id_on_two_connections_must_not_cross_results(fake_asr_s
             fake_asr_server.url,
             make_encoded_audio(0.5),
             task_id=task_id,
-            seg_duration=0.5,
+            seg_duration=5.0,
             seg_overlap=0,
         ),
         transcribe(
             fake_asr_server.url,
             make_encoded_audio(0.5, 480_000),
             task_id=task_id,
-            seg_duration=0.5,
+            seg_duration=5.0,
             seg_overlap=0,
         ),
     )

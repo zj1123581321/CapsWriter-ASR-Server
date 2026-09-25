@@ -8,6 +8,7 @@ WebSocket 接收处理模块
 import asyncio
 import binascii
 import json
+import math
 import time
 from base64 import b64decode
 
@@ -22,7 +23,11 @@ from ..state import (
     set_task_draining,
 )
 from ..schema import Task
-from config_server import ServerConfig as Config
+from config_server import (
+    ServerConfig as Config,
+    Qwen3ASRGGUFArgs,
+    QwenASRMLXArgs,
+)
 from core.protocol import AudioMessage
 from core.constants import AudioFormat
 from core.tools.my_status import Status
@@ -46,6 +51,8 @@ class AudioCache:
         self.offset: float = 0.0    # 当前偏移时间（秒）
         self.byte_count: int = 0    # 累计接收字节数
         self.search_to: float = 0.0 # 切点吸附已搜索到的位置（秒），避免重复扫描
+        self.task_id: str | None = None
+        self.segmentation_params: tuple[float, float] | None = None
 
     @property
     def duration(self) -> float:
@@ -63,9 +70,80 @@ class AudioCache:
         self.offset = 0.0
         self.byte_count = 0
         self.search_to = 0.0
+        self.task_id = None
+        self.segmentation_params = None
 
 
-async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: str, state=None) -> None:
+def _engine_segment_limit() -> float | None:
+    """读取当前 ASR 配置的单段上限，不加载识别模型。"""
+    model_type = Config.model_type.lower()
+    if model_type == 'qwen_asr':
+        return Qwen3ASRGGUFArgs.chunk_size
+    if model_type == 'qwen_asr_mlx':
+        return QwenASRMLXArgs.chunk_size
+    return None
+
+
+def _validate_segmentation(msg: AudioMessage, cache: AudioCache) -> None:
+    """校验当前帧分段参数，并锁定任务首帧的参数值。"""
+    nominal, overlap = float(msg.seg_duration), float(msg.seg_overlap)
+    if not math.isfinite(nominal) or nominal < 5:
+        raise ValueError(f"seg_duration={nominal:g} 不在允许范围 [5, +∞)")
+    if not math.isfinite(overlap) or overlap < 0 or overlap >= nominal / 2:
+        raise ValueError(
+            f"seg_overlap={overlap:g} 不在允许范围 [0, seg_duration/2={nominal / 2:g})"
+        )
+
+    limit = _engine_segment_limit()
+    if limit is not None:
+        if Config.seg_cut_snap:
+            max_cut = max(Config.seg_max_cut, nominal + Config.seg_search_after)
+            max_segment = max_cut + overlap
+            values = (
+                f"seg_max_cut={Config.seg_max_cut:g}, seg_duration={nominal:g}, "
+                f"seg_search_after={Config.seg_search_after:g}, seg_overlap={overlap:g}"
+            )
+        else:
+            max_segment = nominal + overlap
+            values = f"seg_duration={nominal:g}, seg_overlap={overlap:g}"
+        if max_segment > limit:
+            raise ValueError(
+                f"{values} 导致单段最长 {max_segment:g}s，允许范围 ≤ 引擎上限 {limit:g}s"
+            )
+
+    if cache.task_id == msg.task_id:
+        first_nominal, first_overlap = cache.segmentation_params
+        if nominal != first_nominal:
+            raise ValueError(
+                f"seg_duration={nominal:g} 与该任务首帧值 {first_nominal:g} 不同"
+            )
+        if overlap != first_overlap:
+            raise ValueError(
+                f"seg_overlap={overlap:g} 与该任务首帧值 {first_overlap:g} 不同"
+            )
+    elif cache.task_id is not None:
+        raise ValueError(f"任务 {msg.task_id} 与缓冲任务 {cache.task_id} 不匹配")
+    else:
+        cache.task_id = msg.task_id
+        cache.segmentation_params = (nominal, overlap)
+
+
+def _assert_segment_within_limit(duration: float) -> None:
+    limit = _engine_segment_limit()
+    if limit is not None and duration > limit:
+        raise AssertionError(
+            f"提交段长 {duration:.6f}s 超过引擎单段上限 {limit:.6f}s"
+        )
+
+
+async def _submit_segments(
+    msg: AudioMessage,
+    cache: AudioCache,
+    queue_in,
+    socket_id: str,
+    state=None,
+    is_final: bool = False,
+) -> None:
     """缓冲达到阈值后切分并提交识别任务。
 
     seg_cut_snap 开启时，在名义切点附近吸附"最不像人声"的断点下刀
@@ -80,21 +158,35 @@ async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socke
 
     if not Config.seg_cut_snap:
         # 固定时长盲切（原始行为）
-        while cache.duration >= nominal + overlap * 2:
+        limit = _engine_segment_limit()
+        final_limit = limit if limit is not None else nominal + overlap
+        while (
+            cache.duration > final_limit
+            if is_final
+            else cache.duration >= nominal + overlap * 2
+        ):
             _cut_and_submit(msg, cache, queue_in, socket_id, cut=nominal, state=state)
         return
 
     w_before, w_after = Config.seg_search_before, Config.seg_search_after
     max_cut = max(Config.seg_max_cut, nominal + w_after)
     lo = max(nominal - w_before, min(nominal, 1.0))
+    limit = _engine_segment_limit()
+    final_limit = limit if limit is not None else max_cut + overlap
     finder = get_cut_finder()
     loop = asyncio.get_running_loop()
 
-    while cache.duration >= nominal + w_after + overlap:
+    while True:
+        if is_final:
+            if cache.duration <= final_limit:
+                return
+        elif cache.duration < nominal + w_after + overlap:
+            return
+
         if msg.source == 'file':
             hi = min(cache.duration - overlap, max_cut)
             # 弹性等待期间没有新增可搜索区域时，等下一条消息再扫
-            if hi < max_cut and hi <= cache.search_to:
+            if not is_final and hi < max_cut and hi <= cache.search_to:
                 return
         else:
             hi = nominal + w_after
@@ -103,7 +195,7 @@ async def _submit_segments(msg: AudioMessage, cache: AudioCache, queue_in, socke
             None, finder.find, cache.chunks, lo, hi, nominal
         )
 
-        if not confident and msg.source == 'file' and hi < max_cut:
+        if not is_final and not confident and msg.source == 'file' and hi < max_cut:
             cache.search_to = hi
             logger.debug(f"切点吸附: [{lo:.1f}, {hi:.1f}]s 无可信断点，等待更多音频延长搜索")
             return
@@ -124,6 +216,7 @@ def _cut_and_submit(msg: AudioMessage, cache: AudioCache, queue_in, socket_id: s
     segment_bytes = n_segment * AudioFormat.BYTES_PER_SAMPLE
 
     segment_data = cache.chunks[:segment_bytes]
+    _assert_segment_within_limit(len(segment_data) / AudioFormat.BYTES_PER_SECOND)
     cache.chunks = cache.chunks[stride_bytes:]
 
     task = Task(
@@ -197,7 +290,13 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
                 print(f'音频文件接收完毕，时长 {cache.total_duration:.2f}s')
                 logger.info(f"音频文件接收完毕，任务ID: {msg.task_id}, 时长: {cache.total_duration:.2f}s")
 
-            # 提交最终片段
+            # 最后一帧也先走相同分段规则；吸附文件任务此时不再等待后续音频。
+            await _submit_segments(
+                msg, cache, queue_in, socket_id, app.state, is_final=True
+            )
+
+            # 剩余缓冲作为最后一段提交。
+            _assert_segment_within_limit(cache.duration)
             task = Task(
                 type=msg.source,
                 data=cache.chunks,
@@ -291,9 +390,21 @@ async def ws_recv(websocket, app) -> None:
             if active is None:
                 begin_task(state, key)
             record = state.tasks[key]
+
             if record.status in {'DONE', 'FAILED'}:
                 logger.warning(f"丢弃终态任务 {msg.task_id} 的迟到上行帧")
                 continue
+
+            try:
+                _validate_segmentation(msg, cache)
+            except ValueError as e:
+                transition_terminal(state, key, 'FAILED')
+                await queue_error_and_close(
+                    state, websocket, socket_id, msg.task_id, 'bad_request',
+                    str(e), False,
+                )
+                return
+
             if msg.is_final and not set_task_draining(state, key):
                 logger.warning(f"丢弃任务 {msg.task_id} 重复的 is_final 帧")
                 continue

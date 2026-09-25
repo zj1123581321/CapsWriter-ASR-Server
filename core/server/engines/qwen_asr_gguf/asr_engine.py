@@ -55,10 +55,14 @@ class QwenASREngine(BaseASREngine):
         sr = 16000
         audio_data = stream.audio_data
         
-        # 如果长度超过了最大限制，则截断
+        # 服务端保证分段不超过引擎上限；违反时失败，不能静默丢弃尾部。
         max_samples = int(self.config.chunk_size * sr)
         if len(audio_data) > max_samples:
-            audio_data = audio_data[:max_samples]
+            actual_seconds = len(audio_data) / sr
+            raise ValueError(
+                f"音频时长 {actual_seconds:.3f}s 超过 chunk_size 上限 "
+                f"{self.config.chunk_size:.3f}s"
+            )
 
         # 1. 提交编码任务（同步调用）
         audio_embd, enc_time = self.engine.encoder.encode(audio_data)
@@ -93,4 +97,3 @@ class QwenASREngine(BaseASREngine):
     def cleanup(self):
         """释放资源"""
         self.engine.shutdown()
-

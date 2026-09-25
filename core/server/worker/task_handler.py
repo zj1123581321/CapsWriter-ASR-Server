@@ -4,8 +4,8 @@
 
 负责监听任务队列、执行识别流水线并将结果返回主进程。
 
-公平调度：从不同客户端（socket）轮转取任务处理，防止文件转录淹没队列。
-同 socket 内保持 FIFO 顺序，跨 socket 间轮转调度。
+公平调度：按任务轮转取段，防止文件转录饿死旧任务；麦克风段优先处理。
+同一任务内保持 FIFO 顺序。
 """
 
 from collections import OrderedDict, deque
@@ -35,15 +35,21 @@ class TaskBuffer:
         self._buffers[key].append(task)
 
     def pop(self):
-        """取出最新 session 的下一个任务。没有待处理任务时返回 None。"""
+        """优先轮转麦克风任务，否则轮转文件任务。"""
         if not self._buffers:
             return None
 
-        key, buf = next(reversed(self._buffers.items()))
+        key = next(
+            (key for key, buf in self._buffers.items() if buf[0].type == 'mic'),
+            next(iter(self._buffers)),
+        )
+        buf = self._buffers[key]
         task = buf.popleft()
 
         if not buf:
             del self._buffers[key]
+        else:
+            self._buffers.move_to_end(key)
 
         return task
 

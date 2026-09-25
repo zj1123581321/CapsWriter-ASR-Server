@@ -3,7 +3,7 @@
 qwen_asr_mlx 适配层逻辑测试（无需真机 MLX，使用注入的假 Session）。
 
 覆盖 decode_stream 的关键分支：能力声明、空音频早退、文本写回、
-超 chunk_size 截断、语言映射、cleanup。
+超 chunk_size 报错、语言映射、cleanup。
 """
 import numpy as np
 import pytest
@@ -47,14 +47,14 @@ def test_decode_writes_text(mlx_engine):
     assert len(mlx_engine._session.transcribe_calls) == 1
 
 
-def test_decode_truncates_over_chunk_size(mlx_engine):
-    """音频超过 chunk_size*16000 应被截断后再喂给 Session。"""
+def test_decode_rejects_audio_over_chunk_size(mlx_engine):
+    """音频超过 chunk_size*16000 应报错，不能截断后继续推理。"""
     over = make_audio(100.0)  # 100s > chunk_size 80s
     stream = mlx_engine.create_stream()
     stream.accept_waveform(16000, over)
-    mlx_engine.decode_stream(stream)
-    passed_len = mlx_engine._session.transcribe_calls[0]["audio_len"]
-    assert passed_len == int(80.0 * 16000)
+    with pytest.raises(ValueError, match=r"100\.000s.*80\.000s"):
+        mlx_engine.decode_stream(stream)
+    assert mlx_engine._session.transcribe_calls == []
 
 
 def test_decode_no_truncate_under_chunk_size(mlx_engine):
