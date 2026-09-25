@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capswriter-asr"
+version = "0.1.0"
+description = "CapsWriter ASR protocol v2 client SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["websockets>=12", "numpy"]
+
+[tool.setuptools]
+packages = ["capswriter_asr"]
