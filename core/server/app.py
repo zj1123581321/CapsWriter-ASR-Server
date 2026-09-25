@@ -93,13 +93,20 @@ class CapsWriterServer:
         关 loop），让进程以退出码 0 结束。Windows 无法投递 SIGTERM，仅注册
         SIGINT（hasattr + 平台判断，不写 try-except 吞错）。
         """
-        def _stop_on_signal(signum, _frame):
+        def _stop_on_signal(signum):
             logger.info(f"收到 {signal.Signals(signum).name}，开始清理退出")
             self.stop()
 
-        signal.signal(signal.SIGINT, _stop_on_signal)
-        if sys.platform != 'win32' and hasattr(signal, 'SIGTERM'):
-            signal.signal(signal.SIGTERM, _stop_on_signal)
+        if sys.platform == 'win32':
+            def _schedule_stop_on_signal(signum, _frame):
+                self.loop.call_soon_threadsafe(_stop_on_signal, signum)
+
+            signal.signal(signal.SIGINT, _schedule_stop_on_signal)
+        else:
+            # 由 asyncio 自管道唤醒 selector，避免 PEP 475 自动重试 select 时挂住。
+            self.loop.add_signal_handler(signal.SIGINT, _stop_on_signal, signal.SIGINT)
+            if hasattr(signal, 'SIGTERM'):
+                self.loop.add_signal_handler(signal.SIGTERM, _stop_on_signal, signal.SIGTERM)
 
     def start(self):
         """
