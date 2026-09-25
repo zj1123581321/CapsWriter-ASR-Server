@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 import queue
+import sys
 import time
+import types
 import uuid
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -69,6 +73,32 @@ def test_task_cannot_change_segmentation_parameters_after_first_frame(monkeypatc
     ws_recv._validate_segmentation(make_message(duration=10, overlap=1), cache)
     with pytest.raises(ValueError, match="seg_duration=11.*首帧值 10"):
         ws_recv._validate_segmentation(make_message(duration=11, overlap=1), cache)
+
+
+def test_gguf_engine_rejects_audio_over_chunk_size(monkeypatch):
+    package_name = "core.server.engines.qwen_asr_gguf.inference"
+    fake_package = types.ModuleType(package_name)
+    fake_package.__path__ = []
+    fake_asr = types.ModuleType(f"{package_name}.asr")
+    fake_asr.QwenASREngine = object
+    fake_schema = types.ModuleType(f"{package_name}.schema")
+    fake_schema.ASREngineConfig = type("ASREngineConfig", (), {})
+    fake_schema.MsgType = type("MsgType", (), {})
+    fake_schema.StreamingMessage = type("StreamingMessage", (), {})
+    monkeypatch.setitem(sys.modules, package_name, fake_package)
+    monkeypatch.setitem(sys.modules, f"{package_name}.asr", fake_asr)
+    monkeypatch.setitem(sys.modules, f"{package_name}.schema", fake_schema)
+    module_name = "core.server.engines.qwen_asr_gguf.asr_engine"
+    engine_module = importlib.import_module(module_name)
+
+    engine = object.__new__(engine_module.QwenASREngine)
+    engine.config = SimpleNamespace(chunk_size=80.0)
+    stream = engine_module.QwenASRStream()
+    stream.accept_waveform(16000, np.zeros(81 * 16000, dtype=np.float32))
+
+    with pytest.raises(ValueError, match=r"81\.000s.*80\.000s"):
+        engine.decode_stream(stream)
+    sys.modules.pop(module_name, None)
 
 
 @pytest.mark.asyncio

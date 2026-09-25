@@ -10,7 +10,7 @@ decode_stream 处理流水线：
     stream.audio_data (float32/16k)
         │  None? ──► 直接返回（空音频早退）
         ▼
-    截断到 chunk_size * 16000 采样（防超长）
+    断言音频不超过 chunk_size * 16000 采样
         ▼
     语言映射 get_language(ENGINE_QWEN_ASR, lang) → Qwen 英文明称
         ▼
@@ -39,7 +39,7 @@ class MLXEngineConfig:
     """qwen_asr_mlx 引擎配置。字段名须与 config_server.QwenASRMLXArgs 公开属性一致。"""
     model: str = "Qwen/Qwen3-ASR-0.6B"   # HF repo id 或本地模型目录
     dtype: Optional[str] = None          # 'float16' / 'bfloat16' / None=库默认
-    chunk_size: float = 80.0             # 单段最大音频时长（秒），超出截断
+    chunk_size: float = 80.0             # 单段最大音频时长（秒）
     verbose: bool = False
 
 
@@ -105,10 +105,14 @@ class QwenASRMLXEngine(BaseASREngine):
             return
 
         audio = stream.audio_data
-        # 防超长：截断到 chunk_size 秒（server 时间切片通常已 <= 此值）
+        # 服务端保证分段不超过引擎上限；违反时失败，不能静默丢弃尾部。
         max_samples = int(self.config.chunk_size * 16000)
         if len(audio) > max_samples:
-            audio = audio[:max_samples]
+            actual_seconds = len(audio) / 16000
+            raise ValueError(
+                f"音频时长 {actual_seconds:.3f}s 超过 chunk_size 上限 "
+                f"{self.config.chunk_size:.3f}s"
+            )
 
         # mic 路径只要文本，时间戳交外挂 Aligner；初版不支持 context（见 TODOS.md）
         t_kwargs = {"return_timestamps": False}
