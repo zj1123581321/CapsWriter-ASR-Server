@@ -2,6 +2,7 @@
 
 import re
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from core.logger import Logger
 
@@ -34,3 +35,19 @@ def test_file_logger_uses_dated_rotating_handler(tmp_path):
             handler.close()
             logger.removeHandler(handler)
         Logger._loggers.pop(logger_name, None)
+
+
+def test_default_log_dir_is_repo_root_without_config_client(tmp_path):
+    """log_dir=None 时默认目录为仓库根 logs/，不再依赖 config_client（服务端无头化）。"""
+    logger_name = "test-default-dir"
+    logger = Logger.setup(logger_name, log_dir=None, level="INFO")
+    log_file = Path(__file__).resolve().parents[1] / "logs" / "test-default-dir_latest.log"
+    try:
+        handler = next(h for h in logger.handlers if isinstance(h, RotatingFileHandler))
+        assert Path(handler.baseFilename) == log_file
+    finally:
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+        Logger._loggers.pop(logger_name, None)
+        log_file.unlink(missing_ok=True)

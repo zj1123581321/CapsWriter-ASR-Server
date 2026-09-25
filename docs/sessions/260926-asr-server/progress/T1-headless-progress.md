@@ -27,3 +27,10 @@
 - **本段结论**：`core/logger.py` 默认日志目录改为由 `logger.py` 自身 `__file__` 推导仓库根下 `logs/`（已核实 `config_server.BASE_DIR` 就是仓库根，行为等价）；`core/server/__init__.py` 在调用 `setup_logger` 处读 `CW_LOG_LEVEL`（未设置或为空沿用 `Config.log_level`），未动 `config_server.py`。初版注释里含 `config_client` 字样，卡面验收要求 grep 无输出，已改措辞。
 - **关键决策与已否决方案**：无
 - **下一步唯一动作**：提交无头化行为验收测试。
+
+## 里程碑 5：无头化行为验收测试
+
+- **当前阶段**：验证
+- **本段结论**：新增 `tests/test_server_headless.py` 7 个用例：端口占用子进程探测（stdin=DEVNULL，超时 30s，断言退出码 1 且无「按回车」）、导入隔离（tkinter/core.ui/pystray 不入 sys.modules）、SIGTERM 一次退出 0（仅 POSIX，就绪信号防注册前竞态）、源码无 input 交互、CW_LOG_LEVEL 生效（DEBUG 卡面要求 + INFO 防恒真：默认 log_level 已是 DEBUG）；`tests/test_logger.py` 补默认目录落仓库根 logs/ 用例。全量 109 passed, 3 skipped（基线 102+3）。
+- **关键决策与已否决方案**：端口占用用例选择「桩掉 process_manager.start + 走真实 app.start()/socket_manager 自检」而非直接调 `_check_port`，覆盖面更真且不依赖真实模型；SIGTERM 用例以 `SERVER_READY` 行同步就绪时机，避免信号先于处理器注册的竞态。
+- **下一步唯一动作**：红验（端口退出码改 0、删 SIGTERM 注册各一次）后收尾提交。
