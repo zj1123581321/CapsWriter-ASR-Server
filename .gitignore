@@ -196,3 +196,6 @@ core/server/engines/llama/bin/*.dylib
 .venv-test/
 .venv-mlx/
 temp/
+
+# 验收台账写入时的锁文件残留
+retro/*.lock
