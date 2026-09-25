@@ -5,9 +5,11 @@
 负责维护单机识别进程的生命周期，包括启动、模型加载监控、异常退出捕获。
 """
 from __future__ import annotations
+import asyncio
 import sys
 import os
 import queue
+import time
 from multiprocessing import Process, Manager
 from typing import TYPE_CHECKING
 from ..state import console
@@ -17,11 +19,13 @@ from . import logger
 if TYPE_CHECKING:
     from ..app import CapsWriterServer
 
+PROCESS_MONITOR_INTERVAL_SECONDS = 1
+
 
 class ProcessManager:
     """
     识别子进程管理器
-    
+
     由 CapsWriterServer 调用，专注于进程层级的控制。
     """
     def __init__(self, app: CapsWriterServer):
@@ -32,7 +36,7 @@ class ProcessManager:
     def start(self):
         """
         启动识别子进程并等待模型加载完成
-        
+
         Returns:
             Process: 启动成功的子进程对象
         """
@@ -47,34 +51,34 @@ class ProcessManager:
         # 使用 Manager 管理共享列表，用于追踪活动连接
         state = self.app.state
         state.sockets_id = Manager().list()
-        
+
         # 获取标准输入文件描述符，用于 Windows 下的信号传递补丁
         stdin_fn = sys.stdin.fileno()
-        
+
         # 3. 创建并启动进程
         self._process = Process(
             target=start_worker,
             args=(state.queue_in,
                   state.queue_out,
-                  state.sockets_id, 
+                  state.sockets_id,
                   stdin_fn),
             daemon=True
         )
         self._process.start()
-        
+
         # 存入状态以便其他模块引用
         state.recognize_process = self._process
         logger.info(f"识别子进程已拉起 (PID: {self._process.pid})")
 
         # 4. 等待模型加载完成 (轮询方式)
         self._wait_for_models()
-        
+
         return self._process
 
     def _wait_for_models(self):
         """轮询队列直到收到模型加载成功 (True) 或发生错误"""
         logger.info("正在等待子进程加载模型...")
-        
+
         while self.is_alive:
             try:
                 # 阻塞最多 100ms
@@ -87,7 +91,7 @@ class ProcessManager:
                     self._handle_unexpected_exit()
                     return
                 continue
-            
+
         if not self.is_alive: return
         logger.info("模型加载完成，ASR 服务就绪")
         console.rule('[green3]开始服务')
@@ -99,9 +103,58 @@ class ProcessManager:
         if exit_code != 0:
             logger.error(f"识别子进程意外退出! ExitCode: {exit_code}")
             logger.error("这通常是由于模型损坏、底层库冲突或系统资源不足导致的。")
-        
-        # 请求主系统同步退出
-        self.app.stop()
+
+        raise SystemExit(1)
+
+    async def monitor(self):
+        """就绪后监控推理进程存活和最老的未完成推理段。"""
+        from ..state import ensure_server_runtime
+        ensure_server_runtime(self.app.state)
+        state = self.app.state
+        while self.is_alive:
+            await asyncio.sleep(PROCESS_MONITOR_INTERVAL_SECONDS)
+            if not self._process.is_alive():
+                from ..connection.ws_send import fail_active_tasks
+                message = f"推理进程退出 exitcode={self._process.exitcode}"
+                await fail_active_tasks(state, 'internal', message)
+                raise SystemExit(1)
+
+            timeout = float(os.environ.get('CW_SEGMENT_TIMEOUT', '600'))
+            now = time.monotonic()
+            expired = [
+                (key, submitted[0])
+                for key, submitted in state.pending_segments.items()
+                if submitted
+                and now - submitted[0] > timeout
+                and (record := state.tasks.get(key)) is not None
+                and record.status not in {'DONE', 'FAILED'}
+            ]
+            if expired:
+                key, submitted_at = min(expired, key=lambda item: item[1])
+                websocket = state.sockets.get(key[0])
+                if websocket is not None:
+                    from ..connection.ws_send import schedule_error_close
+                    timeout_close = schedule_error_close(
+                        state,
+                        websocket,
+                        key[0],
+                        key[1],
+                        'inference_timeout',
+                        f"推理段超时，最早提交时间距今 {now - submitted_at:.3f}s",
+                        True,
+                    )
+                    await timeout_close
+                else:
+                    from ..state import transition_terminal
+                    transition_terminal(state, key, 'FAILED')
+                from ..connection.ws_send import fail_active_tasks
+                await fail_active_tasks(
+                    state,
+                    'internal',
+                    '推理进程卡死，服务端即将退出',
+                    skip_key=key,
+                )
+                raise SystemExit(1)
 
     def stop(self):
         """停止子进程"""
@@ -115,10 +168,12 @@ class ProcessManager:
             # 发送 None 任务通知优雅退出 (作为兜底)
 
             self.app.state.queue_in.put(None)
-            
+
             # 如果 2 秒内没退，则强制 kill
             self._process.join(timeout=2)
             if self._process.is_alive():
                 logger.debug("子进程未响应优雅退出，执行强制终止")
                 self._process.terminate()
-            
+                self._process.join(timeout=2)
+                if self._process.is_alive():
+                    raise RuntimeError("识别子进程在强制终止后 2 秒内仍存活")

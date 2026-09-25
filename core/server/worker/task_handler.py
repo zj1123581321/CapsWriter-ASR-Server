@@ -13,6 +13,7 @@ from multiprocessing import Queue
 from multiprocessing.managers import ListProxy
 import queue
 from .pipeline import TaskPipeline
+from ..schema import Result
 from ..state import WorkerState
 from .gpu_boost import GpuBoostManager
 from . import logger
@@ -22,36 +23,40 @@ class TaskBuffer:
     """按 task_id 分组缓冲，支持跨 session 轮转出队。"""
     def __init__(self, state: WorkerState):
         self.state = state
-        self._buffers: OrderedDict[str, deque] = OrderedDict()
+        self._buffers: OrderedDict[tuple[str, str], deque] = OrderedDict()
 
     def enqueue(self, task):
         """将任务放入对应 task_id 的缓冲尾部（同 session 内 FIFO）。
         首次遇到新 task_id 时预创建 session。"""
-        tid = task.task_id
-        if tid not in self._buffers:
-            self._buffers[tid] = deque()
-            self.state.get_session(tid, task.socket_id, task.type)
-        self._buffers[tid].append(task)
+        key = (task.socket_id, task.task_id)
+        if key not in self._buffers:
+            self._buffers[key] = deque()
+            self.state.get_session(task.task_id, task.socket_id, task.type)
+        self._buffers[key].append(task)
 
     def pop(self):
         """取出最新 session 的下一个任务。没有待处理任务时返回 None。"""
         if not self._buffers:
             return None
 
-        tid, buf = next(reversed(self._buffers.items()))
+        key, buf = next(reversed(self._buffers.items()))
         task = buf.popleft()
 
         if not buf:
-            del self._buffers[tid]
+            del self._buffers[key]
 
         return task
 
     def cleanup_tasks(self):
         """清理已断开连接的 session 的缓冲任务。"""
-        for tid in list(self._buffers):
-            if tid not in self.state.sessions:
-                logger.debug(f"清理断开连接的 session: {tid[:8]}")
-                del self._buffers[tid]
+        for key in list(self._buffers):
+            if key not in self.state.sessions:
+                logger.debug(f"清理断开连接的 session: {key[1][:8]}")
+                del self._buffers[key]
+
+    def discard(self, key):
+        """丢弃一个已失败任务仍留在轮转缓冲中的段。"""
+        self._buffers.pop(key, None)
 
     @property
     def is_empty(self) -> bool:
@@ -78,6 +83,7 @@ class TaskHandler:
 
         self.buffer = TaskBuffer(state)
         self.gpu_boost = GpuBoostManager(state)
+        self.failed_tasks: set[tuple[str, str]] = set()
 
     def set_engine(self, recognizer, punc_model=None, aligner=None):
         """注入识别引擎实例并初始化管线"""
@@ -113,6 +119,13 @@ class TaskHandler:
                 logger.debug(f"跳过断连客户端任务: {task.task_id[:8]}")
                 continue
 
+            key = (task.socket_id, task.task_id)
+            if key in self.failed_tasks:
+                logger.debug(f"跳过已失败任务迟到片段: {task.task_id[:8]}")
+                if task.is_final:
+                    self.failed_tasks.discard(key)
+                continue
+
             # 任务进入缓冲区
             self.buffer.enqueue(task)
 
@@ -120,6 +133,7 @@ class TaskHandler:
         """清理断连 socket 的缓冲任务和 session。"""
         self.state.cleanup_sessions(self.sockets_id)
         self.buffer.cleanup_tasks()
+        self.failed_tasks = {key for key in self.failed_tasks if key[0] in self.sockets_id}
 
     def cleanup_engines(self):
         """闲置资源清理：对齐器卸载 + GPU 加速取消。"""
@@ -133,10 +147,31 @@ class TaskHandler:
 
     def handle_audio_task(self, task):
         """处理音频识别任务。"""
-        result = self.pipeline.process(task)
+        key = (task.socket_id, task.task_id)
+        if key in self.failed_tasks:
+            return
+        self.state.current_socket_id = task.socket_id
+        try:
+            result = self.pipeline.process(task)
+        except Exception as e:
+            self.state.sessions.pop(key, None)
+            self.failed_tasks.add(key)
+            self.buffer.discard(key)
+            result = Result(
+                task_id=task.task_id,
+                socket_id=task.socket_id,
+                type=task.type,
+                error_code='inference_failed',
+                error_message=(
+                    f"推理片段 offset={task.offset:.3f}s，"
+                    f"{type(e).__name__}: {e}"
+                ),
+            )
+        finally:
+            self.state.current_socket_id = ''
         self.queue_out.put(result)
         if result.is_final:
-            self.state.sessions.pop(task.task_id, None)
+            self.state.sessions.pop(key, None)
 
     def loop(self):
         """核心任务循环：drain 队列 → 清理断连 → 轮转执行一个。"""
@@ -160,7 +195,8 @@ class TaskHandler:
                 self.cleanup()
             except InterruptedError:
                 continue
-            except Exception as e:
-                logger.error(f"任务执行出错: {str(e)}", exc_info=True)
+            except Exception:
+                logger.error("TaskHandler 出现未预期异常，识别进程退出", exc_info=True)
+                raise
 
         logger.info("TaskHandler 工作循环结束")

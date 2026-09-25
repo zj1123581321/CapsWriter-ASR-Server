@@ -25,6 +25,15 @@ from tests.harness.server import FakeServerHarness, ObservedTaskQueue
 from tests.harness.worker import run_fake_worker
 
 
+def pytest_configure(config):
+    from _pytest.config.findpaths import ConfigValue
+    config._inicfg.setdefault(
+        "faulthandler_timeout",
+        ConfigValue("120", origin="file", mode="ini"),
+    )
+    config._inicache.pop("faulthandler_timeout", None)
+
+
 class FakeResult:
     """模拟 mlx_qwen3_asr Session.transcribe 的返回对象。"""
     def __init__(self, text="你好世界。", language="Chinese", segments=None):
@@ -126,9 +135,11 @@ async def fake_asr_server(request, monkeypatch):
         raise AssertionError("WebSocket 发送协程在 5 秒内未退出") from exc
 
     queue_in.close()
-    queue_in.join_thread()
+    queue_in._thread.join(timeout=5)
+    assert not queue_in._thread.is_alive(), "queue_in feeder 5 秒内未退出"
     queue_out.close()
-    queue_out.join_thread()
+    queue_out._thread.join(timeout=5)
+    assert not queue_out._thread.is_alive(), "queue_out feeder 5 秒内未退出"
     manager.shutdown()
 
 

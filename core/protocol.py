@@ -91,11 +91,11 @@ class RecognitionMessage:
     
     def to_json(self) -> str:
         """序列化为 JSON 字符串"""
-        return json.dumps(asdict(self), ensure_ascii=False)
+        return json.dumps(self.to_dict(), ensure_ascii=False)
     
     def to_dict(self) -> dict:
         """转换为字典"""
-        return asdict(self)
+        return {"type": "result", **asdict(self)}
     
     @classmethod
     def from_dict(cls, data: dict) -> RecognitionMessage:
@@ -112,3 +112,24 @@ class RecognitionMessage:
             tokens=data.get('tokens', []),
             timestamps=data.get('timestamps', []),
         )
+
+
+@dataclass
+class ErrorMessage:
+    """服务端 -> 客户端：任务失败消息。"""
+    task_id: str
+    code: str
+    message: str
+    retryable: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "error",
+            "task_id": self.task_id,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
