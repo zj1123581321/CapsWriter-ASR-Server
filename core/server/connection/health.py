@@ -10,12 +10,10 @@ from config_server import ServerConfig as Config
 from core.tools.build_info import get_git_sha
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 def _encodings() -> list[str]:
-    if PROTOCOL_VERSION == 1:
-        return ["f32le"]
     from .audio_decoder import available_encodings
 
     return available_encodings()

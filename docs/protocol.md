@@ -56,6 +56,7 @@
 | seg_overlap | float | 有 | 有 | 默认 2 |
 | context / language | str | 有 | 有 | |
 | **encoding** | str | 无 | 新增 | 见 §3；**出现该字段即声明本任务为 v2 任务** |
+| **samples_total** | int | 无 | 末帧必填 | 16kHz 单声道总样本数；非末帧省略。服务端容许解码帧填充误差 1 秒 |
 
 校验（越界 → `bad_request`）：
 - `5 ≤ seg_duration`，`0 ≤ seg_overlap < seg_duration / 2`，且 **`seg_duration + seg_overlap + 吸附最大延长 ≤ 引擎单段上限`**（引擎上限由 engine 暴露，如 MLX `chunk_size=80`）。服务端据此保证**每个实际提交段都不超过引擎上限**，引擎侧截断变为断言失败（`inference_failed`），绝不静默截断。

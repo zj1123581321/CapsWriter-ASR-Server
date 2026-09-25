@@ -12,6 +12,22 @@ from typing import List, Literal, Optional
 import json
 
 
+# 与 docs/protocol.md §4.2 和 SDK 的协议错误码集合保持一致。
+ERROR_CODES = frozenset({
+    'bad_request',
+    'unsupported_encoding',
+    'decode_failed',
+    'task_conflict',
+    'audio_too_long',
+    'inference_failed',
+    'inference_timeout',
+    'overloaded',
+    'slow_consumer',
+    'no_backend',
+    'internal',
+})
+
+
 @dataclass
 class AudioMessage:
     """
@@ -35,6 +51,8 @@ class AudioMessage:
     seg_overlap: float = 2.0
     context: str = ''
     language: str = 'auto'
+    encoding: Optional[str] = None
+    samples_total: Optional[int] = None
 
     def to_json(self) -> str:
         """序列化为 JSON 字符串"""
@@ -53,6 +71,8 @@ class AudioMessage:
             seg_overlap=data.get('seg_overlap', 2.0),
             context=data.get('context', ''),
             language=data.get('language', 'auto'),
+            encoding=data.get('encoding'),
+            samples_total=data.get('samples_total'),
         )
 
 

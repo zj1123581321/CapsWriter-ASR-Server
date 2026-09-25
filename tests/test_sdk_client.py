@@ -168,6 +168,8 @@ async def test_flac_upload_matches_transcode_and_v2_frames(fake_media_tools, tmp
     assert all(frame["encoding"] == "flac" for frame in state["frames"])
     assert all(len(base64.b64decode(frame["data"])) <= 256 * 1024 for frame in state["frames"])
     assert state["frames"][-1]["is_final"] is True
+    assert state["frames"][-1]["samples_total"] == 5 * 16000
+    assert all("samples_total" not in frame for frame in state["frames"][:-1])
     assert transcript.raw["type"] == "result"
 
 
@@ -182,6 +184,7 @@ async def test_raw_f32le_frames_are_at_most_sixty_seconds(tmp_path, monkeypatch)
     assert len(chunks) == 2
     assert all(len(chunk) // 4 <= 60 * 16000 for chunk in chunks)
     assert [frame["is_final"] for frame in state["frames"]] == [False, True]
+    assert state["frames"][-1]["samples_total"] == len(pcm) // 4
 
 
 @pytest.mark.asyncio
