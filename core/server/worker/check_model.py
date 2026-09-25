@@ -85,7 +85,6 @@ def check_model() -> None:
     - 'qwen_asr_mlx'  (仅 Apple Silicon)
 
         ''', style='bright_red')
-        input('按回车退出')
         sys.exit(1)
 
     # 检查所有必需的文件
@@ -117,7 +116,6 @@ def check_model() -> None:
         error_msg += '\n'
         
         logger.error(error_msg)
-        input('按回车退出')
         sys.exit(1)
 
     # 所有必需文件检查通过
