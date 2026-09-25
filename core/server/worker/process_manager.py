@@ -19,6 +19,8 @@ from . import logger
 if TYPE_CHECKING:
     from ..app import CapsWriterServer
 
+PROCESS_MONITOR_INTERVAL_SECONDS = 1
+
 
 class ProcessManager:
     """
@@ -110,7 +112,7 @@ class ProcessManager:
         ensure_server_runtime(self.app.state)
         state = self.app.state
         while self.is_alive:
-            await asyncio.sleep(1)
+            await asyncio.sleep(PROCESS_MONITOR_INTERVAL_SECONDS)
             if not self._process.is_alive():
                 from ..connection.ws_send import fail_active_tasks
                 message = f"推理进程退出 exitcode={self._process.exitcode}"
@@ -172,4 +174,6 @@ class ProcessManager:
             if self._process.is_alive():
                 logger.debug("子进程未响应优雅退出，执行强制终止")
                 self._process.terminate()
-
+                self._process.join(timeout=2)
+                if self._process.is_alive():
+                    raise RuntimeError("识别子进程在强制终止后 2 秒内仍存活")

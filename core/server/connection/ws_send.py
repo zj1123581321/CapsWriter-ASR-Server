@@ -1,4 +1,5 @@
 import asyncio
+import queue
 from ..schema import Result
 from ..state import (
     acknowledge_segment_result,
@@ -84,7 +85,7 @@ async def fail_active_tasks(state, code: str, message: str, *, skip_key=None) ->
             state, websocket, key[0], key[1], code, message, True
         ))
     if closing:
-        await asyncio.gather(*closing)
+        await asyncio.wait_for(asyncio.gather(*closing), timeout=15)
 
 
 def _result_json(result: Result) -> str:
@@ -110,7 +111,11 @@ async def ws_send(app):
     logger.info("WebSocket 结果分发任务已启动")
 
     while True:
-        result: Result = await to_thread(queue_out.get)
+        try:
+            result: Result = await to_thread(queue_out.get, True, 1)
+        except queue.Empty:
+            # 空队列是正常空闲态；限时轮询可让停止时的工作线程及时返回。
+            continue
         if result is None:
             logger.info("收到退出通知，停止结果分发任务")
             return

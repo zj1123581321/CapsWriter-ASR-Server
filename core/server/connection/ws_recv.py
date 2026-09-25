@@ -353,7 +353,7 @@ async def ws_recv(websocket, app) -> None:
         if not sender.done():
             sender.cancel()
             try:
-                await sender
+                await asyncio.wait_for(sender, timeout=5)
             except asyncio.CancelledError:
                 pass
 
@@ -368,7 +368,11 @@ async def _send_connection(websocket, outbound: asyncio.Queue, socket_id: str) -
     """每个 WebSocket 独立发送，避免慢连接阻塞其它结果。"""
     try:
         while True:
-            payload = await outbound.get()
+            try:
+                payload = await asyncio.wait_for(outbound.get(), timeout=1)
+            except TimeoutError:
+                # 没有待发结果是正常空闲态；周期醒来可响应连接关闭取消。
+                continue
             try:
                 await websocket.send(payload)
             finally:

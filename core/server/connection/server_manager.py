@@ -88,7 +88,7 @@ class SocketManager:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
             
         self._is_running = False
         logger.info("SocketManager: WebSocket 服务已退出")
@@ -99,5 +99,3 @@ class SocketManager:
         if self._server:
             self._server.close()
         self._is_running = False
-        if self.app.loop.is_running():
-            self.app.loop.call_soon_threadsafe(self.app.loop.stop)

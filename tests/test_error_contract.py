@@ -16,6 +16,7 @@ import websockets
 
 from core.protocol import AudioMessage
 from core.server.schema import Result
+from core.server.worker.process_manager import PROCESS_MONITOR_INTERVAL_SECONDS
 from tests.harness.client import collect_terminal, send_audio
 from tests.harness.server import ManagedFakeServerHarness, run_model_load_failure
 
@@ -201,7 +202,8 @@ async def test_worker_killed_closes_clients_and_exits_main_nonzero():
 
 @pytest.mark.asyncio
 async def test_segment_watchdog_errors_and_exits_main_nonzero(monkeypatch):
-    monkeypatch.setenv("CW_SEGMENT_TIMEOUT", "2")
+    segment_timeout = 2
+    monkeypatch.setenv("CW_SEGMENT_TIMEOUT", str(segment_timeout))
     server = await ManagedFakeServerHarness.start(
         {"delay_on_call": 1, "delay_seconds": 10}
     )
@@ -218,7 +220,8 @@ async def test_segment_watchdog_errors_and_exits_main_nonzero(monkeypatch):
                 chunk_seconds=0.5,
             )
             messages, closed = await collect_terminal(
-                websocket, task_id="watchdog", timeout=3
+                websocket, task_id="watchdog",
+                timeout=segment_timeout + 2 * PROCESS_MONITOR_INTERVAL_SECONDS + 2,
             )
             errors = [message for message in messages if message.get("type") == "error"]
             assert errors and errors[0]["code"] == "inference_timeout"

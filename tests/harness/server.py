@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import multiprocessing
+import queue
 from types import SimpleNamespace
 
 import websockets
@@ -77,7 +78,7 @@ def run_managed_fake_server(
         async def stall_first(websocket, message, *args, **kwargs):
             if not stalled:
                 stalled.add(websocket.id)
-                await asyncio.Future()
+                await asyncio.wait_for(asyncio.Future(), timeout=15)
             await original_send(websocket, message, *args, **kwargs)
 
         ServerConnection.send = stall_first
@@ -119,9 +120,9 @@ def run_managed_fake_server(
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
             server.close()
-            await server.wait_closed()
+            await asyncio.wait_for(server.wait_closed(), timeout=5)
 
     asyncio.run(serve())
 
@@ -165,7 +166,16 @@ class ManagedFakeServerHarness:
             ),
         )
         self.process.start()
-        port, self.worker_pid = await asyncio.to_thread(self.info_queue.get, True, 20)
+        try:
+            port, self.worker_pid = await asyncio.to_thread(self.info_queue.get, True, 20)
+        except queue.Empty as exc:
+            if self.process.is_alive():
+                self.process.terminate()
+            await asyncio.to_thread(self.process.join, 5)
+            assert not self.process.is_alive(), "启动超时后服务主进程在 5 秒内未退出"
+            self.info_queue.close()
+            self.manager.shutdown()
+            raise AssertionError("等待测试服务启动信息超时 (20s)") from exc
         self.url = f"ws://127.0.0.1:{port}"
         return self
 
@@ -180,7 +190,13 @@ class ManagedFakeServerHarness:
 
     async def stop(self):
         if self.process.is_alive():
+            self.queue_in.put(None)
+            await asyncio.to_thread(self.process.join, 5)
+        graceful_timeout = self.process.is_alive()
+        if graceful_timeout:
             self.process.terminate()
         await asyncio.to_thread(self.process.join, 5)
+        assert not self.process.is_alive(), "服务主进程在 teardown 的 5 秒 join 后仍存活"
         self.info_queue.close()
         self.manager.shutdown()
+        assert not graceful_timeout, "服务主进程未在 5 秒内响应 worker 停止信号"
