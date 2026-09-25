@@ -34,7 +34,7 @@ from core.protocol import AudioMessage
 from core.constants import AudioFormat
 from core.tools.my_status import Status
 from .segmenter import get_cut_finder
-from .audio_decoder import AudioDecodeError, AudioDecoder, available_encodings
+from .audio_decoder import AudioDecodeError, AudioDecoder
 from .. import logger
 from .ws_send import queue_error_and_close
 
@@ -43,7 +43,6 @@ from .ws_send import queue_error_and_close
 status_mic = Status('正在接收音频', spinner='point')
 MAX_AUDIO_FRAME_BYTES = 64 * 1024 * 1024
 SAMPLES_TOTAL_TOLERANCE = 16000
-_DECODER_STOP = object()
 
 
 class AudioCache:
@@ -522,6 +521,9 @@ async def _cancel_audio_cache(cache: AudioCache) -> None:
     if cache.decoder_task is not None:
         await asyncio.gather(cache.decoder_task, return_exceptions=True)
     if cache.decoder is not None:
+        process = cache.decoder.process
+        if process is not None and process.returncode is None:
+            process.kill()
         await cache.decoder.cancel()
 
 
