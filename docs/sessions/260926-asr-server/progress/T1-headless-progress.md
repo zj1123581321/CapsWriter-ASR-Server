@@ -34,3 +34,10 @@
 - **本段结论**：新增 `tests/test_server_headless.py` 7 个用例：端口占用子进程探测（stdin=DEVNULL，超时 30s，断言退出码 1 且无「按回车」）、导入隔离（tkinter/core.ui/pystray 不入 sys.modules）、SIGTERM 一次退出 0（仅 POSIX，就绪信号防注册前竞态）、源码无 input 交互、CW_LOG_LEVEL 生效（DEBUG 卡面要求 + INFO 防恒真：默认 log_level 已是 DEBUG）；`tests/test_logger.py` 补默认目录落仓库根 logs/ 用例。全量 109 passed, 3 skipped（基线 102+3）。
 - **关键决策与已否决方案**：端口占用用例选择「桩掉 process_manager.start + 走真实 app.start()/socket_manager 自检」而非直接调 `_check_port`，覆盖面更真且不依赖真实模型；SIGTERM 用例以 `SERVER_READY` 行同步就绪时机，避免信号先于处理器注册的竞态。
 - **下一步唯一动作**：红验（端口退出码改 0、删 SIGTERM 注册各一次）后收尾提交。
+
+## 里程碑 6：红验完成，收尾
+
+- **当前阶段**：收尾
+- **本段结论**：两条红验均按「改坏一行 → 断言红 → 只还原该行」完成：端口退出码改 `SystemExit(0)` → `assert 0 == 1` 红；删 SIGTERM 注册 → 子进程被默认处置杀死，`期望退出码 0，实际 -15` 红。还原后 `git diff` 为空，最终全量 109 passed, 3 skipped。
+- **关键决策与已否决方案**：无
+- **下一步唯一动作**：推送分支并开 draft PR，写验收报告。
