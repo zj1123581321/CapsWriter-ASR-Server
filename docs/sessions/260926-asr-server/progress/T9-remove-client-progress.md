@@ -29,3 +29,9 @@
 - 本段结论：grep 发现并删除了 `core/logger.py` 中一行引用旧客户端入口的注释；其余命中仅来自历史 CHANGELOG 和旧文档迁移台账。
 - 关键决策与已否决方案：历史记录保留其当时的客户端词汇，不改写成当前仓库结构。
 - 下一步唯一动作：提交这条清理并复核最终状态后推送 draft PR。
+
+## 里程碑 6：草稿 PR 已发布
+- 当前阶段：实现交付完毕，等待主脑审查。
+- 本段结论：分支 `card/CapsWriter-Offline-with-AI-20260926-14` 已推送，PR [#21](https://github.com/zj1123581321/CapsWriter-Offline-with-AI/pull/21) 为 OPEN draft，远端 SHA 为 `dbd7ffcd8944ed2ab61b30a63cd0a032bb574323`。
+- 关键决策与已否决方案：按卡面保持 draft，不标 ready、不合并；保护区引擎未达模块及范围外遗留项交由主脑在报告中裁决。
+- 下一步唯一动作：将完整报告写入派发报告路径并回传摘要。
