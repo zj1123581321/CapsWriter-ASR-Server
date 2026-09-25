@@ -43,10 +43,9 @@ class SocketManager:
         """
         if self._is_running: return
         
-        # 0. 启动前自检环境
+        # 0. 启动前自检环境（无头守护下没有 tty 等待回车，必须 fail fast 非零退出）
         if not self._check_port():
-            input("\n按回车键退出...")
-            return 
+            raise SystemExit(1)
 
         self._is_running = True
 

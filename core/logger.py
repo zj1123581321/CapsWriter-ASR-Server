@@ -53,8 +53,9 @@ class Logger:
 
         # 确定日志目录
         if log_dir is None:
-            from config_client import BASE_DIR
-            log_dir = os.path.join(BASE_DIR, 'logs')
+            # 默认仓库根目录下的 logs/（本文件位于 core/ 下，上一级即仓库根），
+            # 服务端导入链因此不再依赖任何客户端模块
+            log_dir = os.path.join(str(Path(__file__).resolve().parents[1]), 'logs')
 
         # 创建日志目录
         Path(log_dir).mkdir(parents=True, exist_ok=True)

@@ -8,11 +8,12 @@ CapsWriter Offline 服务端主程序门面类 (Facade)
 """
 
 import os
+import sys
+import signal
 import asyncio
 from pathlib import Path
 from config_server import ServerConfig as Config, __version__
 from .state import ServerState, console
-from core.tools.signal_handler import register_signal
 from .worker.process_manager import ProcessManager
 from .connection.server_manager import SocketManager
 from .ui.tray_manager import TrayManager
@@ -83,10 +84,27 @@ class CapsWriterServer:
         console.print('[green4]再见！')
 
 
+    def _register_exit_signals(self):
+        """
+        注册退出信号处理（服务端专用，不用 core.tools.signal_handler）
+
+        无头守护（pm2 / systemd / Windows 计划任务）下没有「第二次按键」的
+        交互机会，SIGINT / SIGTERM 任一收到一次即触发 stop() 清理（停子进程、
+        关 loop），让进程以退出码 0 结束。Windows 无法投递 SIGTERM，仅注册
+        SIGINT（hasattr + 平台判断，不写 try-except 吞错）。
+        """
+        def _stop_on_signal(signum, _frame):
+            logger.info(f"收到 {signal.Signals(signum).name}，开始清理退出")
+            self.stop()
+
+        signal.signal(signal.SIGINT, _stop_on_signal)
+        if sys.platform != 'win32' and hasattr(signal, 'SIGTERM'):
+            signal.signal(signal.SIGTERM, _stop_on_signal)
+
     def start(self):
         """
         同步启动服务端 (主入口)
-        
+
         注册信号处理、拉起子进程并进入网络服务监听循环。
         """
         # 防连续触发
@@ -94,7 +112,7 @@ class CapsWriterServer:
         self.is_alive = True
 
         # 注册退出信号处理
-        register_signal(self.stop)
+        self._register_exit_signals()
 
         # 托盘图标
         self.tray_manager.start()
