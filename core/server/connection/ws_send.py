@@ -40,7 +40,7 @@ def schedule_error_close(
 ) -> asyncio.Task:
     """将 error 放入单连接队列，并安排队列冲刷后关闭连接。"""
     ensure_server_runtime(state)
-    transition_terminal(state, (socket_id, task_id), 'FAILED')
+    transition_terminal(state, (socket_id, task_id), 'FAILED', code=code)
     outbound = state.out_queues.get(socket_id)
     if outbound is None:
         logger.debug(f"连接 {socket_id} 无出站队列，直接关闭 code={code}")

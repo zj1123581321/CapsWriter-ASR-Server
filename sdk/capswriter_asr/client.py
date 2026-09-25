@@ -41,6 +41,21 @@ class Transcript:
 
 _CHUNK_BYTES = 256 * 1024
 _RAW_SAMPLE_RATE = 16000
+
+# 服务端协议错误码；本地 timeout/connection_lost 等 SDK 异常不在此集合内。
+PROTOCOL_ERROR_CODES = frozenset({
+    "bad_request",
+    "unsupported_encoding",
+    "decode_failed",
+    "task_conflict",
+    "audio_too_long",
+    "inference_failed",
+    "inference_timeout",
+    "overloaded",
+    "slow_consumer",
+    "no_backend",
+    "internal",
+})
 _RAW_FRAME_SECONDS = 60
 
 
@@ -174,6 +189,7 @@ def _audio_frame(
     task_id: str,
     time_start: float,
     is_final: bool,
+    samples_total: int,
     encoding: str,
     seg_duration: float,
     seg_overlap: float,
@@ -190,6 +206,8 @@ def _audio_frame(
         "seg_overlap": seg_overlap,
         "encoding": encoding,
     }
+    if is_final:
+        frame["samples_total"] = samples_total
     if language is not None:
         frame["language"] = language
     if context is not None:
@@ -233,6 +251,7 @@ async def _transcribe_connected(
     data: bytes,
     *,
     encoding: str,
+    samples_total: int,
     language: str | None,
     context: str | None,
     seg_duration: float,
@@ -256,6 +275,7 @@ async def _transcribe_connected(
                     task_id=task_id,
                     time_start=time_start,
                     is_final=is_final,
+                    samples_total=samples_total,
                     encoding=encoding,
                     seg_duration=seg_duration,
                     seg_overlap=seg_overlap,
@@ -314,14 +334,19 @@ async def _operation(
     await _check_server(url, encoding)
     audio = await _transcode(path, encoding)
     if encoding == "f32le":
-        duration = np.frombuffer(audio, dtype="<f4").size / _RAW_SAMPLE_RATE
+        samples_total = np.frombuffer(audio, dtype="<f4").size
+        duration = samples_total / _RAW_SAMPLE_RATE
     elif encoding == "s16le":
-        duration = np.frombuffer(audio, dtype="<i2").size / _RAW_SAMPLE_RATE
+        samples_total = np.frombuffer(audio, dtype="<i2").size
+        duration = samples_total / _RAW_SAMPLE_RATE
+    else:
+        samples_total = round(duration * _RAW_SAMPLE_RATE)
     try:
         return await _transcribe_connected(
             url,
             audio,
             encoding=encoding,
+            samples_total=samples_total,
             language=language,
             context=context,
             seg_duration=seg_duration,
