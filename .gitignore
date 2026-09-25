@@ -191,8 +191,9 @@ release
 
 models/**/*.cfg
 # llama.cpp 下载的二进制(按需下载，不入库)
-core/server/engines/llama/bin/*.so*
-core/server/engines/llama/bin/*.dylib
+core/server/engines/llama/bin/*/*.so*
+core/server/engines/llama/bin/*/*.dylib
+core/server/engines/llama/bin/*/*.dll
 .venv-test/
 .venv-mlx/
 temp/

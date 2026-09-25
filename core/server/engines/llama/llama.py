@@ -21,6 +21,34 @@ from . import logger
 # Configuration
 # =========================================================================
 LOGS = True      # 是否在 logger 文件中记录 llama.cpp 的日志
+LLAMA_BUILD = "b10621"
+
+
+def _llama_lib_dir() -> Path:
+    """返回并校验当前代码要求的 llama.cpp 动态库目录。"""
+    bin_dir = Path(__file__).parent / "bin"
+    lib_dir = bin_dir / LLAMA_BUILD
+
+    if sys.platform == "win32":
+        required_files = ("ggml.dll", "ggml-base.dll", "llama.dll")
+    elif sys.platform == "darwin":
+        required_files = ("libggml.dylib", "libggml-base.dylib", "libllama.dylib")
+    else:
+        required_files = ("libggml.so", "libggml-base.so", "libllama.so")
+
+    missing_files = [name for name in required_files if not (lib_dir / name).is_file()]
+    if not lib_dir.is_dir() or missing_files:
+        actual_dirs = sorted(
+            child.name for child in bin_dir.iterdir() if child.is_dir()
+        ) if bin_dir.is_dir() else []
+        missing = missing_files or list(required_files)
+        raise RuntimeError(
+            f"llama.cpp 版本目录不满足要求：期望版本 {LLAMA_BUILD}，"
+            f"期望目录 {lib_dir}，缺失文件 {missing}，"
+            f"bin/ 下实际存在的子目录 {actual_dirs}"
+        )
+
+    return lib_dir
 
 # =========================================================================
 # Type Definitions
@@ -209,8 +237,7 @@ def bind_llama_lib():
     if llama is not None:
         return
 
-    # 获取库文件所在目录 (模块目录下的 bin)
-    lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+    lib_dir = _llama_lib_dir()
 
     # DLL 命名处理
     if sys.platform == "win32":
@@ -226,9 +253,9 @@ def bind_llama_lib():
         GGML_BASE_DLL = "libggml-base.so"
         LLAMA_DLL = "libllama.so"
 
-    ggml = ctypes.CDLL(os.path.join(lib_dir, GGML_DLL))
-    ggml_base = ctypes.CDLL(os.path.join(lib_dir, GGML_BASE_DLL))
-    llama = ctypes.CDLL(os.path.join(lib_dir, LLAMA_DLL))
+    ggml = ctypes.CDLL(str(lib_dir / GGML_DLL))
+    ggml_base = ctypes.CDLL(str(lib_dir / GGML_BASE_DLL))
+    llama = ctypes.CDLL(str(lib_dir / LLAMA_DLL))
 
     # 设置日志回调
     LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
@@ -409,8 +436,8 @@ def init():
     """
     切换目录，初始化 llama.cpp lib
     """
+    lib_dir = _llama_lib_dir()
     original_cwd = Path.cwd()
-    lib_dir = Path(__file__).parent / 'bin'
 
     # 跳转到 dll 所在目录，并将其加到 Path
     os.chdir(lib_dir)
