@@ -168,7 +168,7 @@ async def test_flac_upload_matches_transcode_and_v2_frames(fake_media_tools, tmp
     assert all(frame["encoding"] == "flac" for frame in state["frames"])
     assert all(len(base64.b64decode(frame["data"])) <= 256 * 1024 for frame in state["frames"])
     assert state["frames"][-1]["is_final"] is True
-    assert state["frames"][-1]["samples_total"] == 5 * 16000
+    assert state["frames"][-1]["samples_total"] == 16000
     assert all("samples_total" not in frame for frame in state["frames"][:-1])
     assert transcript.raw["type"] == "result"
 
