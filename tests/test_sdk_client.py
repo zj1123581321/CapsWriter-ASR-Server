@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import subprocess
@@ -174,16 +175,15 @@ async def test_progress_is_received_before_upload_finishes(tmp_path, monkeypatch
         async def recv(self):
             return await self.ws.recv()
 
-    def delayed_connect(url, *, ping_interval=None, max_size=None, max_queue=None, proxy=None):
-        return DelayedConnection(
-            original_connect(
-                url,
-                ping_interval=ping_interval,
-                max_size=max_size,
-                max_queue=max_queue,
-                proxy=proxy,
-            )
-        )
+    def delayed_connect(url, *args, **kwargs):
+        assert kwargs["ping_interval"] is None
+        assert kwargs["max_size"] is None
+        assert kwargs["max_queue"] is None
+        if "proxy" in inspect.signature(original_connect).parameters:
+            assert kwargs["proxy"] is None
+        return DelayedConnection(original_connect(url, *args, **kwargs))
+
+    delayed_connect.__signature__ = inspect.signature(original_connect)
 
     monkeypatch.setattr(sdk_client.websockets, "connect", delayed_connect)
     progress_observed = []
@@ -258,6 +258,48 @@ async def test_idle_timeout_is_independent_of_incoming_messages(tmp_path):
         with pytest.raises(AsrError) as caught:
             await transcribe_file(audio_path, url, idle_timeout=2, deadline_total=10)
     assert caught.value.code == "timeout"
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.asyncio
+async def test_blocked_send_uses_idle_timeout(tmp_path, monkeypatch):
+    audio_path = make_audio(tmp_path / "source.wav")
+    original_connect = websockets.connect
+    proxy_unspecified = object()
+
+    class BlockedSendConnection:
+        def __init__(self, context_manager):
+            self.context_manager = context_manager
+            self.ws = None
+
+        async def __aenter__(self):
+            self.ws = await self.context_manager.__aenter__()
+            return self
+
+        async def __aexit__(self, *args):
+            return await self.context_manager.__aexit__(*args)
+
+        async def send(self, _message):
+            await asyncio.Future()
+
+        async def recv(self):
+            return await self.ws.recv()
+
+    def blocked_connect(url, *, ping_interval=None, max_size=None, max_queue=None, proxy=proxy_unspecified):
+        options = {"ping_interval": ping_interval, "max_size": max_size, "max_queue": max_queue}
+        if proxy is not proxy_unspecified:
+            options["proxy"] = proxy
+        return BlockedSendConnection(original_connect(url, **options))
+
+    blocked_connect.__signature__ = inspect.signature(original_connect)
+    monkeypatch.setattr(sdk_client.websockets, "connect", blocked_connect)
+
+    async with fake_v2_server(accept_and_finish) as (url, _state):
+        started = time.monotonic()
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(audio_path, url, idle_timeout=2, deadline_total=10)
+    assert caught.value.code == "timeout"
+    assert "发送音频帧" in caught.value.message
     assert time.monotonic() - started < 5
 
 
