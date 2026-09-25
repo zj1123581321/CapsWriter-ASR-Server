@@ -1,6 +1,2 @@
 from .. import logger, console
-
-try:
-    from ...llama import llama
-except:
-    ...
+from ...llama import llama
