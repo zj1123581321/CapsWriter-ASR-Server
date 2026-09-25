@@ -53,6 +53,7 @@ class AudioMessage:
     language: str = 'auto'
     encoding: Optional[str] = None
     samples_total: Optional[int] = None
+    model: Optional[str] = None
 
     def to_json(self) -> str:
         """序列化为 JSON 字符串"""
@@ -61,6 +62,8 @@ class AudioMessage:
             data.pop('encoding')
         if self.samples_total is None:
             data.pop('samples_total')
+        if self.model is None:
+            data.pop('model')
         return json.dumps(data, ensure_ascii=False)
     
     @classmethod
@@ -78,6 +81,7 @@ class AudioMessage:
             language=data.get('language', 'auto'),
             encoding=data.get('encoding'),
             samples_total=data.get('samples_total'),
+            model=data.get('model'),
         )
 
 

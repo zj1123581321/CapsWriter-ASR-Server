@@ -57,6 +57,7 @@
 | context / language | str | 有 | 有 | |
 | **encoding** | str | 无 | 新增 | 见 §3；**出现该字段即声明本任务为 v2 任务** |
 | **samples_total** | int | 无 | 末帧必填 | 16kHz 单声道总样本数；非末帧省略。服务端容许解码帧填充误差 1 秒 |
+| model | str | 无 | 可选 | 期望的后端模型（/health 的 model 值）；缺省 = 不限 |
 
 校验（越界 → `bad_request`）：
 - `5 ≤ seg_duration`，`0 ≤ seg_overlap < seg_duration / 2`，且 **`seg_duration + seg_overlap + 吸附最大延长 ≤ 引擎单段上限`**（引擎上限由 engine 暴露，如 MLX `chunk_size=80`）。服务端据此保证**每个实际提交段都不超过引擎上限**，引擎侧截断变为断言失败（`inference_failed`），绝不静默截断。
@@ -136,6 +137,7 @@ proxy：
 ## 6. 版本规则
 
 - 整数版本，只增不减；v1 = 现状，v2 = 本文件。v2 服务端兼容 v1 任务。
+- `model` 为可选字段，不升版本。
 - **SDK 永远发送 encoding 字段（含 f32le）**，因此 SDK 任务都是 v2 任务：
   - SDK 每任务前 GET /health；非 v2 → `ServerTooOld`；encodings 不含所选编码 → `UnsupportedEncoding`。不降级。
   - proxy 对 v2 任务只路由到健康的 v2 后端，且后端 encodings 含该编码；否则 `no_backend`。v2 任务不会落到 v1 后端，v2 保证（error 帧、终态规则）端到端成立。

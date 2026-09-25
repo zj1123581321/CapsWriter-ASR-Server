@@ -643,6 +643,13 @@ async def ws_recv(websocket, app) -> None:
                     return
                 begin_task(state, key, Config.max_inflight_segments)
             record = state.tasks[key]
+            if msg.model is not None and msg.model != Config.model_type:
+                await _cancel_audio_cache(cache)
+                await queue_error_and_close(
+                    state, websocket, socket_id, msg.task_id, 'bad_request',
+                    f"请求模型 {msg.model!r} 与服务端模型 {Config.model_type!r} 不符", False,
+                )
+                return
             if not record.encoding_set:
                 record.declared_encoding = msg.encoding
                 record.encoding = msg.encoding or 'v1'
@@ -781,7 +788,7 @@ def _validate_audio_dict(data) -> None:
     missing = [name for name in required if name not in data]
     if missing:
         raise KeyError(f"缺少必需字段: {', '.join(missing)}")
-    string_fields = ('task_id', 'source', 'data', 'context', 'language', 'encoding')
+    string_fields = ('task_id', 'source', 'data', 'context', 'language', 'encoding', 'model')
     for name in string_fields:
         if name in data and not isinstance(data[name], str):
             raise TypeError(f"字段 {name} 必须是字符串")
