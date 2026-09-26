@@ -1,186 +1,131 @@
-# CapsWriter ASR 服务协议（v2）
-状态：已评审（2026-09-26 CEO review + eng review 窄审），实现按任务卡逐步落地；本文件是服务端、proxy、SDK 的唯一契约来源。
+# WebSocket 语音识别协议
 
-适用：server（`core/server`）、proxy（`core/proxy`）和下游 SDK。
-服务端消息数据类定义在 `core/protocol.py`；SDK 按本契约编码和解析消息。
+本文说明 CapsWriter ASR Server 与下游客户端之间的 WebSocket 和 HTTP `/health` 协议。新客户端应使用 v2；服务端保留 v1 上行兼容。Python 项目可优先使用 [SDK](../sdk/README.md)，其他语言可按本文直接接入。
 
-## 0. 设计约束
+## 连接与健康检查
 
-- 外部下游用 `result.get("is_final", False)` 判结束（tg-archiver `asr/client.py:209`、VideoTranscriptAPI `capswriter_client.py:651`、WechatChatRoomSummary `capswriter.py:203`），三家都在 `ConnectionClosed` 时退出等待（tg-archiver 抛 `AsrConnectionError`；另两家返回 None）。**让老下游停止等待的信号只有 `is_final` 或连接关闭。** 服务端只保证「不挂死」；老下游是否把 None 正确当失败上报，由下游迁移 issue（T14）负责。
-- 服务端与 proxy 均禁用 WS ping（`server_manager.py:73`、`proxy_server.py:73`、`router.py:237`，提交 f61a1a7）。存活判定只靠应用层计时与进度消息。
-- 红线：无重试、无 fallback，错误 fail fast。
+- 默认 WebSocket 地址为 `ws://<host>:6016`；proxy 使用自身配置的地址。连上后直接发送 JSON 文本帧，不需要 subprotocol 或握手配置帧。
+- 同端口提供 `GET /health`。就绪时返回 HTTP 200 和 JSON，包含 `status`、`protocol_version`、`role`、`encodings`；服务端还返回当前 `model`。未就绪时返回 HTTP 503。
+- SDK 要求健康检查报告 `protocol_version >= 2`，且 `encodings` 包含所选编码。它不会回退到 v1。
+- 一条连接同一时刻只处理一个活动任务。活动任务收到最终结果后可以继续复用连接；一个任务失败时服务端先发送 `error`，再关闭连接。
 
-## 1. 连接、任务与唯一终态
+服务端 `/health` 的其余字段用于判断运行状态和版本来源：
 
-- **一条连接同一时刻最多一个活动任务**。任务终结（final 或 error）后，同连接可开始下一个任务。
-- 活动任务未终结时出现不同 `task_id` → `error{code:"task_conflict"}`。
-- 服务端内部一律以 `(socket_id, task_id)` 为任务键（修正 `state.py:70` 仅按 task_id 全局存储导致跨连接同 ID 串结果的问题）。
-
-任务状态机（每个任务唯一一个，服务端主进程持有）：
-```
- RECEIVING --上行 is_final--> DRAINING --最后一段结果到达且尾段已切完--> DONE (发 final)
-     |                            |
-     +--------任一失败-------------+------------> FAILED (发 error)
- DONE/FAILED 为终态；进入终态的转移只允许发生一次（原子检查），
- 终态后：迟到的结果丢弃；已入推理队列未开始的段由 worker 按「已终止任务集合」跳过；
-         正在推理的段不做跨进程中断（跑完后结果丢弃）；
-         在途计数、proxy active_tasks 只释放一次。
- 并发裁决：先到者胜。final 与 error 同时就绪时以先完成终态转移者为准。
- 重复 is_final、终态后继续上传的帧：丢弃并记 warning，不回包（连接已关或已进入下一任务前）。
-```
-- error 的「发出」= 放入该连接出站队列；随后该连接出站队列冲刷（上限 5s），再以 close 4000 关闭。冲刷超时直接关闭。
-- DONE 不关闭连接（由客户端关）；FAILED 必关连接（为了让老下游退出等待）。
-
-```
-客户端                                    服务端
-  |-- GET /health -------------------------->|  SDK 校验版本
-  |== WS ===================================|
-  |-- audio{task_id,encoding,data,F} ------>|
-  |-- audio{...}  (连续分块，≤60s/帧) ------->|  背压：在途段满时停止读取
-  |<-- result{type:result,is_final=F} ------|  每段一条累计进度
-  |-- audio{...,is_final=T} --------------->|  末帧可带数据；服务端继续切段
-  |<-- result{type:result,is_final=T} ------|
- 失败：|<-- error{...} ; close(4000) ---------|
-```
-
-## 2. 上行消息 audio（JSON 文本帧）
-
-| 字段 | 类型 | v1 | v2 | 说明 |
-|---|---|---|---|---|
-| task_id | str | 有 | 有 | 非空 |
-| source | "mic"\|"file" | 有 | 有 | 下游一律 "file" |
-| data | str | 有 | 有 | base64，可空串 |
-| is_final | bool | 有 | 有 | 末帧 true，**可携带数据** |
-| time_start | float | 有 | 有 | 透传 |
-| seg_duration | float | 有 | 有 | 默认 15 |
-| seg_overlap | float | 有 | 有 | 默认 2 |
-| context / language | str | 有 | 有 | |
-| **encoding** | str | 无 | 新增 | 见 §3；**出现该字段即声明本任务为 v2 任务** |
-| **samples_total** | int | 无 | 末帧必填 | 16kHz 单声道总样本数；非末帧省略。服务端容许解码帧填充误差 1 秒 |
-| model | str | 无 | 可选 | 期望的后端模型（/health 的 model 值）；缺省 = 不限 |
-
-校验（越界 → `bad_request`）：
-- `5 ≤ seg_duration`，`0 ≤ seg_overlap < seg_duration / 2`，且 **`seg_duration + seg_overlap + 吸附最大延长 ≤ 引擎单段上限`**（引擎上限由 engine 暴露，如 MLX `chunk_size=80`）。服务端据此保证**每个实际提交段都不超过引擎上限**，引擎侧截断变为断言失败（`inference_failed`），绝不静默截断。
-- 同一任务内 encoding 不可变。
-- 缺 encoding = v1 任务，按 `f32le` 处理。
-- 未知字段忽略。
-
-**末帧切段规则（修复现存缺陷 `ws_recv.py:190`）**：收到 is_final 后，先把末帧数据并入缓冲，再按常规规则循环切段直到剩余 ≤ 单段上限，最后提交尾段。压缩编码则在解码器输出 EOF 之后执行同一流程。
-
-## 3. encoding 与解码
-
-| 值 | 内容 | 约束 | 服务端处理 |
-|---|---|---|---|
-| `f32le` | PCM float32 LE 16kHz 单声道 | 每块字节数 4 的倍数 | 直入缓冲 |
-| `s16le` | PCM int16 LE 16kHz 单声道 | 每块字节数 2 的倍数 | 转 float32 |
-| `flac` | 一条 FLAC 流，任意字节切分 | — | per-task ffmpeg |
-| `ogg_opus` | 一条 Ogg/Opus 流，任意字节切分 | — | per-task ffmpeg |
-
-- 单帧 base64 解码后 ≤ 64 MiB（约 17 分钟 f32le）；超限 `bad_request`。
-- 单任务解码后音频时长 ≤ `CW_MAX_TASK_SECONDS`（默认 14400）；按**解码后 PCM** 计，超限 `audio_too_long`。
-- ffmpeg 生命周期（asyncio 子进程，写 stdin 与读 stdout 为两个并发协程，禁止同步串行写读）：
-  1. 首帧创建：`ffmpeg -nostdin -f {flac|ogg} -i pipe:0 -ar 16000 -ac 1 -f f32le pipe:1`（显式 demuxer）。
-  2. 数据帧写入 stdin（带背压 drain）。
-  3. 上行 is_final：关闭 stdin → 读 stdout 至 EOF → `wait()` 取退出码 → 非零即 `decode_failed` → 否则执行末帧切段。
-  4. 取消（error、断连）：关闭 stdin，5s 内未退出则 kill，再 wait 回收。任何路径都不得遗留子进程。
-- 服务端 PATH 无 ffmpeg 时，/health 的 encodings 不含压缩格式；收到压缩任务 → `unsupported_encoding`。
-- SDK 默认 `flac`；`ogg_opus` 需在固定语料 CER 不劣于 flac 后按消费方逐个开启。
-
-## 4. 下行消息
-
-### 4.1 result
-v1 字段全部保留，新增 `type:"result"`（老下游 dict.get 读取不受影响）。
-- 中间帧：每段一条，用作进度与存活信号。
-- 最终帧：`is_final=true`；file 任务的 tokens/timestamps 必须来自真实对齐或引擎原生时间戳；不得缺段。
-
-### 4.2 error（v2）
 ```json
-{"type":"error","task_id":"…","code":"inference_failed","message":"含段序号等上下文","retryable":false}
+{"status":"ok","protocol_version":2,"role":"server","encodings":["f32le","s16le","flac","ogg_opus"],"model":"paraformer","git_sha":"abc1234","llama_build":null,"worker_alive":true,"aligner":"not_required","active_tasks":0,"queued_segments":0}
 ```
-| code | 触发 | retryable |
+
+`git_sha` 是服务进程启动时取得的版本标识；更新工作树不会改变已运行进程报告的值。`worker_alive` 表示识别子进程已就绪且存活，`aligner` 表示当前时间对齐器状态；`active_tasks` 与 `queued_segments` 是当前负载计数。`llama_build` 仅在相关 GGUF 模型或已加载对齐器时提供，其他情况为 `null`。proxy 的 `/health` 同样返回状态、协议版本、角色和 `git_sha`；`encodings` 是健康 v2 后端编码的并集，`backends` 逐项报告后端 URL、健康状态、协议版本、模型、编码和版本标识。服务端与 proxy 都会在没有可服务的健康 worker/backend 时返回 HTTP 503。
+
+## 上行音频帧
+
+每条上行消息都是 JSON 文本帧。必填字段如下：
+
+| 字段 | 类型 | 说明 |
 |---|---|---|
-| bad_request | 坏 JSON、缺字段、越界、encoding 变化、帧超限、上传空闲超时 | false |
-| unsupported_encoding | 取值不认识或本机不可用 | false |
-| decode_failed | base64/字节对齐错误、ffmpeg 非零退出 | false |
-| task_conflict | 活动任务未终结时出现新 task_id | false |
-| audio_too_long | 超时长上限 | false |
-| inference_failed | 段推理异常、对齐返回空、引擎断言失败 | true |
-| inference_timeout | 单段推理超 `CW_SEGMENT_TIMEOUT` | true |
-| overloaded | 全局活动任务超上限 | true |
-| slow_consumer | 该连接出站队列满（客户端长期不读） | true |
-| no_backend | （proxy）无可用 v2 后端 | true |
-| internal | 其他（附异常类名） | true |
+| `task_id` | string | 任务标识；同一任务所有帧保持一致 |
+| `source` | `file` 或 `mic` | 文件或麦克风音频 |
+| `data` | string | 每帧音频字节的 Base64 编码 |
+| `is_final` | boolean | 末帧为 `true`；末帧可以携带音频数据 |
+| `time_start` | number | 音频起始 Unix 时间戳，秒 |
 
-- 老 v1 下游若用 `RecognitionMessage.from_dict` 解析 error 会抛 `KeyError`；随后连接关闭，它会停止等待，但可能误报「完成」。新接入应使用 SDK 或按本契约处理 error 帧。
-- 无法解析出 task_id 的坏帧，task_id 填空串。
+可选字段：`seg_duration`（默认 15 秒，最小 5 秒）、`seg_overlap`（默认 2 秒，必须非负且小于 `seg_duration / 2`）、`language`（默认 `auto`）、`context`（默认空字符串）和 `model`。`model` 有值时必须与当前服务端模型相同。一个任务的分段参数与编码不能在帧间改变。对有单段长度限制的引擎，服务端还会把切点搜索延长量和 overlap 计入最长段长；Qwen3 GGUF 与 MLX 的上限为 80 秒，超限时返回 `bad_request`。
 
-## 5. /health（HTTP GET，同端口）
+### v1 与 v2 上行
 
-server：
+服务端以 `encoding` 是否出现区分上行版本：
+
+- **v1**：不带 `encoding` 和 `samples_total`，音频按 16 kHz、单声道、little-endian float32 PCM (`f32le`) 解释。v1 客户端可继续连接支持 v1 的服务端，也可连接本服务端。
+- **v2**：带 `encoding`；末帧必须带非负整数 `samples_total`。`samples_total` 是整段解码后 16 kHz 单声道 PCM 的样本数，服务端允许最多 16,000 个样本（1 秒）的解码差异。编码在一个任务内固定。
+
+v2 示例末帧：
+
 ```json
-{"status":"ok","protocol_version":2,"role":"server",
- "encodings":["f32le","s16le","flac","ogg_opus"],
- "model":"qwen_asr_mlx","git_sha":"abc1234","llama_build":"b10621",
- "worker_alive":true,"aligner":"ok","active_tasks":1,"queued_segments":3}
+{"task_id":"bcb785be-9f09-46e4-ad05-f64482ae8dd7","source":"file","encoding":"s16le","data":"AAABAAIA","is_final":true,"time_start":1780000000.0,"samples_total":3}
 ```
-proxy：
-```json
-{"status":"ok","protocol_version":2,"role":"proxy","git_sha":"…",
- "encodings":["f32le","s16le","flac"],
- "backends":[{"url":"…","healthy":true,"protocol_version":2,"model":"…","encodings":[…],"git_sha":"…"}]}
-```
-- 不可服务（worker 死、未就绪、proxy 无健康 v2 后端）→ HTTP 503。
-- proxy 的 `encodings` = 所有健康 v2 后端 encodings 的并集；proxy 每 30s 刷新后端 /health。
-- 旧服务端无 /health：websockets 对普通 HTTP 请求返回非 200（通常 426），**SDK 把任何非 200 / 非 JSON 响应一律视为 v1**。
-- 对齐器：服务启动时**立即加载**（改掉 `engines/manager.py:20` 的首次使用惰性加载）；需要外挂对齐器的引擎加载失败 → 启动失败。原生时间戳引擎（paraformer、sensevoice 等）`aligner:"native"`。空闲卸载机制保留，但再次加载失败 → 该任务 `inference_failed`，不伪造时间戳。
 
-## 6. 版本规则
+`data` 中示例字节仅用于说明字段格式，不构成有效语音样本。对于多帧任务，末帧可包含最后一段数据；若没有剩余数据，`data` 可以为空字符串。
 
-- 整数版本，只增不减；v1 = 现状，v2 = 本文件。v2 服务端兼容 v1 任务。
-- `model` 为可选字段，不升版本。
-- **SDK 永远发送 encoding 字段（含 f32le）**，因此 SDK 任务都是 v2 任务：
-  - SDK 每任务前 GET /health；非 v2 → `ServerTooOld`；encodings 不含所选编码 → `UnsupportedEncoding`。不降级。
-  - proxy 对 v2 任务只路由到健康的 v2 后端，且后端 encodings 含该编码；否则 `no_backend`。v2 任务不会落到 v1 后端，v2 保证（error 帧、终态规则）端到端成立。
-  - 缺 encoding 的 v1 任务，proxy 可路由到任意健康后端（现状）。
-- 破坏兼容须升 v3，/health 增加 `min_protocol_version`。
+## 音频编码
 
-## 7. 背压与资源上限（全链路有界）
-
-| 位置 | 上限 | 满时行为 |
+| `encoding` | 帧内容 | 服务端要求 |
 |---|---|---|
-| server 每任务在途段 | `CW_MAX_INFLIGHT_SEGMENTS`=4 | 提交前 await 信号量 → 停止读该连接 → TCP 流控 |
-| server 全局活动任务 | `CW_MAX_TASKS`=8 | 新任务 `overloaded` |
-| server 每连接出站队列 | 256 条 | 满 → `slow_consumer`，关该连接；分发器从不 await 满队列（put_nowait） |
-| server worker 每轮取入 | `CW_DRAIN_BATCH`=16 | 取满即去推理 |
-| proxy 每任务上行队列 | 8 帧（改 `router.py:203` 的无界 Queue） | 满 → 停止读客户端，背压透传 |
-| proxy 每任务下行队列 | 256 条 | 同 server 出站规则 |
-| ffmpeg 输出读取 | 受在途段信号量约束 | 同上 |
+| `f32le` | 16 kHz 单声道 float32 little-endian PCM；每帧字节数为 4 的倍数 | 原始 PCM |
+| `s16le` | 16 kHz 单声道 int16 little-endian PCM；每帧字节数为 2 的倍数 | 原始 PCM，服务端转为 float32 |
+| `flac` | 单条 FLAC 音频流，可任意分帧 | 服务端 PATH 中需有 `ffmpeg` |
+| `ogg_opus` | 单条 Ogg/Opus 音频流，可任意分帧 | 服务端 PATH 中需有 `ffmpeg` |
 
-- 信号量在**结果回到主进程时**释放（不等送达客户端），慢客户端不会反向锁住推理。
-- 结果分发：单一分发协程从 `queue_out` 取结果，按 `(socket_id, task_id)` `put_nowait` 到对应连接的出站队列；每连接一个发送协程。一个慢连接只影响自己。
+单帧 Base64 解码后的数据上限为 64 MiB；任务解码后时长默认最多 14,400 秒，可由服务端 `CW_MAX_TASK_SECONDS` 调整。v2 客户端应分块发送：原始 PCM 每帧最多 60 秒，压缩流每帧不超过 256 KiB。发送的 `data` 必须是指定编码的裸音频字节，不能把 WAV 文件头放进 PCM 帧。
 
-计时规则：
-- **上传空闲** `CW_UPLOAD_IDLE_SECONDS`=300：仅在服务端「愿意读」（未被背压挂起）时计时；背压挂起期间暂停计时。超时 → `bad_request`（message 注明 upload idle）。
-- **单段推理看门狗** `CW_SEGMENT_TIMEOUT`=600：主进程记录每段提交时间，超时 → 该任务 `inference_timeout`；并判定推理子进程卡死 → 主进程非零退出交守护进程拉起（与 D3「子进程死亡即退出」同一原则）。上限按最慢机器（Mac mini CPU）单段耗时的 10 倍以上取值，部署时按 /health 实测复核。
+服务端资源上限和超时默认值如下；服务端操作说明与变量定义见[部署文档](../deploy/README.md)和 `config_server.py`：
 
-## 8. SDK 行为
+| 项目 | 默认上限 | 满载或超时时的处理 |
+|---|---:|---|
+| 单帧 Base64 解码后音频 | 64 MiB | 返回 `bad_request` |
+| 单任务解码后时长 | `CW_MAX_TASK_SECONDS` = 14,400 秒 | 返回 `audio_too_long` |
+| 每任务已提交未完成片段 | `CW_MAX_INFLIGHT_SEGMENTS` = 4 | 停止读取该连接，形成 TCP 背压 |
+| 服务端全局活动任务 | `CW_MAX_TASKS` = 8 | 新任务返回 `overloaded` |
+| Worker 每轮领取片段 | `CW_DRAIN_BATCH` = 16 | 后续片段留在队列中等待 |
+| 每连接结果队列 | 256 条 | 队列满时返回 `slow_consumer` 并关闭连接 |
+| proxy 每任务上行队列 | 8 帧 | 暂停读取客户端，向上传递背压 |
+| 上传空闲 | `CW_UPLOAD_IDLE_SECONDS` = 300 秒 | 返回 `bad_request`；服务端背压等待期间暂停计时 |
+| 单段推理看门狗 | `CW_SEGMENT_TIMEOUT` = 600 秒 | 返回 `inference_timeout` 并重启卡住的服务端进程 |
 
-- `websockets.connect(..., ping_interval=None, max_size=None, max_queue=None)`。
-- 上传与接收并发（两个协程）；禁止「先发完再收」。
-- 分块：raw 编码每帧 ≤ 60 秒音频；压缩流每帧 256 KiB。
-- 截止时间由独立计时器强制：
-  - `deadline_total = max(120s, 音频时长 × 1.0 + 60s)`；
-  - `idle_timeout = 300s`：上传结束后无任何服务端消息，或 send 被阻塞超过此值 → 失败。
-- 失败抛 `AsrError(code, message)`：code 取服务端 error 原值；另有 `timeout`、`connection_lost`（无 error 帧的异常关闭）、`server_too_old`、`unsupported_encoding`。SDK 不自动重试。
+proxy 每 30 秒探测后端健康状态；探测请求超时为 5 秒。压缩编码还要求服务端 PATH 有 `ffmpeg`，否则 `/health.encodings` 不含 `flac` 和 `ogg_opus`，收到相应请求会返回 `unsupported_encoding`。
 
-## 9. 兼容性矩阵
+## 下行结果与错误
 
-| 客户端 \ 服务端 | v1 server | v2 server | v2 proxy（混合后端） |
-|---|---|---|---|
-| 下游 v1 应用（缺 encoding） | 现状 | 正常；失败时按 error 帧处理 | 可落任意健康后端 |
-| SDK v2（任意 encoding） | ServerTooOld | 正常 | 只落 v2 后端，否则 no_backend |
+成功消息为 JSON 对象，具有 `type: "result"`。`is_final: false` 表示中间进度，`is_final: true` 表示该任务的最终结果。
 
-## 10. 本契约引出的现存缺陷（与 v2 无关，P0 修）
-- 末帧整块提交可超引擎上限，MLX 静默截断尾部（`ws_recv.py:190` + `qwen_asr_mlx/asr_engine.py:108`）。
-- 分段参数无校验，`seg_duration=0` 时 `ws_recv.py:74` 死循环冻结事件循环。
-- 结果按 task_id 全局存储，跨连接同 ID 串结果（`state.py:70`）。
+| 字段 | 说明 |
+|---|---|
+| `task_id` | 对应的任务标识 |
+| `text` | 识别文本 |
+| `text_accu` | 按时间信息合并的文本 |
+| `tokens` | 服务端输出的 token 列表 |
+| `timestamps` | 与服务端 token 输出关联的时间，单位秒 |
+| `duration` | 已处理音频时长，单位秒 |
+| `time_start`、`time_submit`、`time_complete` | 音频起始、片段提交、任务完成的 Unix 时间戳 |
+
+不要假设不同模型输出相同粒度的 token；生成字幕时直接使用服务端给出的 token 与时间数组，不要从 `text` 反推索引。
+
+### 4.2 error
+
+任务失败消息的格式为：
+
+```json
+{"type":"error","task_id":"…","code":"inference_failed","message":"识别失败","retryable":true}
+```
+
+收到 `error` 即代表失败；客户端不能把随后连接关闭当作成功。`retryable` 是服务端给出的恢复建议，协议客户端不应无条件自动重试。
+
+| code | 含义 |
+|---|---|
+| bad_request | JSON、必填字段或参数不合法，或上传空闲超时 |
+| unsupported_encoding | 服务端不支持该编码 |
+| decode_failed | 音频字节、样本数或解码器处理失败 |
+| task_conflict | 同一连接已有另一个活动任务 |
+| audio_too_long | 音频超过服务端任务时长上限 |
+| inference_failed | 识别或时间对齐失败 |
+| inference_timeout | 单段识别超时 |
+| overloaded | 服务端活动任务达到上限 |
+| slow_consumer | 客户端读取结果过慢 |
+| no_backend | proxy 没有支持该请求的健康后端 |
+| internal | 其他服务端内部错误 |
+
+服务端把任务错误帧排入发送队列后会关闭对应连接。因此，客户端应先读取并处理错误帧；异常关闭且此前未收到最终结果时应报告连接失败。
+
+## 兼容性与流控
+
+| 客户端请求 | v1 服务端 | 本服务端 / v2 proxy |
+|---|---|---|
+| v1 上行（省略 `encoding`） | v1 行为 | 兼容处理 |
+| v2 上行（带 `encoding`） | 不支持；客户端应先检查 `/health` | 按编码和 `samples_total` 校验 |
+
+proxy 对带 `encoding` 的 v2 任务只选择协议版本不低于 2 且支持该编码的健康后端；找不到时返回 `no_backend`。不带 `encoding` 的 v1 请求保留旧路由行为。
+
+服务端会在读取或推理背压时减慢上行读取，并限制任务数、待处理片段和每连接的结果队列。服务端可通过 `CW_UPLOAD_IDLE_SECONDS` 配置上传空闲超时，默认 300 秒；背压等待时间不计入该空闲时长。客户端应并发发送音频并接收结果，避免先发完整段再开始读取。
+
+## Python SDK
+
+SDK 默认编码为 `flac`，因此服务端也必须在 PATH 中安装 `ffmpeg` 且健康检查需列出 `flac`。首次部署可选 `s16le` 避免服务端压缩解码依赖；SDK 客户端本机始终需要 `ffmpeg` 和 `ffprobe`。SDK 每个任务前检查 `/health`，并发上传和接收；默认总体截止时间为 `max(120 秒, 音频时长 + 60 秒)`，`idle_timeout` 默认 300 秒。超过截止时间、上传发送时限或结果空闲时限时会抛出 `AsrError`。它不自动重试。完整安装与调用示例见 [SDK 文档](../sdk/README.md)。
