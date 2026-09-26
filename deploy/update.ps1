@@ -28,19 +28,21 @@ if ($HealthTimeout -lt 1 -or $HealthInterval -lt 1) { throw '健康检查超时�
 
 & git -C $repo fetch --tags origin
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& git -C $repo checkout --detach $Ref
+$refCommit = & git -C $repo rev-parse --verify "$($Ref)^{commit}"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-$expectedGitSha = (& git -C $repo rev-parse --short HEAD).Trim()
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$refCommit = $refCommit.Trim()
 
 if ($ModelType -in @('qwen_asr', 'fun_asr_nano')) {
-    $buildInfo = Join-Path $repo 'core/server/engines/llama_build_info.py'
-    if (-not (Test-Path -LiteralPath $buildInfo -PathType Leaf)) {
+    $buildInfoPath = 'core/server/engines/llama_build_info.py'
+    & git -C $repo cat-file -e "$($refCommit):$buildInfoPath" 2>$null
+    if ($LASTEXITCODE -ne 0) {
         Write-Output "llama 预检跳过：$Ref 无 llama_build_info.py"
     } else {
-        $buildInfoText = [System.IO.File]::ReadAllText($buildInfo)
+        $buildInfoLines = & git -C $repo show "$($refCommit):$buildInfoPath"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $buildInfoText = $buildInfoLines -join "`n"
         $buildMatch = [regex]::Match($buildInfoText, '(?m)^\s*LLAMA_BUILD\s*=\s*"([^"]+)"\s*$')
-        if (-not $buildMatch.Success) { throw "无法从 $buildInfo 解析 LLAMA_BUILD" }
+        if (-not $buildMatch.Success) { throw "无法从 $($Ref):$buildInfoPath 解析 LLAMA_BUILD" }
         $llamaBuild = $buildMatch.Groups[1].Value
         $llamaLibDir = Join-Path $repo "core/server/engines/llama/bin/$llamaBuild"
         $requiredLlamaFiles = @('ggml.dll', 'ggml-base.dll', 'llama.dll')
@@ -53,6 +55,12 @@ if ($ModelType -in @('qwen_asr', 'fun_asr_nano')) {
         }
     }
 }
+
+& git -C $repo checkout --detach $Ref
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$expectedGitSha = (& git -C $repo rev-parse --short HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 & $Python -m pip install -r (Join-Path $repo 'requirements-server.txt')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

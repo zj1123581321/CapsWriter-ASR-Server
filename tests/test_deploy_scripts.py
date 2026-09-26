@@ -186,10 +186,11 @@ def test_bash_syntax_and_powershell_contract():
     assert ".venv" not in content
     for llama_contract in (
         "llama_build_info.py", "LLAMA_BUILD", "ggml.dll", "ggml-base.dll",
-        "llama.dll", "llama-$llamaBuild-bin-win-vulkan-x64.zip",
+        "llama.dll", "llama-$llamaBuild-bin-win-vulkan-x64.zip", "cat-file -e",
+        "rev-parse --verify", "git -C $repo show",
     ):
         assert llama_contract in content
-    assert content.index("llama 预检失败") < content.index("Start-ScheduledTask")
+    assert content.index("llama 预检失败") < content.index("checkout --detach")
     pwsh = shutil.which("pwsh")
     if pwsh:
         subprocess.run(
@@ -290,6 +291,8 @@ def llama_lib_dir(clone):
 
 
 def test_llama_preflight_stops_restart_when_library_is_missing(deployment_clone, tmp_path):
+    run_git("-C", deployment_clone, "checkout", "--detach", "old")
+    original_head = run_git("-C", deployment_clone, "rev-parse", "HEAD").stdout.strip()
     bin_dir = prepare_fake_tools(tmp_path)
     lib_dir = llama_lib_dir(deployment_clone)
     for name in ("libggml.dylib", "libggml-base.dylib"):
@@ -298,9 +301,10 @@ def test_llama_preflight_stops_restart_when_library_is_missing(deployment_clone,
     env["CW_MODEL_TYPE"] = "qwen_asr_mlx"
     env["DEPLOY_TEST_UNAME"] = "Darwin"
 
-    result = run_update(deployment_clone, env)
+    result = run_update(deployment_clone, env, ref="main")
 
     assert result.returncode != 0
+    assert run_git("-C", deployment_clone, "rev-parse", "HEAD").stdout.strip() == original_head
     assert "libllama.dylib" in result.stderr
     assert "llama-b10621-bin-macos-arm64.tar.gz" in result.stderr
     assert not (tmp_path / "pm2-argv.log").exists()

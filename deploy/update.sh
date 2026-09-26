@@ -54,18 +54,16 @@ esac
 
 cd "$repo_dir"
 git fetch --tags origin
-git checkout --detach "$ref"
-expected_git_sha="$(git rev-parse --short HEAD)"
+ref_commit="$(git rev-parse --verify "${ref}^{commit}")"
 
 case "$model_type" in
     qwen_asr|qwen_asr_mlx|fun_asr_nano)
-        llama_build_info="$repo_dir/core/server/engines/llama_build_info.py"
-        if [[ ! -f "$llama_build_info" ]]; then
-            printf 'llama 预检跳过：%s 无 llama_build_info.py\n' "$ref"
-        else
-            llama_build="$(sed -nE 's/^[[:space:]]*LLAMA_BUILD[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' "$llama_build_info")"
+        llama_build_info_path="core/server/engines/llama_build_info.py"
+        if git cat-file -e "${ref_commit}:${llama_build_info_path}" 2>/dev/null; then
+            llama_build_info="$(git show "${ref_commit}:${llama_build_info_path}")"
+            llama_build="$(sed -nE 's/^[[:space:]]*LLAMA_BUILD[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' <<< "$llama_build_info")"
             if [[ -z "$llama_build" ]]; then
-                printf '无法从 %s 解析 LLAMA_BUILD\n' "$llama_build_info" >&2
+                printf '无法从 %s:%s 解析 LLAMA_BUILD\n' "$ref" "$llama_build_info_path" >&2
                 exit 1
             fi
             llama_lib_dir="$repo_dir/core/server/engines/llama/bin/$llama_build"
@@ -94,9 +92,14 @@ case "$model_type" in
                     "$llama_lib_dir" "${missing_llama_files[*]}" "$llama_asset" >&2
                 exit 1
             fi
+        else
+            printf 'llama 预检跳过：%s 无 llama_build_info.py\n' "$ref"
         fi
         ;;
 esac
+
+git checkout --detach "$ref"
+expected_git_sha="$(git rev-parse --short HEAD)"
 
 "$deploy_python" -m pip install -r "$requirements_file"
 

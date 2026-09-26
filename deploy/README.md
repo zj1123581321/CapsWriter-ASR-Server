@@ -45,7 +45,7 @@ Windows 使用已有计划任务：
 - macOS：`llama-<build>-bin-macos-arm64.tar.gz`，解压到 `core/server/engines/llama/bin/<build>/`。使用 `tar -xzf` 解压，保留资产内的符号链接。
 - Windows：`llama-<build>-bin-win-vulkan-x64.zip`，解压到 `core/server/engines/llama/bin/<build>/`。
 
-macOS 目录需要 `libggml.dylib`、`libggml-base.dylib`、`libllama.dylib`；Windows 目录需要 `ggml.dll`、`ggml-base.dll`、`llama.dll`。缺失时更新脚本会在重启前失败，并输出缺失文件与对应资产名。`bin/` 根目录中的旧版本库要保留，旧代码回滚时仍从那里加载。
+macOS 目录需要 `libggml.dylib`、`libggml-base.dylib`、`libllama.dylib`；Windows 目录需要 `ggml.dll`、`ggml-base.dll`、`llama.dll`。缺失时更新脚本会在重启前失败、输出缺失文件与对应资产名，并保持仓库工作树原样。`bin/` 根目录中的旧版本库要保留，旧代码回滚时仍从那里加载。
 
 ## 回滚到 T17 之前的版本
 
