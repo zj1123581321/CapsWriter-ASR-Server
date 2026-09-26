@@ -12,7 +12,7 @@ CapsWriter ASR 负载均衡代理 v1 已上线（`core/proxy/`），经过完整
 
 ```bash
 # 1. 在主 repo 创建新分支
-cd /home/zlx/projects/oss/CapsWriter-Offline-with-AI
+cd ~/projects/oss/CapsWriter-Offline-with-AI
 git branch feat/proxy-v2-routing
 
 # 2. 创建 worktree
@@ -111,10 +111,10 @@ scripts/_verify_proxy_concurrent.py                                  # 并发验
 ## 部署信息
 
 代理运行在 Mac Studio（pm2 进程 `capswriter-proxy`，port 6020）。
-- Mac Studio: 192.168.31.222:6017（M1 Max 64GB, weight=2.0）
-- Mac mini: 192.168.31.207:6017（M2 Pro 16GB, weight=1.0）
+- Mac Studio: 192.0.2.11:6017（M1 Max 64GB, weight=2.0）
+- Mac mini: 192.0.2.12:6017（M2 Pro 16GB, weight=1.0）
 
-更新代码后：`cd /Users/zhanglixing/Production/capswriter_proxy && git pull && pm2 restart capswriter-proxy`
+更新代码后：`cd ~/Production/capswriter_proxy && git pull && pm2 restart capswriter-proxy`
 
 ## Review 状态
 

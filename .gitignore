@@ -198,3 +198,6 @@ temp/
 
 # 验收台账写入时的锁文件残留
 retro/*.lock
+
+# 仓内个人记忆不随仓分发（真身在私有仓 agent-config）
+memory/

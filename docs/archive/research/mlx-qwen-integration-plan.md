@@ -1,8 +1,8 @@
 # 把 Apple MLX 版 Qwen3-ASR 整合进主线引擎体系 — 调研报告
 
 > 状态：只读调研，未改动任何源码。
-> 主线项目：`/Users/zhanglixing/Dev/projects/CapsWriter-Offline-with-AI`（master）
-> MLX 推理源：`/Users/zhanglixing/Production/qwen_asr_server/tools/mlx_ws_server/`
+> 主线项目：`~/Dev/projects/CapsWriter-Offline-with-AI`（master）
+> MLX 推理源：`~/Production/qwen_asr_server/tools/mlx_ws_server/`
 > 日期：2026-06-25
 
 ---
@@ -351,9 +351,9 @@ mlx-qwen3-asr     # import 名 mlx_qwen3_asr，提供 Session API
 - 语言映射：`core/server/engines/language.py`（`ENGINE_QWEN_ASR`、`get_language`）
 - GGUF 模板引擎：`core/server/engines/qwen_asr_gguf/asr_engine.py`、`inference/schema.py`
 - 服务端配置：`config_server.py`（`ServerConfig.model_type`、`Qwen3ASRGGUFArgs`、`ModelPaths`）
-- MLX 推理源：`/Users/zhanglixing/Production/qwen_asr_server/tools/mlx_ws_server/server.py`（`ASREngine` 类，行 116-194）
-- MLX benchmark：`/Users/zhanglixing/Production/qwen_asr_server/tools/mlx_ws_server/benchmark_client.py`、`run_benchmark.sh`
-- 调研文档：`/Users/zhanglixing/Production/qwen_asr_server/docs/lixing/deepresearch-qwen3asr/{chatgpt,gemini,kimi}.md`
+- MLX 推理源：`~/Production/qwen_asr_server/tools/mlx_ws_server/server.py`（`ASREngine` 类，行 116-194）
+- MLX benchmark：`~/Production/qwen_asr_server/tools/mlx_ws_server/benchmark_client.py`、`run_benchmark.sh`
+- 调研文档：`~/Production/qwen_asr_server/docs/lixing/deepresearch-qwen3asr/{chatgpt,gemini,kimi}.md`
 
 ---
 

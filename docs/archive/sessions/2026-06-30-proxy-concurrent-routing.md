@@ -3,8 +3,8 @@
 ## 背景
 
 CapsWriter ASR 负载均衡代理已实现并部署（`core/proxy/`），当前在 Mac Studio 上通过 pm2 运行，负载均衡两个 Qwen3-ASR (MLX) 后端：
-- Mac Studio: 192.168.31.222:6017
-- Mac mini: 192.168.31.207:6017
+- Mac Studio: 192.0.2.11:6017
+- Mac mini: 192.0.2.12:6017
 
 代理的核心设计：per-task 独立后端 WS 连接，least-loaded（active_tasks 计数）路由。
 
@@ -52,4 +52,4 @@ CapsWriter ASR 负载均衡代理已实现并部署（`core/proxy/`），当前�
 
 ## 部署信息
 
-代理运行在 Mac Studio（pm2 进程 `capswriter-proxy`，port 6020）。通过 `run_proxy.sh` wrapper 注入 `CW_PROXY_BACKENDS` 环境变量。更新代码后 `cd /Users/zhanglixing/Production/capswriter_proxy && git pull && pm2 restart capswriter-proxy`。
+代理运行在 Mac Studio（pm2 进程 `capswriter-proxy`，port 6020）。通过 `run_proxy.sh` wrapper 注入 `CW_PROXY_BACKENDS` 环境变量。更新代码后 `cd ~/Production/capswriter_proxy && git pull && pm2 restart capswriter-proxy`。

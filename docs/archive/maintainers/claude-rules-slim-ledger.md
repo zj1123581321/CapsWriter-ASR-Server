@@ -1,7 +1,7 @@
 # CLAUDE.md 规则瘦身逐条核销表（初稿）
 
 - 基准文件：仓根 `CLAUDE.md`（19074B，HEAD `5d18fba`）
-- 配方：`/home/zlx/projects/personal/agent-config/docs/guides/rules-budget.md` 三问准入
+- 配方：`~/projects/personal/agent-config/docs/guides/rules-budget.md` 三问准入
   1. 这条每个会话都需要吗？
   2. 能从代码 / README / git log 推断吗？
   3. 现在还成立吗？
