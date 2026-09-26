@@ -2,7 +2,7 @@
 """
 冒烟验证：MLX Qwen3-ASR 能否在 multiprocessing spawn 子进程里正常初始化 Metal 并推理。
 
-背景（见 docs/lixing/mlx-qwen-integration-plan.md 评审报告 架构问题#2）：
+背景（见 docs/archive/research/mlx-qwen-integration-plan.md 评审报告 架构问题#2）：
   独立版 mlx_ws_server 跑在主进程(asyncio+线程池)，而主线把 ASR 跑在
   multiprocessing 子进程里(process_manager.py)。macOS 默认 spawn(干净子进程)，
   Metal 理论上能在子进程全新初始化，但这条路径从未真机验证过 —— 本脚本就是那个 gate。

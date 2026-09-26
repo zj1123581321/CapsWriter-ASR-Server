@@ -4,7 +4,7 @@
 
 - **ASR 服务端**：`start_server.py` 创建 WebSocket 服务。主进程处理连接、任务状态和网络收发；识别模型运行在独立子进程，避免推理占用网络事件循环。
 - **Proxy**：`start_proxy.py` 接受下游连接，并按任务把音频转发到配置的 ASR 后端。Proxy 不加载识别模型。
-- **Python SDK**：`sdk/` 为下游应用提供文件转录 API 和命令行入口；其他语言也可按 [协议](protocol.md) 接入。
+- **Python SDK**：`sdk/` 为下游应用提供文件转录 API 和命令行入口；其他语言也可按 [协议](../reference/protocol.md) 接入。
 
 ### 服务端识别流程
 
@@ -16,8 +16,8 @@
 
 ### Proxy 路由流程
 
-Proxy 为每个任务选择健康且协议兼容的后端，并保持任务期间的连接关联。路由策略、健康检查和限制见 [ASR 负载均衡代理](ASR负载均衡代理.md) 与 [proxy 路由设计](designs/proxy-concurrent-routing.md)。
+Proxy 为每个任务选择健康且协议兼容的后端，并保持任务期间的连接关联。路由策略、健康检查和限制见 [ASR 负载均衡代理](../guides/ASR负载均衡代理.md) 与 [proxy 路由设计](designs/proxy-concurrent-routing.md)。
 
 ### 模型与热词
 
-引擎由 `CW_MODEL_TYPE` 选择，模型路径和后端参数集中在 `config_server.py`。部分模型支持读取根目录的 `hot-server.txt`；可用能力见 [模型支持](models.md)。
+引擎由 `CW_MODEL_TYPE` 选择，模型路径和后端参数集中在 `config_server.py`。部分模型支持读取根目录的 `hot-server.txt`；可用能力见 [模型支持](../reference/models.md)。

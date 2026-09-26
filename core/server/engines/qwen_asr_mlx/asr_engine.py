@@ -18,7 +18,7 @@ decode_stream 处理流水线：
         ▼
     stream.result.text = result.text        ← Pipeline 只读这里
 
-设计约束（见 docs/lixing/mlx-qwen-integration-plan.md 评审报告）：
+设计约束（见 docs/archive/research/mlx-qwen-integration-plan.md 评审报告）：
   - mlx / mlx-qwen3-asr 仅 Apple Silicon → 延迟导入，放在 __init__ 内
   - 能力 [ASR, PUNC]，不声明 TIMESTAMPS（段级≠字级，交外挂 Aligner）
   - 初版不支持 context 续写（已知限制，见 TODOS.md）

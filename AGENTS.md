@@ -16,13 +16,14 @@ risk-tier: internal
 
 ## 架构与开发文档
 
-- [架构与工作流](docs/architecture-workflows.md)
-- [数据流](docs/data-flow.md)
-- [关键路径](docs/key-paths.md)
+- [文档总导航](docs/README.md)
+- [架构与工作流](docs/development/architecture-workflows.md)
+- [数据流](docs/development/data-flow.md)
+- [关键路径](docs/development/key-paths.md)
 - [部署与升级](deploy/README.md)
-- [测试](docs/testing.md)
-- [模型支持](docs/models.md)
-- [协议](docs/protocol.md)
+- [测试](docs/development/testing.md)
+- [模型支持](docs/reference/models.md)
+- [协议](docs/reference/protocol.md)
 - [SDK 使用说明](sdk/README.md)
 - [上游关系](UPSTREAM.md)
 
