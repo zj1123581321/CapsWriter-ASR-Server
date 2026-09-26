@@ -9,8 +9,11 @@ on:
 
 jobs:
   test:
-    name: 单元测试
+    name: 单元测试 (${{ matrix.websockets }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        websockets: ["websockets==15.0.1", "websockets"]
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -24,7 +27,10 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
-          pip install numpy rich websockets colorama pytest soundfile pytest-asyncio
+          pip install numpy rich "${{ matrix.websockets }}" colorama pytest soundfile pytest-asyncio
+
+      - name: 打印 websockets 版本
+        run: python -c "import websockets; print(websockets.__version__)"
 
       - name: 运行 pytest
         run: python -m pytest tests/ -q

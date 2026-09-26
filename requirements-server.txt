@@ -6,6 +6,6 @@ onnxruntime-directml
 
 # basic
 rich
-websockets
+websockets>=15.0.1
 watchdog
 pypinyin
