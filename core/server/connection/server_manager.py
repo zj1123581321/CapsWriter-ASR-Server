@@ -59,12 +59,12 @@ class SocketManager:
             ping_interval=None,
         )
         try:
-            await serve
+            server = await serve
         except OSError as exc:
             logger.error(f"端口被占用：{Config.addr}:{Config.port}，监听异常：{exc}")
             raise SystemExit(1)
 
-        async with serve as server:
+        async with server:
             self._server = server  # 保存 server 引用，用于外部关闭
 
             # sender 与 worker 看门狗并行；任一异常结束都让服务端主循环退出。
