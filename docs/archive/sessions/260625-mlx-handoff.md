@@ -12,7 +12,7 @@
 目标：把它的 MLX 推理移植成主线的一个引擎，将来让这台机器也能用主线统一架构跑 Qwen3-ASR（替代独立的 mlx_ws_server）。
 
 ## 关键路径
-- 主线项目（开发仓库）：`/Users/zhanglixing/Dev/projects/CapsWriter-Offline-with-AI`（分支 master）
+- 主线项目（开发仓库）：`~/Dev/projects/CapsWriter-Offline-with-AI`（分支 master）
 - 主线引擎体系：`core/server/engines/`，最贴近的模板是 `qwen_asr_gguf`（GGUF/llama.cpp 版 Qwen3-ASR）
 - MLX 推理源：`~/Production/qwen_asr_server/tools/mlx_ws_server/`（`server.py` 等）
 - **必读调研报告**：`docs/lixing/mlx-qwen-integration-plan.md`（上个 session 用子 Agent 生成，含文件级实施方案和骨架代码）
