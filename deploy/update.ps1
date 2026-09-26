@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Ref,
+    [Parameter(Mandatory = $true)]
+    [string]$Python,
     [string]$TaskName = $env:DEPLOY_TASK_NAME,
     [string]$Port = $env:DEPLOY_PORT,
     [string]$ModelType = $env:CW_MODEL_TYPE,
@@ -10,7 +12,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$python = Join-Path $repo '.venv\Scripts\python.exe'
+$pythonCommand = Get-Command -Name $Python -ErrorAction SilentlyContinue
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf) -and $null -eq $pythonCommand) {
+    throw "-Python 指向的解释器不存在: $Python"
+}
 
 if (-not $TaskName) { throw '请设置 -TaskName 或 DEPLOY_TASK_NAME' }
 if (-not $Port -or $Port -notmatch '^\d+$' -or [int]$Port -lt 1 -or [int]$Port -gt 65535) {
@@ -28,11 +33,27 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $expectedGitSha = (& git -C $repo rev-parse --short HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-if (-not (Test-Path $python)) {
-    & python -m venv (Join-Path $repo '.venv')
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($ModelType -in @('qwen_asr', 'fun_asr_nano')) {
+    $buildInfo = Join-Path $repo 'core/server/engines/llama_build_info.py'
+    if (-not (Test-Path -LiteralPath $buildInfo -PathType Leaf)) {
+        Write-Output "llama 预检跳过：$Ref 无 llama_build_info.py"
+    } else {
+        $buildInfoText = [System.IO.File]::ReadAllText($buildInfo)
+        $buildMatch = [regex]::Match($buildInfoText, '(?m)^\s*LLAMA_BUILD\s*=\s*"([^"]+)"\s*$')
+        if (-not $buildMatch.Success) { throw "无法从 $buildInfo 解析 LLAMA_BUILD" }
+        $llamaBuild = $buildMatch.Groups[1].Value
+        $llamaLibDir = Join-Path $repo "core/server/engines/llama/bin/$llamaBuild"
+        $requiredLlamaFiles = @('ggml.dll', 'ggml-base.dll', 'llama.dll')
+        $missingLlamaFiles = @($requiredLlamaFiles | Where-Object {
+            -not (Test-Path -LiteralPath (Join-Path $llamaLibDir $_) -PathType Leaf)
+        })
+        if ($missingLlamaFiles.Count -gt 0) {
+            $releaseAsset = "llama-$llamaBuild-bin-win-vulkan-x64.zip"
+            throw "llama 预检失败：$llamaLibDir 缺少文件：$($missingLlamaFiles -join ', ')；请从 llama.cpp release 获取资产：$releaseAsset"
+        }
+    }
 }
-& $python -m pip install -r (Join-Path $repo 'requirements-server.txt')
+& $Python -m pip install -r (Join-Path $repo 'requirements-server.txt')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $scheduledTask = Get-ScheduledTask -TaskName $TaskName
