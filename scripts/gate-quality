@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+if ! command -v ffmpeg >/dev/null; then
+  echo "gate-quality: ffmpeg 未安装" >&2
+  exit 1
+fi
+
+uv_bin="$(command -v uv)" || {
+  echo "gate-quality: uv 未安装" >&2
+  exit 1
+}
+
+exec "$uv_bin" run --no-project --python 3.12 \
+  --with numpy \
+  --with rich \
+  --with "websockets==15.0.1" \
+  --with colorama \
+  --with pytest \
+  --with soundfile \
+  --with pytest-asyncio \
+  python -m pytest tests/ -q
