@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -147,6 +148,40 @@ def update_environment(tmp_path, bin_dir, port):
     return env
 
 
+def install_fake_curl(tmp_path, bin_dir, env):
+    real_python = shutil.which("python3")
+    assert real_python
+    curl = bin_dir / "curl"
+    curl.write_text(
+        f'''#!{real_python}
+import json
+import os
+import pathlib
+import sys
+import time
+
+args = sys.argv[1:]
+calls_path = pathlib.Path(os.environ["DEPLOY_TEST_CURL_CALLS"])
+calls = calls_path.read_text(encoding="utf-8").splitlines() if calls_path.exists() else []
+with calls_path.open("a", encoding="utf-8") as calls_file:
+    calls_file.write(json.dumps(args) + "\\n")
+time.sleep(1)
+responses = json.loads(os.environ["DEPLOY_TEST_CURL_RESPONSES"])
+status, payload = responses[min(len(calls), len(responses) - 1)]
+if status is None:
+    sys.exit(7)
+output_path = pathlib.Path(args[args.index("--output") + 1])
+output_path.write_text(json.dumps(payload), encoding="utf-8")
+sys.stdout.write(str(status))
+''',
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    env["DEPLOY_TEST_CURL_CALLS"] = str(tmp_path / "curl-args.jsonl")
+    env["DEPLOY_TEST_CURL_RESPONSES"] = "[]"
+    return Path(env["DEPLOY_TEST_CURL_CALLS"])
+
+
 def run_update(clone, env, ref="main"):
     return subprocess.run(
         ["bash", str(clone / "deploy" / "update.sh"), ref],
@@ -191,6 +226,10 @@ def test_bash_syntax_and_powershell_contract():
     ):
         assert llama_contract in content
     assert content.index("llama 预检失败") < content.index("checkout --detach")
+    poll_loop = content.split("while ($healthTimer.Elapsed.TotalSeconds -lt $HealthTimeout) {", 1)[1]
+    poll_loop = poll_loop.split("$actualGitSha = if", 1)[0]
+    assert poll_loop.count("break") == 1
+    assert "if ($lastStatus -eq 200 -and $lastPayload.git_sha -eq $expectedGitSha) { break }" in poll_loop
     pwsh = shutil.which("pwsh")
     if pwsh:
         subprocess.run(
@@ -198,6 +237,43 @@ def test_bash_syntax_and_powershell_contract():
              f"$null = [scriptblock]::Create((Get-Content -Raw '{powershell_script}'))"],
             check=True, capture_output=True, text=True,
         )
+
+
+def test_update_script_polls_health_until_sha_matches_or_times_out(deployment_clone, tmp_path):
+    bin_dir = prepare_fake_tools(tmp_path)
+    git_sha = run_git("-C", deployment_clone, "rev-parse", "--short", "main").stdout.strip()
+    env = update_environment(tmp_path, bin_dir, 6016)
+    calls_path = install_fake_curl(tmp_path, bin_dir, env)
+    stale = {"status": "ok", "git_sha": "old-sha", "model": "paraformer", "worker_alive": True}
+    matching = {**stale, "git_sha": git_sha}
+    cases = (
+        ([[200, stale], [200, stale], [200, matching]], "success", 60),
+        ([[200, stale]], "mismatch", 5), ([[None, {}]], "timeout", 5),
+    )
+    for responses, outcome, health_timeout in cases:
+        env["DEPLOY_HEALTH_TIMEOUT"] = str(health_timeout)
+        calls_path.write_text("", encoding="utf-8")
+        env["DEPLOY_TEST_CURL_RESPONSES"] = json.dumps(responses)
+        started_at = time.monotonic()
+        result = run_update(deployment_clone, env)
+        elapsed = time.monotonic() - started_at
+        calls = len(calls_path.read_text(encoding="utf-8").splitlines())
+        if outcome == "success":
+            assert result.returncode == 0, result.stderr
+            assert f"git_sha={git_sha}" in result.stdout
+            curl_args = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+            assert calls == 3 and all(args[-1] == "http://127.0.0.1:6016/health" for args in curl_args)
+            assert all(args[args.index("--write-out") + 1] == "%{http_code}" for args in curl_args)
+        else:
+            assert result.returncode != 0 and calls >= 2
+            if outcome == "mismatch":
+                assert "健康检查 git_sha 不一致" in result.stderr
+                assert f"期望={git_sha}" in result.stderr and "实际=old-sha" in result.stderr
+                assert elapsed <= health_timeout + 5
+            else:
+                assert "健康检查超时" in result.stderr
+                assert '"git_sha":null' in result.stderr
+                assert "git_sha 不一致" not in result.stderr
 
 
 def test_update_script_rejects_sha_mismatch_and_accepts_matching_sha(deployment_clone, tmp_path):

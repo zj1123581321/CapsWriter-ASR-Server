@@ -106,7 +106,8 @@ expected_git_sha="$(git rev-parse --short HEAD)"
 pm2 restart "$process_name"
 
 health_file="$(mktemp)"
-trap 'rm -f -- "$health_file"' EXIT
+health_response_file="$(mktemp)"
+trap 'rm -f -- "$health_file" "$health_response_file"' EXIT
 health_url="http://127.0.0.1:${port}/health"
 health_status="000"
 health_deadline=$((SECONDS + health_timeout))
@@ -115,13 +116,23 @@ while (( SECONDS < health_deadline )); do
     if (( request_timeout > 5 )); then
         request_timeout=5
     fi
-    if health_status="$(curl --silent --show-error --connect-timeout "$request_timeout" --max-time "$request_timeout" \
-        --output "$health_file" --write-out '%{http_code}' "$health_url")"; then
+    if response_status="$(curl --silent --show-error --connect-timeout "$request_timeout" --max-time "$request_timeout" \
+        --output "$health_response_file" --write-out '%{http_code}' "$health_url")"; then
+        health_status="$response_status"
+        cp -- "$health_response_file" "$health_file"
         if [[ "$health_status" == 200 ]]; then
-            break
+            actual_git_sha="$(python3 - "$health_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    print(json.load(response_file).get("git_sha") or "")
+PY
+)"
+            if [[ "$actual_git_sha" == "$expected_git_sha" ]]; then
+                break
+            fi
         fi
-    else
-        health_status="000"
     fi
     remaining=$((health_deadline - SECONDS))
     if (( remaining <= 0 )); then
@@ -156,14 +167,6 @@ if [[ "$health_status" != 200 ]]; then
     exit 1
 fi
 
-actual_git_sha="$(python3 - "$health_file" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as response_file:
-    print(json.load(response_file).get("git_sha") or "")
-PY
-)"
 if [[ "$actual_git_sha" != "$expected_git_sha" ]]; then
     printf '健康检查 git_sha 不一致：期望=%s 实际=%s\n' "$expected_git_sha" "$actual_git_sha" >&2
     printf '/health 白名单字段: %s\n' "$(health_summary)" >&2
