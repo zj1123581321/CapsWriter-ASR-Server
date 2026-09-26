@@ -22,7 +22,7 @@ mlx-qwen3-asr==0.3.5
 
 # basic
 rich
-websockets
+websockets>=15.0.1
 watchdog
 pypinyin
 colorama
