@@ -163,7 +163,7 @@ args = sys.argv[1:]
 calls_path = pathlib.Path(os.environ["DEPLOY_TEST_CURL_CALLS"])
 calls = calls_path.read_text(encoding="utf-8").splitlines() if calls_path.exists() else []
 with calls_path.open("a", encoding="utf-8") as calls_file:
-    calls_file.write("call\\n")
+    calls_file.write(json.dumps(args) + "\\n")
 responses = json.loads(os.environ["DEPLOY_TEST_CURL_RESPONSES"])
 status, payload = responses[min(len(calls), len(responses) - 1)]
 if status is None:
@@ -259,7 +259,9 @@ def test_update_script_polls_health_until_sha_matches_or_times_out(deployment_cl
         if outcome == "success":
             assert result.returncode == 0, result.stderr
             assert f"git_sha={git_sha}" in result.stdout
-            assert calls == 3
+            curl_args = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+            assert calls == 3 and all(args[-1] == "http://127.0.0.1:6016/health" for args in curl_args)
+            assert all(args[args.index("--write-out") + 1] == "%{http_code}" for args in curl_args)
         else:
             assert result.returncode != 0 and calls >= 2
             if outcome == "mismatch":
