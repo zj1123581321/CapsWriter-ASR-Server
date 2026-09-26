@@ -1,6 +1,6 @@
 ## 测试
 
-正式测试位于 [`tests/`](../tests/)。完整验证命令：
+正式测试位于 [`tests/`](../../tests/)。完整验证命令：
 
 ```sh
 uv run --no-project --python 3.12 --with numpy --with rich --with websockets --with colorama --with pytest --with soundfile --with pytest-asyncio python -m pytest tests/ -q -p no:cacheprovider
@@ -19,4 +19,4 @@ uv run --no-project --python 3.12 --with numpy --with rich --with websockets --w
 - `scripts/_baseline_asr.py`：保存服务端转录结果、字符错误率和时间戳基线。
 - MLX 设备验证脚本见 `scripts/_verify_mlx_asr.py` 和 `scripts/_smoke_mlx_subprocess.py`。
 
-SDK 安装和 CLI 用法见 [`sdk/README.md`](../sdk/README.md)。
+SDK 安装和 CLI 用法见 [`sdk/README.md`](../../sdk/README.md)。

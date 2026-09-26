@@ -61,7 +61,7 @@
 ### [ ] 告警接入全机通道（D11）
 - **What:** proxy 轮询各后端 /health，异常时走全机告警通道。
 - **Why:** 服务端 fail-fast 退出后只有守护进程重启，无人知晓。
-- **现状/起点:** 带静默期告警三件套（持续故障周期重发、发送路径失败即报错不吞、自检 selftest），/health 契约见 docs/protocol.md §5。
+- **现状/起点:** 带静默期告警三件套（持续故障周期重发、发送路径失败即报错不吞、自检 selftest），/health 契约见 docs/reference/protocol.md §5。
 - **Depends on:** 服务端 /health（T6）与 proxy /health（T13）合并。
 
 ## GGUF 尾段复读幻觉防护

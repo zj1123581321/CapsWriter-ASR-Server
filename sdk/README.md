@@ -20,7 +20,7 @@ python -m pip install "git+https://github.com/zj1123581321/CapsWriter-ASR-Server
 
 ## 首次识别
 
-先按[入门指南](../docs/getting-started.md)启动服务，并确认服务端已下载所选模型。默认地址是 `ws://127.0.0.1:6016`。下面的代码转录本地音频文件：
+先按[入门指南](../docs/guides/getting-started.md)启动服务，并确认服务端已下载所选模型。默认地址是 `ws://127.0.0.1:6016`。下面的代码转录本地音频文件：
 
 ```python
 import asyncio
@@ -43,7 +43,7 @@ asyncio.run(main())
 
 上面的首次示例显式选用 `s16le`，服务端无需安装 FFmpeg 即可接收。SDK 默认编码是 `flac`；若使用默认值，服务端也必须在 `PATH` 中安装 FFmpeg，且 `/health` 的 `encodings` 必须包含 `flac`。无论客户端选择何种编码，SDK 都需要客户端本机的 `ffmpeg` 和 `ffprobe`：前者把输入文件转成所选编码，后者读取文件时长。服务端必须报告协议版本 2 和所选编码；SDK 不会降级到 v1，也不会自动重试。同步程序可调用 `transcribe_file_sync(path, url, ...)`。
 
-`transcribe_file` 和同步入口还接受 `encoding`（`flac`、`ogg_opus`、`f32le`、`s16le`）、`language`、`context`、`seg_duration`、`seg_overlap`、`deadline_total`、`idle_timeout`、`model` 与 `on_progress(result_dict)`。异步接口会并发上传和接收结果；失败时抛出 `AsrError`。识别结果的字段见[服务协议](../docs/protocol.md)。
+`transcribe_file` 和同步入口还接受 `encoding`（`flac`、`ogg_opus`、`f32le`、`s16le`）、`language`、`context`、`seg_duration`、`seg_overlap`、`deadline_total`、`idle_timeout`、`model` 与 `on_progress(result_dict)`。异步接口会并发上传和接收结果；失败时抛出 `AsrError`。识别结果的字段见[服务协议](../docs/reference/protocol.md)。
 
 SDK 也提供命令行字幕导出，默认写入 SRT：
 
@@ -53,4 +53,4 @@ python -m capswriter_asr meeting.m4a --url ws://127.0.0.1:6016 --encoding s16le 
 
 ## 直接使用 WebSocket
 
-非 Python 客户端可直接按[协议 v2](../docs/protocol.md)接入。仓库提供了一个只接受 16 kHz、单声道、PCM16 WAV 短音频的[最小 Python 示例](../examples/websocket_transcribe.py)，展示末帧样本数、并发收发与服务端错误处理。
+非 Python 客户端可直接按[协议 v2](../docs/reference/protocol.md)接入。仓库提供了一个只接受 16 kHz、单声道、PCM16 WAV 短音频的[最小 Python 示例](../examples/websocket_transcribe.py)，展示末帧样本数、并发收发与服务端错误处理。

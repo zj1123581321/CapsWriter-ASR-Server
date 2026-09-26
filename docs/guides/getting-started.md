@@ -11,7 +11,7 @@ git clone https://github.com/zj1123581321/CapsWriter-ASR-Server.git
 cd CapsWriter-ASR-Server
 ```
 
-服务端开发和 CI 当前使用 Python 3.12，首次部署建议使用 Python 3.12。SDK 的 Python 版本要求以 [`sdk/pyproject.toml`](../sdk/pyproject.toml) 为准；这不是服务端最低版本声明。
+服务端开发和 CI 当前使用 Python 3.12，首次部署建议使用 Python 3.12。SDK 的 Python 版本要求以 [`sdk/pyproject.toml`](../../sdk/pyproject.toml) 为准；这不是服务端最低版本声明。
 
 ## 2. 建立环境并安装依赖
 
@@ -71,7 +71,7 @@ models/
         └── tokens.json
 ```
 
-服务端在启动时检查 Paraformer 所需的 ONNX 模型和 `tokens.txt`。标点模型在加载识别引擎时使用；缺少时服务不能完成初始化。更多模型路径和下载说明见[模型支持](models.md)与[模型下载说明](模型下载的若干问题.md)。
+服务端在启动时检查 Paraformer 所需的 ONNX 模型和 `tokens.txt`。标点模型在加载识别引擎时使用；缺少时服务不能完成初始化。更多模型路径和下载说明见[模型支持](../reference/models.md)与[模型下载说明](模型下载的若干问题.md)。
 
 ## 4. 启动并检查服务
 
@@ -108,11 +108,11 @@ curl --fail http://127.0.0.1:6016/health
 
 ## 5. 让应用完成首次识别
 
-保持服务进程运行，再按照 [Python SDK 文档](../sdk/README.md)安装 SDK，并使用其中的 `s16le` 示例转录一段本地音频。SDK 在客户端读取音频时仍需文档列出的 `ffmpeg` / `ffprobe`；`s16le` 上传路径不要求服务端安装 `ffmpeg`。若改用默认的 FLAC 编码，服务端也需安装 `ffmpeg`，并先确认 `/health` 的 `encodings` 包含 `flac`。使用其它语言时，从 [WebSocket 协议](protocol.md)和[下游客户端接入指南](下游客户端接入指南.md)开始。
+保持服务进程运行，再按照 [Python SDK 文档](../../sdk/README.md)安装 SDK，并使用其中的 `s16le` 示例转录一段本地音频。SDK 在客户端读取音频时仍需文档列出的 `ffmpeg` / `ffprobe`；`s16le` 上传路径不要求服务端安装 `ffmpeg`。若改用默认的 FLAC 编码，服务端也需安装 `ffmpeg`，并先确认 `/health` 的 `encodings` 包含 `flac`。使用其它语言时，从 [WebSocket 协议](../reference/protocol.md)和[下游客户端接入指南](下游客户端接入指南.md)开始。
 
 ## 后续部署
 
-- 选择其它引擎与下载对应模型： [模型支持](models.md)。
+- 选择其它引擎与下载对应模型： [模型支持](../reference/models.md)。
 - 将多个后端接到同一入口： [ASR 负载均衡代理](ASR负载均衡代理.md)。
-- 配置已运行服务的守护与升级： [部署维护与升级](../deploy/README.md)。
-- 了解上游来源与项目差异： [UPSTREAM.md](../UPSTREAM.md)。
+- 配置已运行服务的守护与升级： [部署维护与升级](../../deploy/README.md)。
+- 了解上游来源与项目差异： [UPSTREAM.md](../../UPSTREAM.md)。

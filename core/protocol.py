@@ -12,7 +12,7 @@ from typing import List, Literal, Optional
 import json
 
 
-# 与 docs/protocol.md §4.2 和 SDK 的协议错误码集合保持一致。
+# 与 docs/reference/protocol.md §4.2 和 SDK 的协议错误码集合保持一致。
 ERROR_CODES = frozenset({
     'bad_request',
     'unsupported_encoding',

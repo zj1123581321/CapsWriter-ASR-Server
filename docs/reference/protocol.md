@@ -1,6 +1,6 @@
 # WebSocket 语音识别协议
 
-本文说明 CapsWriter ASR Server 与下游客户端之间的 WebSocket 和 HTTP `/health` 协议。新客户端应使用 v2；服务端保留 v1 上行兼容。Python 项目可优先使用 [SDK](../sdk/README.md)，其他语言可按本文直接接入。
+本文说明 CapsWriter ASR Server 与下游客户端之间的 WebSocket 和 HTTP `/health` 协议。新客户端应使用 v2；服务端保留 v1 上行兼容。Python 项目可优先使用 [SDK](../../sdk/README.md)，其他语言可按本文直接接入。
 
 ## 连接与健康检查
 
@@ -57,7 +57,7 @@ v2 示例末帧：
 
 单帧 Base64 解码后的数据上限为 64 MiB；任务解码后时长默认最多 14,400 秒，可由服务端 `CW_MAX_TASK_SECONDS` 调整。v2 客户端应分块发送：原始 PCM 每帧最多 60 秒，压缩流每帧不超过 256 KiB。发送的 `data` 必须是指定编码的裸音频字节，不能把 WAV 文件头放进 PCM 帧。
 
-服务端资源上限和超时默认值如下；服务端操作说明与变量定义见[部署文档](../deploy/README.md)和 `config_server.py`：
+服务端资源上限和超时默认值如下；服务端操作说明与变量定义见[部署文档](../../deploy/README.md)和 `config_server.py`：
 
 | 项目 | 默认上限 | 满载或超时时的处理 |
 |---|---:|---|
@@ -128,4 +128,4 @@ proxy 对带 `encoding` 的 v2 任务只选择协议版本不低于 2 且支持�
 
 ## Python SDK
 
-SDK 默认编码为 `flac`，因此服务端也必须在 PATH 中安装 `ffmpeg` 且健康检查需列出 `flac`。首次部署可选 `s16le` 避免服务端压缩解码依赖；SDK 客户端本机始终需要 `ffmpeg` 和 `ffprobe`。SDK 每个任务前检查 `/health`，并发上传和接收；默认总体截止时间为 `max(120 秒, 音频时长 + 60 秒)`，`idle_timeout` 默认 300 秒。超过截止时间、上传发送时限或结果空闲时限时会抛出 `AsrError`。它不自动重试。完整安装与调用示例见 [SDK 文档](../sdk/README.md)。
+SDK 默认编码为 `flac`，因此服务端也必须在 PATH 中安装 `ffmpeg` 且健康检查需列出 `flac`。首次部署可选 `s16le` 避免服务端压缩解码依赖；SDK 客户端本机始终需要 `ffmpeg` 和 `ffprobe`。SDK 每个任务前检查 `/health`，并发上传和接收；默认总体截止时间为 `max(120 秒, 音频时长 + 60 秒)`，`idle_timeout` 默认 300 秒。超过截止时间、上传发送时限或结果空闲时限时会抛出 `AsrError`。它不自动重试。完整安装与调用示例见 [SDK 文档](../../sdk/README.md)。

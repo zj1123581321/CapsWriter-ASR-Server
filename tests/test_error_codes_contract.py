@@ -45,7 +45,7 @@ def _assert_error_code_sets_match(*sets: set[str]) -> None:
 def test_protocol_error_codes_match_sdk_and_documentation():
     core = _assignment_set(ROOT / "core/protocol.py", "ERROR_CODES")
     sdk = _assignment_set(ROOT / "sdk/capswriter_asr/client.py", "PROTOCOL_ERROR_CODES")
-    documented = _markdown_error_codes(ROOT / "docs/protocol.md")
+    documented = _markdown_error_codes(ROOT / "docs/reference/protocol.md")
     _assert_error_code_sets_match(core, sdk, documented)
 
 
