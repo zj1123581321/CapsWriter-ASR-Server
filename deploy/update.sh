@@ -7,6 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 ref="$1"
+deploy_python="${DEPLOY_PYTHON:?请设置 DEPLOY_PYTHON}"
 process_name="${DEPLOY_PROCESS_NAME:?请设置 DEPLOY_PROCESS_NAME}"
 port="${DEPLOY_PORT:?请设置 DEPLOY_PORT}"
 model_type="${CW_MODEL_TYPE:?请设置 CW_MODEL_TYPE}"
@@ -29,6 +30,13 @@ esac
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "$script_dir/.." && pwd)"
+if [[ "$deploy_python" == */* && "$deploy_python" != /* ]]; then
+    deploy_python="$repo_dir/$deploy_python"
+fi
+if [[ ! -f "$deploy_python" || ! -x "$deploy_python" ]] && ! command -v -- "$deploy_python" >/dev/null 2>&1; then
+    printf 'DEPLOY_PYTHON 不存在或不可执行: %s\n' "$deploy_python" >&2
+    exit 2
+fi
 platform="$(uname -s)"
 case "$platform:$model_type" in
     Darwin:qwen_asr|Darwin:qwen_asr_mlx|Darwin:fun_asr_nano|Darwin:sensevoice|Darwin:paraformer|Darwin:proxy)
@@ -49,10 +57,48 @@ git fetch --tags origin
 git checkout --detach "$ref"
 expected_git_sha="$(git rev-parse --short HEAD)"
 
-if [[ ! -x .venv/bin/python ]]; then
-    python3 -m venv .venv
-fi
-.venv/bin/python -m pip install -r "$requirements_file"
+case "$model_type" in
+    qwen_asr|qwen_asr_mlx|fun_asr_nano)
+        llama_build_info="$repo_dir/core/server/engines/llama_build_info.py"
+        if [[ ! -f "$llama_build_info" ]]; then
+            printf 'llama 预检跳过：%s 无 llama_build_info.py\n' "$ref"
+        else
+            llama_build="$(sed -nE 's/^[[:space:]]*LLAMA_BUILD[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' "$llama_build_info")"
+            if [[ -z "$llama_build" ]]; then
+                printf '无法从 %s 解析 LLAMA_BUILD\n' "$llama_build_info" >&2
+                exit 1
+            fi
+            llama_lib_dir="$repo_dir/core/server/engines/llama/bin/$llama_build"
+            case "$platform" in
+                Darwin)
+                    llama_files=(libggml.dylib libggml-base.dylib libllama.dylib)
+                    llama_asset="llama-${llama_build}-bin-macos-arm64.tar.gz"
+                    ;;
+                Linux)
+                    llama_files=(libggml.so libggml-base.so libllama.so)
+                    llama_asset="llama-${llama_build}-bin-ubuntu-vulkan-x64.tar.gz"
+                    ;;
+                *)
+                    printf 'llama 预检不支持当前系统: %s\n' "$platform" >&2
+                    exit 2
+                    ;;
+            esac
+            missing_llama_files=()
+            for llama_file in "${llama_files[@]}"; do
+                if [[ ! -f "$llama_lib_dir/$llama_file" ]]; then
+                    missing_llama_files+=("$llama_file")
+                fi
+            done
+            if (( ${#missing_llama_files[@]} > 0 )); then
+                printf 'llama 预检失败：%s 缺少文件：%s；请从 llama.cpp release 获取资产：%s\n' \
+                    "$llama_lib_dir" "${missing_llama_files[*]}" "$llama_asset" >&2
+                exit 1
+            fi
+        fi
+        ;;
+esac
+
+"$deploy_python" -m pip install -r "$requirements_file"
 
 pm2 restart "$process_name"
 
