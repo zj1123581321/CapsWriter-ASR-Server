@@ -84,7 +84,7 @@ while ($healthTimer.Elapsed.TotalSeconds -lt $HealthTimeout) {
         $lastStatus = [int]$response.StatusCode
         $lastPayload = $null
         if ($response.Content) { $lastPayload = $response.Content | ConvertFrom-Json }
-        if ($lastStatus -eq 200) { break }
+        if ($lastStatus -eq 200 -and $lastPayload.git_sha -eq $expectedGitSha) { break }
     }
     $remainingMilliseconds = [int][Math]::Max(
         0,
