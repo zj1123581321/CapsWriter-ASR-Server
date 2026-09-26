@@ -18,6 +18,7 @@ import websockets
 from rich.console import Console
 
 from core.server.schema import Result, RecognitionSession
+from core.tools.build_info import get_git_sha
 
 
 TaskKey = tuple[str, str]
@@ -84,6 +85,9 @@ class ServerState:
 
     # 识别子进程
     recognize_process: Optional[Process] = None
+
+    # 服务启动时读取的代码版本，供 /health 报告。
+    git_sha: str = field(default_factory=get_git_sha)
 
     tasks: Dict[TaskKey, TaskLifecycle] = field(default_factory=dict)
     connection_tasks: Dict[str, TaskKey] = field(default_factory=dict)
