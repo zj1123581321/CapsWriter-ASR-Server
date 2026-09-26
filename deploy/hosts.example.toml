@@ -1,31 +1,36 @@
 # 无 IP、路径或凭据；运行更新脚本时把 profile 对应项作为环境变量/参数传入。
 
 [mac_studio.paraformer]
-process_name = "capswriter-paraformer"
+process_name = "capswriter-server"
+python = "venv/bin/python"
 port = 6016
 model_type = "paraformer"
 platform = "macos"
 
 [mac_studio.qwen_mlx]
-process_name = "capswriter-qwen-mlx"
+process_name = "qwen-asr-server"
+python = "venv/bin/python"
 port = 6017
 model_type = "qwen_asr_mlx"
 platform = "macos"
 
 [mac_studio.proxy]
 process_name = "capswriter-proxy"
+python = ".venv/bin/python"
 port = 6020
 model_type = "proxy"
 platform = "macos"
 
-[mac_mini.qwen_mlx]
-process_name = "capswriter-qwen-mlx"
+[mac_mini.qwen_mlx] # 当前停用
+process_name = "qwen-asr-server"
+python = "venv/bin/python"
 port = 6017
 model_type = "qwen_asr_mlx"
 platform = "macos"
 
 [amd_windows.server]
 task_name = "CapsWriter-Server"
+python = "python"
 port = 6016
 model_type = "qwen_asr"
 platform = "windows"

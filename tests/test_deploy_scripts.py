@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -34,13 +35,23 @@ def deployment_clone(tmp_path):
     run_git("-C", seed, "config", "user.name", "Deploy Script Test")
     run_git("-C", seed, "config", "user.email", "deploy-test@example.invalid")
     (seed / "requirements-server-linux.txt").write_text("# fake requirements\n", encoding="utf-8")
+    (seed / "requirements-server-macos.txt").write_text("# fake requirements\n", encoding="utf-8")
+    (seed / "requirements-server.txt").write_text("# fake requirements\n", encoding="utf-8")
     (seed / "deploy").mkdir()
     shutil.copy2(DEPLOY_DIR / "update.sh", seed / "deploy" / "update.sh")
+    (seed / "core" / "server" / "engines").mkdir(parents=True)
     (seed / "tracked.txt").write_text("fixture\n", encoding="utf-8")
-    run_git("-C", seed, "add", "requirements-server-linux.txt", "deploy/update.sh", "tracked.txt")
-    run_git("-C", seed, "commit", "-m", "deployment fixture")
+    run_git("-C", seed, "add", "requirements-server-linux.txt", "requirements-server-macos.txt",
+            "requirements-server.txt", "deploy/update.sh", "tracked.txt")
+    run_git("-C", seed, "commit", "-m", "old deployment fixture")
+    run_git("-C", seed, "tag", "old")
+    (seed / "core" / "server" / "engines" / "llama_build_info.py").write_text(
+        'LLAMA_BUILD = "b10621"\n', encoding="utf-8"
+    )
+    run_git("-C", seed, "add", "core/server/engines/llama_build_info.py")
+    run_git("-C", seed, "commit", "-m", "deployment fixture with llama build")
     run_git("-C", seed, "remote", "add", "origin", origin)
-    run_git("-C", seed, "push", "-u", "origin", "main")
+    run_git("-C", seed, "push", "-u", "origin", "main", "--tags")
     run_git("clone", origin, clone)
     return clone
 
@@ -89,20 +100,15 @@ def prepare_fake_tools(tmp_path):
     assert real_python
     python3 = bin_dir / "python3"
     python3.write_text(
-        "#!/bin/sh\n"
-        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"venv\" ]; then\n"
-        "  target=\"$3\"\n"
-        "  mkdir -p \"$target/bin\"\n"
-        "  cat > \"$target/bin/python\" <<'PYTHON_WRAPPER'\n"
-        "#!/bin/sh\n"
-        "printf '%s\\n' \"$@\" > \"$DEPLOY_TEST_PYTHON_ARGS\"\n"
-        "printf '%s\\n' \"${CW_MODEL_TYPE-unset}\" > \"$DEPLOY_TEST_MODEL_TYPE\"\n"
-        "exit \"${DEPLOY_TEST_PIP_EXIT:-0}\"\n"
-        "PYTHON_WRAPPER\n"
-        "  chmod +x \"$target/bin/python\"\n"
-        "  exit 0\n"
-        "fi\n"
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$DEPLOY_TEST_PYTHON3_ARGS\"\n"
         f"exec {real_python} \"$@\"\n",
+        encoding="utf-8",
+    )
+    deploy_python = bin_dir / "deploy-python"
+    deploy_python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DEPLOY_TEST_PYTHON_ARGS\"\n"
+        "printf '%s\\n' \"${CW_MODEL_TYPE-unset}\" > \"$DEPLOY_TEST_MODEL_TYPE\"\n"
+        "exit \"${DEPLOY_TEST_PIP_EXIT:-0}\"\n",
         encoding="utf-8",
     )
     pm2 = bin_dir / "pm2"
@@ -111,8 +117,14 @@ def prepare_fake_tools(tmp_path):
         "printf '%s\\n' \"${CW_MODEL_TYPE-unset}\" > \"$DEPLOY_TEST_PM2_MODEL_TYPE\"\n",
         encoding="utf-8",
     )
+    uname = bin_dir / "uname"
+    uname.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"${DEPLOY_TEST_UNAME:-Linux}\"\n", encoding="utf-8"
+    )
     python3.chmod(0o755)
+    deploy_python.chmod(0o755)
     pm2.chmod(0o755)
+    uname.chmod(0o755)
     return bin_dir
 
 
@@ -120,12 +132,14 @@ def update_environment(tmp_path, bin_dir, port):
     env = os.environ.copy()
     env.update({
         "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+        "DEPLOY_PYTHON": str(bin_dir / "deploy-python"),
         "CW_MODEL_TYPE": "paraformer",
         "DEPLOY_PROCESS_NAME": "fake-server",
         "DEPLOY_PORT": str(port),
         "DEPLOY_HEALTH_TIMEOUT": "3",
         "DEPLOY_HEALTH_INTERVAL": "1",
         "DEPLOY_TEST_PYTHON_ARGS": str(tmp_path / "python-argv.log"),
+        "DEPLOY_TEST_PYTHON3_ARGS": str(tmp_path / "python3-argv.log"),
         "DEPLOY_TEST_MODEL_TYPE": str(tmp_path / "python-model.log"),
         "DEPLOY_TEST_PM2_ARGS": str(tmp_path / "pm2-argv.log"),
         "DEPLOY_TEST_PM2_MODEL_TYPE": str(tmp_path / "pm2-model.log"),
@@ -133,9 +147,9 @@ def update_environment(tmp_path, bin_dir, port):
     return env
 
 
-def run_update(clone, env):
+def run_update(clone, env, ref="main"):
     return subprocess.run(
-        ["bash", str(clone / "deploy" / "update.sh"), "main"],
+        ["bash", str(clone / "deploy" / "update.sh"), ref],
         cwd=clone,
         env=env,
         stdout=subprocess.PIPE,
@@ -165,6 +179,18 @@ def test_bash_syntax_and_powershell_contract():
         "Invoke-WebRequest",
     ):
         assert command in content
+    assert re.search(
+        r"\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$Python", content
+    )
+    assert "-m venv" not in content
+    assert ".venv" not in content
+    for llama_contract in (
+        "llama_build_info.py", "LLAMA_BUILD", "ggml.dll", "ggml-base.dll",
+        "llama.dll", "llama-$llamaBuild-bin-win-vulkan-x64.zip", "cat-file -e",
+        "rev-parse --verify", "git -C $repo show",
+    ):
+        assert llama_contract in content
+    assert content.index("llama 预检失败") < content.index("checkout --detach")
     pwsh = shutil.which("pwsh")
     if pwsh:
         subprocess.run(
@@ -195,10 +221,13 @@ def test_update_script_rejects_sha_mismatch_and_accepts_matching_sha(deployment_
         assert matched.returncode == 0, matched.stderr
         assert f"git_sha={git_sha}" in matched.stdout
 
-    assert (deployment_clone / ".venv" / "bin" / "python").is_file()
+    assert not (deployment_clone / ".venv").exists()
     assert (tmp_path / "python-argv.log").read_text(encoding="utf-8").splitlines() == [
         "-m", "pip", "install", "-r", "requirements-server-linux.txt",
     ]
+    python3_calls = (tmp_path / "python3-argv.log").read_text(encoding="utf-8").splitlines()
+    assert not any(python3_calls[index:index + 2] == ["-m", "venv"]
+                   for index in range(len(python3_calls) - 1))
     assert (tmp_path / "python-model.log").read_text(encoding="utf-8").strip() == "paraformer"
     assert (tmp_path / "pm2-argv.log").read_text(encoding="utf-8").splitlines() == [
         "restart", "fake-server",
@@ -230,3 +259,94 @@ def test_update_script_does_not_restart_after_dependency_install_failure(deploym
         result = run_update(deployment_clone, env)
     assert result.returncode != 0
     assert not (tmp_path / "pm2-argv.log").exists()
+
+
+def test_update_script_requires_deploy_python_and_does_not_create_venv(deployment_clone, tmp_path):
+    bin_dir = prepare_fake_tools(tmp_path)
+    with HealthService(200, {"status": "ok"}) as health:
+        env = update_environment(tmp_path, bin_dir, health.port)
+        env.pop("DEPLOY_PYTHON")
+        result = run_update(deployment_clone, env)
+    assert result.returncode != 0
+    assert "DEPLOY_PYTHON" in result.stderr
+    assert not (deployment_clone / ".venv").exists()
+    python3_calls = (tmp_path / "python3-argv.log").read_text(encoding="utf-8") if (
+        tmp_path / "python3-argv.log"
+    ).exists() else ""
+    assert "-m\nvenv" not in python3_calls
+    assert not (tmp_path / "python-argv.log").exists()
+
+    env = update_environment(tmp_path, bin_dir, 6016)
+    env["DEPLOY_PYTHON"] = str(tmp_path / "missing-python")
+    missing_interpreter = run_update(deployment_clone, env)
+    assert missing_interpreter.returncode != 0
+    assert "DEPLOY_PYTHON 不存在或不可执行" in missing_interpreter.stderr
+    assert not (tmp_path / "pm2-argv.log").exists()
+
+
+def llama_lib_dir(clone):
+    path = clone / "core" / "server" / "engines" / "llama" / "bin" / "b10621"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_llama_preflight_stops_restart_when_library_is_missing(deployment_clone, tmp_path):
+    run_git("-C", deployment_clone, "checkout", "--detach", "old")
+    original_head = run_git("-C", deployment_clone, "rev-parse", "HEAD").stdout.strip()
+    bin_dir = prepare_fake_tools(tmp_path)
+    lib_dir = llama_lib_dir(deployment_clone)
+    for name in ("libggml.dylib", "libggml-base.dylib"):
+        (lib_dir / name).touch()
+    env = update_environment(tmp_path, bin_dir, 6017)
+    env["CW_MODEL_TYPE"] = "qwen_asr_mlx"
+    env["DEPLOY_TEST_UNAME"] = "Darwin"
+
+    result = run_update(deployment_clone, env, ref="main")
+
+    assert result.returncode != 0
+    assert run_git("-C", deployment_clone, "rev-parse", "HEAD").stdout.strip() == original_head
+    assert "libllama.dylib" in result.stderr
+    assert "llama-b10621-bin-macos-arm64.tar.gz" in result.stderr
+    assert not (tmp_path / "pm2-argv.log").exists()
+
+
+def test_llama_preflight_restarts_when_all_mac_libraries_exist(deployment_clone, tmp_path):
+    bin_dir = prepare_fake_tools(tmp_path)
+    lib_dir = llama_lib_dir(deployment_clone)
+    for name in ("libggml.dylib", "libggml-base.dylib", "libllama.dylib"):
+        (lib_dir / name).touch()
+    git_sha = run_git("-C", deployment_clone, "rev-parse", "--short", "main").stdout.strip()
+    with HealthService(200, {"status": "ok", "git_sha": git_sha}) as health:
+        env = update_environment(tmp_path, bin_dir, health.port)
+        env["CW_MODEL_TYPE"] = "qwen_asr_mlx"
+        env["DEPLOY_TEST_UNAME"] = "Darwin"
+        result = run_update(
+            deployment_clone, env,
+        )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "pm2-argv.log").read_text(encoding="utf-8").splitlines() == [
+        "restart", "fake-server",
+    ]
+
+
+def test_paraformer_skips_llama_preflight(deployment_clone, tmp_path):
+    bin_dir = prepare_fake_tools(tmp_path)
+    git_sha = run_git("-C", deployment_clone, "rev-parse", "--short", "main").stdout.strip()
+    with HealthService(200, {"status": "ok", "git_sha": git_sha}) as health:
+        result = run_update(deployment_clone, update_environment(tmp_path, bin_dir, health.port))
+    assert result.returncode == 0, result.stderr
+    assert not (deployment_clone / "core/server/engines/llama/bin/b10621").exists()
+    assert (tmp_path / "pm2-argv.log").is_file()
+
+
+def test_old_ref_without_build_info_skips_llama_preflight(deployment_clone, tmp_path):
+    bin_dir = prepare_fake_tools(tmp_path)
+    git_sha = run_git("-C", deployment_clone, "rev-parse", "--short", "old").stdout.strip()
+    with HealthService(200, {"status": "ok", "git_sha": git_sha}) as health:
+        env = update_environment(tmp_path, bin_dir, health.port)
+        env["CW_MODEL_TYPE"] = "qwen_asr_mlx"
+        env["DEPLOY_TEST_UNAME"] = "Darwin"
+        result = run_update(deployment_clone, env, ref="old")
+    assert result.returncode == 0, result.stderr
+    assert "llama 预检跳过：old 无 llama_build_info.py" in result.stdout
+    assert (tmp_path / "pm2-argv.log").is_file()
