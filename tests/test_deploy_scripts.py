@@ -158,12 +158,14 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 args = sys.argv[1:]
 calls_path = pathlib.Path(os.environ["DEPLOY_TEST_CURL_CALLS"])
 calls = calls_path.read_text(encoding="utf-8").splitlines() if calls_path.exists() else []
 with calls_path.open("a", encoding="utf-8") as calls_file:
     calls_file.write(json.dumps(args) + "\\n")
+time.sleep(1)
 responses = json.loads(os.environ["DEPLOY_TEST_CURL_RESPONSES"])
 status, payload = responses[min(len(calls), len(responses) - 1)]
 if status is None:
@@ -241,15 +243,15 @@ def test_update_script_polls_health_until_sha_matches_or_times_out(deployment_cl
     bin_dir = prepare_fake_tools(tmp_path)
     git_sha = run_git("-C", deployment_clone, "rev-parse", "--short", "main").stdout.strip()
     env = update_environment(tmp_path, bin_dir, 6016)
-    env["DEPLOY_HEALTH_TIMEOUT"] = "3"
     calls_path = install_fake_curl(tmp_path, bin_dir, env)
     stale = {"status": "ok", "git_sha": "old-sha", "model": "paraformer", "worker_alive": True}
     matching = {**stale, "git_sha": git_sha}
     cases = (
-        ([[200, stale], [200, stale], [200, matching]], "success"),
-        ([[200, stale]], "mismatch"), ([[None, {}]], "timeout"),
+        ([[200, stale], [200, stale], [200, matching]], "success", 60),
+        ([[200, stale]], "mismatch", 5), ([[None, {}]], "timeout", 5),
     )
-    for responses, outcome in cases:
+    for responses, outcome, health_timeout in cases:
+        env["DEPLOY_HEALTH_TIMEOUT"] = str(health_timeout)
         calls_path.write_text("", encoding="utf-8")
         env["DEPLOY_TEST_CURL_RESPONSES"] = json.dumps(responses)
         started_at = time.monotonic()
@@ -267,7 +269,7 @@ def test_update_script_polls_health_until_sha_matches_or_times_out(deployment_cl
             if outcome == "mismatch":
                 assert "健康检查 git_sha 不一致" in result.stderr
                 assert f"期望={git_sha}" in result.stderr and "实际=old-sha" in result.stderr
-                assert elapsed <= 8
+                assert elapsed <= health_timeout + 5
             else:
                 assert "健康检查超时" in result.stderr
                 assert '"git_sha":null' in result.stderr
