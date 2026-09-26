@@ -7,7 +7,6 @@ import json
 from urllib.parse import urlsplit
 
 from config_server import ServerConfig as Config
-from core.tools.build_info import get_git_sha
 
 
 PROTOCOL_VERSION = 2
@@ -49,7 +48,7 @@ def build_health_payload(state, process_manager) -> dict:
         "role": "server",
         "encodings": _encodings(),
         "model": model,
-        "git_sha": get_git_sha(),
+        "git_sha": state.git_sha,
         "llama_build": llama_build,
         "worker_alive": worker_alive,
         "aligner": aligner,

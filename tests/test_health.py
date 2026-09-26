@@ -6,10 +6,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
+import shutil
 import signal
+import subprocess
+import sys
 from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import urlopen
+from uuid import uuid4
 
 import pytest
 import websockets
@@ -29,6 +34,12 @@ class RecordingQueue:
 
     def put(self, message):
         self.messages.append(message)
+
+
+def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    )
 
 
 @pytest.mark.parametrize("aligner_status", ["native", "loaded", "not_required"])
@@ -58,6 +69,7 @@ def test_health_payload_reports_unavailable_when_worker_is_dead():
         recognize_process=SimpleNamespace(is_alive=lambda: False),
         tasks={},
         pending_segments={},
+        git_sha="test-sha",
     )
     process_manager = SimpleNamespace(models_ready=True, aligner_status="loaded")
     app = SimpleNamespace(state=state, process_manager=process_manager)
@@ -167,6 +179,112 @@ async def test_health_endpoint_tracks_work_and_preserves_http_and_websocket():
         assert idle["queued_segments"] == 0
     finally:
         await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_health_git_sha_is_frozen_at_server_start(tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    service_dir = tmp_path / "service"
+    branch = f"health-sha-{uuid4().hex}"
+    _run_git(repository_root, "worktree", "add", "-b", branch, str(service_dir), "HEAD")
+
+    process = None
+    try:
+        shutil.copy2(
+            repository_root / "core/server/connection/health.py",
+            service_dir / "core/server/connection/health.py",
+        )
+        shutil.copy2(
+            repository_root / "core/server/state.py",
+            service_dir / "core/server/state.py",
+        )
+        initial_sha = _run_git(service_dir, "rev-parse", "--short", "HEAD").stdout.strip()
+
+        instrumentation_dir = tmp_path / "instrumentation"
+        instrumentation_dir.mkdir()
+        calls_file = tmp_path / "git-rev-parse-calls.txt"
+        (instrumentation_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "import subprocess\n"
+            "_run = subprocess.run\n"
+            "def _track_git_sha(*args, **kwargs):\n"
+            "    command = args[0] if args else kwargs['args']\n"
+            "    if command == ['git', 'rev-parse', '--short', 'HEAD']:\n"
+            "        with open(os.environ['HEALTH_GIT_SHA_CALLS'], 'a') as calls:\n"
+            "            calls.write(str(os.getpid()) + '\\n')\n"
+            "    return _run(*args, **kwargs)\n"
+            "subprocess.run = _track_git_sha\n",
+            encoding="utf-8",
+        )
+        ready_file = tmp_path / "server-ready.txt"
+        server_script = (
+            "import asyncio, sys\n"
+            "from tests.harness.server import ManagedFakeServerHarness\n"
+            "async def main():\n"
+            "    harness = await ManagedFakeServerHarness.start()\n"
+            "    open(sys.argv[1], 'w', encoding='utf-8').write(harness.url)\n"
+            "    await asyncio.to_thread(sys.stdin.readline)\n"
+            "    await harness.stop()\n"
+            "asyncio.run(main())\n"
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            [str(instrumentation_dir), str(service_dir)]
+        )
+        environment["HEALTH_GIT_SHA_CALLS"] = str(calls_file)
+        process = subprocess.Popen(
+            [sys.executable, "-c", server_script, str(ready_file)],
+            cwd=service_dir,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+
+        deadline = asyncio.get_running_loop().time() + 20
+        while (
+            not ready_file.exists()
+            and process.poll() is None
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.05)
+        assert ready_file.exists(), f"测试服务未能启动，exitcode={process.poll()}"
+
+        url = f"{_http_url(ready_file.read_text(encoding='utf-8'))}/health"
+        assert len(calls_file.read_text(encoding="utf-8").splitlines()) == 1
+
+        status_code, started = await asyncio.to_thread(_get_health, url)
+        assert status_code == 200
+        assert started["git_sha"] == initial_sha
+
+        (service_dir / "runtime-version.txt").write_text("new version\n")
+        _run_git(service_dir, "add", "runtime-version.txt")
+        _run_git(
+            service_dir,
+            "-c",
+            "user.name=Health Test",
+            "-c",
+            "user.email=health@example.invalid",
+            "commit",
+            "-m",
+            "advance test HEAD",
+        )
+        new_sha = _run_git(service_dir, "rev-parse", "--short", "HEAD").stdout.strip()
+        assert new_sha != initial_sha
+
+        for _ in range(20):
+            status_code, current = await asyncio.to_thread(_get_health, url)
+            assert status_code == 200
+            assert current["git_sha"] == initial_sha
+        assert len(calls_file.read_text(encoding="utf-8").splitlines()) == 1
+    finally:
+        if process is not None and process.poll() is None:
+            process.stdin.write("stop\n")
+            process.stdin.flush()
+            process.wait(timeout=10)
+        _run_git(repository_root, "worktree", "remove", "--force", str(service_dir))
+        _run_git(repository_root, "branch", "-D", branch)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="SIGKILL 子进程验证仅适用于 POSIX")
