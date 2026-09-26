@@ -12,7 +12,7 @@
 服务端 `/health` 的其余字段用于判断运行状态和版本来源：
 
 ```json
-{"status":"ok","protocol_version":2,"role":"server","encodings":["f32le","s16le","flac","ogg_opus"],"model":"paraformer","git_sha":"abc1234","llama_build":null,"worker_alive":true,"aligner":"not_required","active_tasks":0,"queued_segments":0}
+{"status":"ok","protocol_version":2,"role":"server","encodings":["f32le","s16le","flac","ogg_opus"],"model":"paraformer","git_sha":"abc1234","llama_build":null,"worker_alive":true,"aligner":"native","active_tasks":0,"queued_segments":0}
 ```
 
 `git_sha` 是服务进程启动时取得的版本标识；更新工作树不会改变已运行进程报告的值。`worker_alive` 表示识别子进程已就绪且存活，`aligner` 表示当前时间对齐器状态；`active_tasks` 与 `queued_segments` 是当前负载计数。`llama_build` 仅在相关 GGUF 模型或已加载对齐器时提供，其他情况为 `null`。proxy 的 `/health` 同样返回状态、协议版本、角色和 `git_sha`；`encodings` 是健康 v2 后端编码的并集，`backends` 逐项报告后端 URL、健康状态、协议版本、模型、编码和版本标识。服务端与 proxy 都会在没有可服务的健康 worker/backend 时返回 HTTP 503。
@@ -69,7 +69,7 @@ v2 示例末帧：
 | 每连接结果队列 | 256 条 | 队列满时返回 `slow_consumer` 并关闭连接 |
 | proxy 每任务上行队列 | 8 帧 | 暂停读取客户端，向上传递背压 |
 | 上传空闲 | `CW_UPLOAD_IDLE_SECONDS` = 300 秒 | 返回 `bad_request`；服务端背压等待期间暂停计时 |
-| 单段推理看门狗 | `CW_SEGMENT_TIMEOUT` = 600 秒 | 返回 `inference_timeout` 并重启卡住的服务端进程 |
+| 单段推理看门狗 | `CW_SEGMENT_TIMEOUT` = 600 秒 | 返回 `inference_timeout`；推理进程卡住后主进程非零退出，由外部守护进程重启服务 |
 
 proxy 每 30 秒探测后端健康状态；探测请求超时为 5 秒。压缩编码还要求服务端 PATH 有 `ffmpeg`，否则 `/health.encodings` 不含 `flac` 和 `ogg_opus`，收到相应请求会返回 `unsupported_encoding`。
 
