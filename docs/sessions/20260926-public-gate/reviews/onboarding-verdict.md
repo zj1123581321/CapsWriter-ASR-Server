@@ -3,6 +3,7 @@
 - 审查对象（H0 冻结）：`3baee635f89fd6480d5dc726bcf7ec3943fb4b0f..fc4568052975963cbce457c33615dc5720f8ee0f`，12 个文件全为新增。
 - risk-tier: internal；独立 reviewer（dispatch dlg-20260926-135031-f1c8f7），未读实现报告/他人意见；源码只读，未重跑全量套件。
 - 修订（dispatch dlg-20260926-141417-c6bb2e）：纠正隔离证据表述，去除「无凭据 ci 池已证实」「SILO 仅在 primary」的绝对结论；登记 v2 前移时效。H0 冻结与容器 230/契约 4 结论不变。
+- 修订2（dispatch dlg-20260926-143104-f5d9e8）：移除「当前阶段无活跃暴露面」结论——被实际 CI 证伪（draft 不阻止 quality 执行 PR 代码，run 36247561740）。
 - 结论：**pass**（无 P1/P2；P3 七条均不阻塞）。
 
 failure-visibility: clean
@@ -28,7 +29,7 @@ failure-visibility: clean
 
 ## P1 两问（对最高风险候选）
 
-- 脚本继承环境（OCR high#4）：真实使用会触发吗？会（exec 继承，设计明示不过滤环境，secret 隔离归平台 job 边界）。后果可接受吗？按实际使用与阶段依赖判定：当前唯一平台消费方是 gate-v2 quality job，**静态已锁**该 job 不注入 SILO/FEISHU（step env 仅 `GATE_ARTIFACT_DIR`、job 级无 secret env，@v2 原文核实；SILO 由 primary/ledger/disposition-control 持有，已逐 job 核）；但 runs-on 的 ci 标签只是配置意图，宿主/cache/实际 runner CLI 隔离是否部署不能由 workflow 文本证明，仍待生产验收，此前置未完成不得宣称平台隔离已证实。当前阶段（draft + 本地使用）无活跃暴露面 → 非 P1。
+- 脚本继承环境（OCR high#4）：真实使用会触发吗？会（exec 继承，设计明示不过滤环境，secret 隔离归平台 job 边界）。后果可接受吗？按实际使用与阶段依赖判定：当前唯一平台消费方是 gate-v2 quality job，**静态已锁**该 job 不注入 SILO/FEISHU（step env 仅 `GATE_ARTIFACT_DIR`、job 级无 secret env，@v2 原文核实；SILO 由 primary/ledger/disposition-control 持有，已逐 job 核）；但 runs-on 的 ci 标签只是配置意图，宿主/cache/实际 runner CLI 隔离是否部署不能由 workflow 文本证明，仍待生产验收，此前置未完成不得宣称平台隔离已证实。暴露面是活跃的：draft PR 的 quality 已在自托管 ci runner 实际执行本脚本（run 36247561740，head 8a0b70c，runner gatehub-10f379616b43-slot-3，`gate-quality: ffmpeg 未安装` fail-loud；draft 只跳 primary/ocr 模型腿，不阻止 quality 执行 PR 代码——均核 run/jobs/日志原文）。该次运行 step env 实测仅 SILO_ENDPOINT/重试参数/GATE_ARTIFACT_DIR 等非敏感值、无任何密钥，且本仓 repo secrets 实测为空（gh secret list rc=0 零行）——已锁事实是「job 不注入 + 仓库尚无可注入值」；宿主/cache/runner CLI 隔离仍 unknown，不得以 draft 宣称安全，该 host 风险归未完成的生产部署验收（B 平台侧），与 F 静态契约通过是两回事。→ 对本 diff 维持非 P1（无静默出错、无凭据注入路径）；接入级风险如实挂 Unknown。
 - disposition caller 引用 callee 未声明的 secret（审查时点候选）：现 v2=bb443ef 已声明该 pair，候选消失；推广前手动 dispatch 也仅在校验阶段响亮失败、零写入。→ 非 P1。
 
 ## P2
@@ -47,7 +48,7 @@ failure-visibility: clean
 
 ## Unknown / 待验证（设计已登记，复核确认仍存在）
 
-- fork/Dependabot/draft→ready 矩阵、生产 runner rollout 未完成；capacity allowlist 须待 caller 进默认分支后取三条真实 producer SHA 关闭，当前无预填 hash（已核仓内无 allowlist 写入）。
+- fork/Dependabot/draft→ready 矩阵、生产 runner rollout 未完成；ci runner 已实际执行过本 PR 的 quality（run 36247561740），其宿主/cache/CLI 隔离验收未完成；capacity allowlist 须待 caller 进默认分支后取三条真实 producer SHA 关闭，当前无预填 hash（已核仓内无 allowlist 写入）。
 - 公开仓 Silo repository secret 凭据核验未完成。时效（root 实核通报，本卡已独立复核 v2 tag 与 callee 原文）：canary run 36247030733 引用 bb443ef 且 primary/quality/ocr/aggregate/ledger 全 SUCCESS，自动 v2 sync run 36247226184「Move v2」contract 成功（本卡实测 v2=bb443ef、disposition callee 已声明 SILO pair）——disposition callee 声明前置解除；生产 runner/keys/live Caps/fork-Dependabot 矩阵前置不因此解除，正式接入仍以此为准。
 - 全量 230 passed 为进度文档声明，本审查按卡未重跑；仅实测 4 条新契约测试通过。
 
