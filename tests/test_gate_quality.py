@@ -28,7 +28,7 @@ def _write_fake_uv(bindir: Path, record: Path, exit_code: int) -> None:
         f"if {SENTINEL_KEY!r} in os.environ:\n"
         "    raise SystemExit(99)\n"
         f"open({str(record)!r}, 'w', encoding='utf-8').write(\n"
-        "    json.dumps({'argv': sys.argv, 'PATH': os.environ.get('PATH', '')}))\n"
+        "    json.dumps({'argv': sys.argv, 'PATH': os.environ.get('PATH', ''), 'cwd': os.getcwd()}))\n"
         f"raise SystemExit({exit_code})\n",
         encoding="utf-8",
     )
@@ -45,6 +45,7 @@ def _run_entry(tmp_path: Path, *, uv_exit=0, with_ffmpeg=True, with_uv=True):
         ff = bindir / "ffmpeg"
         ff.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         ff.chmod(0o755)
+    os.symlink(shutil.which("dirname"), bindir / "dirname")
     if with_uv:
         _write_fake_uv(bindir, record, uv_exit)
     completed = subprocess.run(
@@ -71,10 +72,12 @@ def test_gate_quality_uv_argv_matches_ci_full_suite(tmp_path, monkeypatch):
     completed, record = _run_entry(tmp_path, uv_exit=0)
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(record.read_text(encoding="utf-8"))
-    assert set(payload) == {"argv", "PATH"}
+    assert set(payload) == {"argv", "PATH", "cwd"}
     assert payload["argv"][0].endswith("/uv")
     assert payload["argv"][1:] == EXPECTED_ARGV
+    assert payload["cwd"] == str(REPO_ROOT)
     assert payload["PATH"].split(os.pathsep)[0].endswith("/bin")
+    assert "dirname: command not found" not in completed.stderr
     _assert_clean(completed, record)
 
 
@@ -84,6 +87,7 @@ def test_gate_quality_propagates_uv_nonzero_exit(tmp_path, monkeypatch):
     assert completed.returncode == 7, completed.stderr
     payload = json.loads(record.read_text(encoding="utf-8"))
     assert payload["argv"][1:] == EXPECTED_ARGV
+    assert payload["cwd"] == str(REPO_ROOT)
     _assert_clean(completed, record)
 
 

@@ -21,3 +21,9 @@
 - 关键决策及否决：不序列化完整 environ；路径隔离替身，不依赖系统缺包；不改 ci.yml。
 - 下一步：更新 draft PR30，交主脑复审；caller/secret/迁仓仍待后续卡。
 
+## 2026-09-26 工作目录契约修正
+
+- 当前阶段：定点契约 4 passed；注入错误 cwd 后仓根断言变红。
+- 本段结论：受控 PATH 提供真实 `dirname`；替身 uv 记录 cwd，成功与非零传播用例断言仓根；同入口依赖运行 4 passed。仅 pytest 依赖命令被 conftest 缺 `numpy` 挡住（退出 4）。
+- 关键决策及否决：此前默认 `git diff --check` 面对 clean 树的空 diff，不能证明已提交范围；本轮检查 base..HEAD，不改历史测试数字。
+- 下一步：检查 base..HEAD whitespace，commit/push 并读回 draft PR30 与远端 tip。
