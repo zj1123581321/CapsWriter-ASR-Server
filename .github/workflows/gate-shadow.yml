@@ -1,0 +1,17 @@
+name: gate-shadow
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+permissions:
+  actions: read
+  contents: read
+jobs:
+  gate-shadow:
+    uses: zlxlabs/gate/.github/workflows/gate-shadow-v2.yml@v2
+    with:
+      tier: internal
+      runner: self
+      design_doc: ""

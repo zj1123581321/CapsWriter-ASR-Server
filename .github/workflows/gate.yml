@@ -1,0 +1,21 @@
+name: gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+jobs:
+  gate:
+    uses: zlxlabs/gate/.github/workflows/gate-v2.yml@v2
+    with:
+      tier: internal
+      runner: self
+      has_ui: false
+      design_doc: ""
+    secrets:
+      FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
+      # 本公开仓使用单独的 repository secrets，不复用私有仓组织密钥。
+      SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
+      SILO_SECRET_KEY: ${{ secrets.SILO_SECRET_KEY }}

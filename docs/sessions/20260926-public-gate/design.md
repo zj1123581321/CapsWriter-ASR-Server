@@ -1,44 +1,26 @@
-# DESIGN-note：公开仓先交付无凭据质量入口
+# 公开仓统一门禁接入设计
 
-## 目标
+## 目标与边界
 
-业务仓提供可被统一门禁调用的真实测试入口 `scripts/gate-quality`，一次跑完整 `tests/`。既有 CI 双矩阵保留。平台 caller、secret、迁仓未落地，本卡不宣称接入成功。
+CapsWriter 公开仓提供可复现的 Python 开发测试环境，并通过 gate、shadow、disposition 三个 caller 接入 gate v2。质量入口执行仓内完整 `tests/`；PR #30 保持 draft，待独立审查和公开仓凭据核验后再决定 ready。此卡不改 gate 实现、平台 registry、生产依赖或部署配置。
 
-## 非目标
+E 卡只负责无凭据质量入口，因此当时否决根 `pyproject.toml` 是对该入口消费边界的限定。F 卡明确增加开发 workspace 元数据和测试依赖；`scripts/gate-quality` 继续使用 `--no-project`，不消费根项目清单，服务依赖也不迁入开发依赖。
 
-不新增门禁 caller、不配置 secret、不迁移 GitHub 仓、不改平台仓、不部署、不删历史。不把 key 烤进镜像，不新增凭据 broker。
+## 配置与信任边界
 
-## 为什么不是分区 / 删除 / 约定
+Caller 使用 gate 仓官方模板的结构和移动 `@v2`：`tier=internal`、`runner=self`、`has_ui=false`、空 `design_doc`。公开仓只具名转发 repository secret；不继承全部组织或仓库 secret。质量 job 的 secret 隔离由 gate 的 job 边界承担，本地入口不实现环境过滤。
 
-- **分区**：测试入口必须落在业务仓，后续 quality job 才能在无 Silo 凭据的一次性环境执行 PR 代码。平台评审与存储必须换 job；同 job 的 step env 不是隔离。本仓不再拆框架。
-- **删除**：不能删真实测试入口。没有它，后续接入只能继续 hosted CI 或跳过，fork 绿仍不代表完整主审。
-- **约定**：口头约定「跑 pytest」锁不住 Python 3.12、`websockets==15.0.1` 与完整 `tests/` argv；必须是可执行脚本并由子进程契约消费。
+根 `pyproject.toml` 仅声明空项目依赖和七项测试开发依赖，`uv.lock` 由 uv 生成；服务端、模型、平台依赖仍留在部署路径。Dev Container 基于 Python 3.12 和固定 uv feature，只在本仓配置中补足缺失的 ffmpeg，再同步开发依赖。
 
-## 方案要点与已否决方案
+## 不变式
 
-- **要点**：入口用现成 uv：`uv run --no-project --python 3.12 --with … python -m pytest tests/ -q`。依赖与命令取自 `.github/workflows/ci.yml` 的 `websockets==15.0.1` 矩阵腿。ffmpeg 缺失则失败并打印可 grep 错误串，不在本机 sudo 安装。脚本不读平台 secret。统一方案依据 [gate#248](https://github.com/zlxlabs/gate/issues/248)；登记见 [gate-hub#1134](https://github.com/zlxlabs/gate-hub/issues/1134)。当前平台未落地，调用配置未完成。
-- **信任边界**：
-  - **test**：执行 PR 树内 `scripts/gate-quality` 与测试代码；不得持有私有存储或模型登录凭据。
-  - **primary**：模型主审。是否执行 PR 代码、是否与 test 共享 runner/cache 标待证，本卡不落地。
-  - **storage**：ledger/artifact 必须在固定可信来源的独立 job；step env 不是隔离。
-- **已否决**：改 `ci.yml` 当门禁（锁定决策要求原样保留）；根目录 pyproject/lock/通用测试框架；step 级收窄 env 当隔离（同 job 文件系统可污染，见 gate#248）；把平台 secret 拷进本仓或镜像。
+1. `scripts/gate-quality` 从仓根运行 `uv run --no-project --python 3.12`，固定 CI 同款七项依赖与完整 pytest argv；`tests/test_gate_quality.py` 的真实子进程断言 `cwd=ROOT`、argv 和退出码。
+2. 开发 workspace 的 `uv sync` / `uv run python -m pytest` 使用锁文件中的测试组，不锁服务或模型依赖；质量入口仍与该 workspace 解耦。
+3. 质量入口测试 fixture 只向替身写入 argv、PATH、cwd 白名单，不序列化完整环境；受控子进程环境不证明入口会剥夺 secret，secret 边界由平台 job 实现。
+4. Public caller 显式传递 Silo 凭据，不使用 `secrets: inherit`。当前 gate disposition v2 尚未在 `workflow_call` 声明两个可选 Silo secret；其 caller 在上游契约合并前不得启用。
 
-## 关键不变式
+## 已核事实与未完成项
 
-1. [实测] 入口实际 argv 为 `uv run --no-project --python 3.12`、CI 同款 `--with`（含 `websockets==15.0.1`）以及 `python -m pytest tests/ -q`。代码：`scripts/gate-quality`。测试：`tests/test_gate_quality.py` 经替身 uv 写文件消费。
-2. [实测] 替身 uv 非零退出时入口保持非零，无吞错。同上测试。
-3. [实测] 替身只记 argv 与 PATH，不序列化完整环境；未许可变量既不传入子进程也不进记录。同上测试。
+A 卡 PR #251 已合并；GitHub API 当前显示 `v2` tag 指向 `08a3baa16650e314f05d4e3aea9ec3631cad3760`，由自动 canary 推广，本卡不手动改 tag 或 ACL。独立公开仓 Silo repository secret 尚未完成凭据核验；gate disposition secret 契约等待上游卡。
 
-## 待验证前提
-
-1. [推断] review-primary / 模型工具循环是否执行 PR 代码；若会执行必须物理隔离。验证入口：[gate-hub#1136](https://github.com/zlxlabs/gate-hub/issues/1136)。
-2. [推断] hosted/self-hosted shared cache 与一次性 runner 是否让后续持 key 步骤读到 test 产物。验证入口：[gate-hub#1136](https://github.com/zlxlabs/gate-hub/issues/1136)。
-3. [推断] 线上 gate-v2 tag 与顾问审查检出是否一致；实施前须在实际基线重核。见 [gate#248](https://github.com/zlxlabs/gate/issues/248)。
-4. [推断] 公开 own-branch、external fork、Dependabot、draft→ready 的 secret 与主审政策未写。Dependabot 同仓 head 不等于可信。验证入口：[gate#249](https://github.com/zlxlabs/gate/issues/249)。
-5. [推断] 调用配置（caller/onboard/registry）未完成，本卡结束后门禁不会自动跑本入口。onboard 登记：[gate-hub#1134](https://github.com/zlxlabs/gate-hub/issues/1134)。
-
-## 验收路径
-
-1. 入口：`bash scripts/gate-quality`
-2. 步骤：先跑 `tests/test_gate_quality.py` 锁 argv、非零传播、受控 PATH 缺 ffmpeg/uv；再跑完整入口；`git diff --check`。
-3. 预期：契约测试绿；完整入口退出码等于 pytest 退出码；缺 ffmpeg/uv 时非零且字面错误可 grep。不预期平台接入成功。后续真实 gate runner 验证属于接入卡。
+仍待验证主审是否执行 PR 代码、共享 runner/cache 隔离、公开仓 external fork/Dependabot/draft 转 ready 矩阵及完整接入容量门禁。Caps caller 进入默认分支后，须从真实 producer 取三条 SHA，补 gate-hub allowlist 并移除临时排除；不得用 tag 或预填 hash 代替消费证据。runner UV 边界 PR #1145 仍未部署。

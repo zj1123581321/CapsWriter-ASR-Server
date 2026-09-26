@@ -1,0 +1,38 @@
+name: gate-disposition
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number: { description: "pull request number", required: true, type: string }
+      primary_run_id: { description: "canonical primary run id", required: true, type: string }
+      primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
+      finding_id: { description: "exact current-audit finding id", required: true, type: string }
+      reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      disposition: { description: "false-positive or deferred", required: false, type: string }
+      counterevidence_json: { description: "counterevidence JSON for false-positive", required: false, type: string }
+      tracking_issue: { description: "same-repository issue reference for deferred", required: false, type: string }
+      gate_ref: { description: "deprecated compatibility input (ignored)", required: false, type: string }
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+jobs:
+  disposition:
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    uses: zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@v2
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      primary_run_id: ${{ inputs.primary_run_id }}
+      primary_run_attempt: ${{ inputs.primary_run_attempt }}
+      finding_id: ${{ inputs.finding_id }}
+      reason: ${{ inputs.reason }}
+      disposition: ${{ inputs.disposition }}
+      counterevidence_json: ${{ inputs.counterevidence_json }}
+      tracking_issue: ${{ inputs.tracking_issue }}
+    # 公开仓只具名传递专属 Silo 密钥，不继承组织或仓库的全部 secrets。
+    # gate v2 callee 声明可选 workflow_call secret 并完成推广后再启用。
+    secrets:
+      SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
+      SILO_SECRET_KEY: ${{ secrets.SILO_SECRET_KEY }}

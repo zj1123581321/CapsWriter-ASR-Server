@@ -1,0 +1,20 @@
+[project]
+name = "capswriter-asr-server"
+version = "0.0.0"
+description = "CapsWriter ASR Server 的开发测试环境（非发行元数据）"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "colorama",
+    "numpy",
+    "pytest",
+    "pytest-asyncio",
+    "rich",
+    "soundfile",
+    "websockets==15.0.1",
+]
