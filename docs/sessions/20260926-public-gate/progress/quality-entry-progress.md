@@ -17,7 +17,7 @@
 ## 2026-09-26 P2
 
 - 当前阶段：三项 P2 定点契约 4 passed。
-- 本段结论：受控最小 env；替身只记 argv/PATH；缺 ffmpeg/uv 字面错误；设计链接 gate-hub#1136、gate#249、gate-hub#1134。
+- 本段结论：受控最小 env；替身只记 argv/PATH；缺 ffmpeg/uv 字面错误；设计链接 gate-hub#1136、gate#249、gate-hub#1134。完整入口 230 passed, 3 skipped, 81 warnings, 98.90s；`git diff --check` 0。
 - 关键决策及否决：不序列化完整 environ；路径隔离替身，不依赖系统缺包；不改 ci.yml。
-- 下一步：完整 `bash scripts/gate-quality` 一次 + `git diff --check`。
+- 下一步：更新 draft PR30，交主脑复审；caller/secret/迁仓仍待后续卡。
 
