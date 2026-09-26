@@ -5,7 +5,7 @@
 ## 首次部署
 
 1. 在目标机器 clone 本仓库：`git clone <仓库地址> CapsWriter-Offline-with-AI`。
-2. 手工准备守护进程实际使用的解释器并安装依赖。需要虚拟环境时，在 clone 内运行 `python3 -m venv <环境目录>`，再用 `<环境目录>/bin/python -m pip install -r requirements-server-macos.txt`（macOS）或对应平台的 requirements；Windows 可直接使用 PATH 上的 `python`。之后更新脚本只会通过传入的解释器执行 `-m pip install -r ...`。
+2. 手工准备守护进程实际使用的解释器并安装依赖。需要虚拟环境时，在 clone 内运行 `python3 -m venv <环境目录>`，再用 `<环境目录>/bin/python -m pip install -r requirements-server-macos.txt`（macOS）或对应平台的 requirements；Windows 可直接使用 PATH 上的 `python`。之后更新脚本只会通过传入的解释器执行 `-m pip install -r ...`。`DEPLOY_PYTHON` / `-Python` 指向的解释器必须带 pip；uv 创建的虚拟环境需先执行一次 `<python> -m ensurepip`。
 3. 按机器配置守护进程。更新脚本只重启已存在的 PM2 进程或计划任务，不创建守护配置。
 4. 准备本机所需的 llama 动态库，步骤见「llama 库」。首次启动并确认 `/health` 可访问后，再运行更新脚本。
 5. `hosts.example.toml` 是无地址、无凭据的参数模板，不会被 shell 或 PowerShell 自动读取。
@@ -36,7 +36,7 @@ Windows 使用已有计划任务：
 
 `-Python` 必填，可填 PATH 上守护进程实际使用的 `python` 命令或解释器路径。计划任务的 `run_server.bat` 由 clone 中的未跟踪文件维护。
 
-对每个服务分别调用脚本。脚本先 `git fetch --tags origin`，再 detached checkout 目标 ref；llama 预检通过后用指定解释器安装 requirements，随后重启并轮询本机 `/health`，最多 300 秒。HTTP 未到 200、超时或 `git_sha` 与 checkout 提交不一致都会以非零退出；失败诊断只列 `/health` 的 `status`、`git_sha`、`model`、`worker_alive`。
+对每个服务分别调用脚本。脚本先 `git fetch --tags origin`，再 detached checkout 目标 ref；llama 预检通过后用指定解释器安装 requirements，随后重启并轮询本机 `/health`，最多 300 秒。HTTP 未到 200、超时或 `git_sha` 与 checkout 提交不一致都会以非零退出；失败诊断只列 `/health` 的 `status`、`git_sha`、`model`、`worker_alive`。`/health` 的 `git_sha` 表示运行中进程启动时加载的代码版本，磁盘 HEAD 改变后要等进程重启才会更新。
 
 ## llama 库
 
