@@ -27,18 +27,18 @@
 
 1. [实测] 入口实际 argv 为 `uv run --no-project --python 3.12`、CI 同款 `--with`（含 `websockets==15.0.1`）以及 `python -m pytest tests/ -q`。代码：`scripts/gate-quality`。测试：`tests/test_gate_quality.py` 经替身 uv 写文件消费。
 2. [实测] 替身 uv 非零退出时入口保持非零，无吞错。同上测试。
-3. [实测] 替身只记 argv/env 后退出，不递归调用 pytest。同上测试。
+3. [实测] 替身只记 argv 与 PATH，不序列化完整环境；未许可变量既不传入子进程也不进记录。同上测试。
 
 ## 待验证前提
 
-1. [推断] review-primary / 模型工具循环是否执行 PR 代码；若会执行必须物理隔离。验证入口：平台仓按 [gate#248](https://github.com/zlxlabs/gate/issues/248) 基线核对，不在本卡。
-2. [推断] hosted/self-hosted shared cache 与一次性 runner 是否让后续持 key 步骤读到 test 产物。验证入口：gate#248 故障注入，尚未做。
-3. [推断] 线上 gate-v2 tag 与顾问审查检出是否一致；实施前须在实际基线重核。见 gate#248。
-4. [推断] 公开 own-branch、external fork、Dependabot、draft→ready 的 secret 与主审政策未写。Dependabot 同仓 head 不等于可信。验证入口：[gate-hub#1134](https://github.com/zlxlabs/gate-hub/issues/1134) 接入卡。
-5. [推断] 调用配置（caller/onboard/registry）未完成，本卡结束后门禁不会自动跑本入口。
+1. [推断] review-primary / 模型工具循环是否执行 PR 代码；若会执行必须物理隔离。验证入口：[gate-hub#1136](https://github.com/zlxlabs/gate-hub/issues/1136)。
+2. [推断] hosted/self-hosted shared cache 与一次性 runner 是否让后续持 key 步骤读到 test 产物。验证入口：[gate-hub#1136](https://github.com/zlxlabs/gate-hub/issues/1136)。
+3. [推断] 线上 gate-v2 tag 与顾问审查检出是否一致；实施前须在实际基线重核。见 [gate#248](https://github.com/zlxlabs/gate/issues/248)。
+4. [推断] 公开 own-branch、external fork、Dependabot、draft→ready 的 secret 与主审政策未写。Dependabot 同仓 head 不等于可信。验证入口：[gate#249](https://github.com/zlxlabs/gate/issues/249)。
+5. [推断] 调用配置（caller/onboard/registry）未完成，本卡结束后门禁不会自动跑本入口。onboard 登记：[gate-hub#1134](https://github.com/zlxlabs/gate-hub/issues/1134)。
 
 ## 验收路径
 
 1. 入口：`bash scripts/gate-quality`
-2. 步骤：先跑 `tests/test_gate_quality.py` 锁 argv 与非零传播；再跑完整入口；`git diff --check`。
-3. 预期：契约测试绿；完整入口退出码等于 pytest 退出码；ffmpeg/uv 缺失时非零。不预期平台接入成功。后续真实 gate runner 验证属于接入卡。
+2. 步骤：先跑 `tests/test_gate_quality.py` 锁 argv、非零传播、受控 PATH 缺 ffmpeg/uv；再跑完整入口；`git diff --check`。
+3. 预期：契约测试绿；完整入口退出码等于 pytest 退出码；缺 ffmpeg/uv 时非零且字面错误可 grep。不预期平台接入成功。后续真实 gate runner 验证属于接入卡。

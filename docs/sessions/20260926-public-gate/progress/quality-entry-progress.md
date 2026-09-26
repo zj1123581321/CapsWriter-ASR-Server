@@ -13,3 +13,11 @@
 - 本段结论：228 passed, 3 skipped, 81 warnings, 161.94s；`git diff --check` 0。既有 skip 未改。
 - 关键决策及否决：不修范围外 skip；不宣称平台接入。ffmpeg 本机已有，未 sudo 安装。
 - 下一步：draft PR；caller/secret/迁仓仍待后续卡。
+
+## 2026-09-26 P2
+
+- 当前阶段：三项 P2 定点契约 4 passed。
+- 本段结论：受控最小 env；替身只记 argv/PATH；缺 ffmpeg/uv 字面错误；设计链接 gate-hub#1136、gate#249、gate-hub#1134。
+- 关键决策及否决：不序列化完整 environ；路径隔离替身，不依赖系统缺包；不改 ci.yml。
+- 下一步：完整 `bash scripts/gate-quality` 一次 + `git diff --check`。
+
