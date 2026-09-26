@@ -1,6 +1,6 @@
 # 上游关系与同步记录
 
-本仓库面向局域网 ASR 服务端；上游 `HaujetZhao/CapsWriter-Offline` 面向语音输入法。本仓库只摘取引擎层和服务端推理相关提交，客户端、界面和整仓打包/依赖管理不随上游同步。
+CapsWriter ASR Server 源自上游 [`HaujetZhao/CapsWriter-Offline`](https://github.com/HaujetZhao/CapsWriter-Offline)。上游面向桌面语音输入；本项目面向需要独立部署离线 ASR 的应用，保留服务端、模型推理和 Python SDK。项目在 GitHub 上仍沿用 fork 关系；仓库改名不会改变来源。客户端界面和整仓打包流程不随上游同步。
 
 本次共同祖先（merge-base）：`7d7fac3541a998be10ebf15102f7884a7dd36edb`。
 
