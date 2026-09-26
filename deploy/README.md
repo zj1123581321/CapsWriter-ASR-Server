@@ -1,58 +1,48 @@
-# 三机统一部署与升级
+# 部署维护与升级
 
-`update.sh` 和 `update.ps1` 在当前 clone 内切换到指定 Git ref、用服务实际使用的 Python 解释器安装依赖、重启一个服务并核对 `/health` 的 `git_sha`。脚本不创建虚拟环境；首次建环境按下文手工完成。更新脚本不含主机地址或凭据。
+从空环境完成首次安装，请先阅读[首次部署与第一次识别](../docs/getting-started.md)。本页说明已有服务的更新脚本、守护进程边界和可选 llama.cpp 动态库准备。各主机个人布局与历史回滚记录移至[维护者运维记录](../docs/operations.md)，普通部署不需要这些配置。
 
-## 首次部署
+## 更新脚本做什么
 
-1. 在目标机器 clone 本仓库：`git clone <仓库地址> CapsWriter-Offline-with-AI`。
-2. 手工准备守护进程实际使用的解释器并安装依赖。需要虚拟环境时，在 clone 内运行 `python3 -m venv <环境目录>`，再用 `<环境目录>/bin/python -m pip install -r requirements-server-macos.txt`（macOS）或对应平台的 requirements；Windows 可直接使用 PATH 上的 `python`。之后更新脚本只会通过传入的解释器执行 `-m pip install -r ...`。`DEPLOY_PYTHON` / `-Python` 指向的解释器必须带 pip；uv 创建的虚拟环境需先执行一次 `<python> -m ensurepip`。
-3. 按机器配置守护进程。更新脚本只重启已存在的 PM2 进程或计划任务，不创建守护配置。
-4. 准备本机所需的 llama 动态库，步骤见「llama 库」。首次启动并确认 `/health` 可访问后，再运行更新脚本。
-5. `hosts.example.toml` 是无地址、无凭据的参数模板，不会被 shell 或 PowerShell 自动读取。
+`update.sh` 和 `update.ps1` 在当前 clone 中切换到指定 Git ref，用服务实际使用的 Python 解释器安装依赖，重启一个已有服务，并检查 `/health`。脚本不会创建虚拟环境，也不会创建 PM2、计划任务或其它守护配置。
 
-## 生产机实际布局
+服务首次启动且确认健康后，再将更新脚本接入自己的守护进程。`hosts.example.toml` 只是无地址、无凭据的参数模板，不会被 shell 或 PowerShell 自动读取。
 
-- **Mac Studio**：三个进程各自使用独立 clone。PM2 的 `qwen-asr-server`（6017，`qwen_asr_mlx`）和 `capswriter-server`（6016，`paraformer`）都由各自 clone 的 `venv/bin/python` 启动。PM2 的 `capswriter-proxy`（6020）由 clone 内未跟踪的 `run_proxy.sh` 启动，使用 `.venv/bin/python`。
-- **Windows**：计划任务 `CapsWriter-Server` 调用 clone 内未跟踪的 `run_server.bat`，服务使用 PATH 上的系统 `python`，没有虚拟环境。`run_server.bat` 启动时会 `taskkill` 全部 python 进程，因此运行它可能结束机器上其他 Python 任务。
-- **Mac mini**：6017 自 2026-09-08 起人为停用，PM2 保存的是空进程表；proxy 会把这个后端显示为 unhealthy。不要把它当成应自动恢复的服务。
+## 更新已有服务
 
-## 更新
-
-macOS/Linux 在每个服务自己的 clone 根目录执行。`DEPLOY_PYTHON` 必填，值应指向该守护进程实际使用的解释器；可以是可执行文件路径，也可以是 PATH 上的命令名。
+macOS/Linux 在每个服务 clone 根目录运行。`DEPLOY_PYTHON` 必填，必须指向运行该服务且带 pip 的解释器；可以是可执行路径或 PATH 上的命令名。
 
 ```sh
-DEPLOY_PYTHON="$PWD/venv/bin/python" \
-CW_MODEL_TYPE=qwen_asr_mlx DEPLOY_PROCESS_NAME=qwen-asr-server DEPLOY_PORT=6017 \
+DEPLOY_PYTHON="$PWD/.venv/bin/python" \
+CW_MODEL_TYPE=paraformer DEPLOY_PROCESS_NAME=my-asr DEPLOY_PORT=6016 \
 deploy/update.sh <git-ref>
 ```
 
-Paraformer 使用 `CW_MODEL_TYPE=paraformer DEPLOY_PROCESS_NAME=capswriter-server DEPLOY_PORT=6016`，解释器同样填该 clone 实际使用的 `venv/bin/python`。Proxy 使用 `CW_MODEL_TYPE=proxy DEPLOY_PROCESS_NAME=capswriter-proxy DEPLOY_PORT=6020`，解释器填 `.venv/bin/python`。
+需要为不同引擎或实例更新时，按实际服务分别设置 `CW_MODEL_TYPE`、`DEPLOY_PROCESS_NAME` 和 `DEPLOY_PORT`。`DEPLOY_PORT` 必须与该实例监听端口一致。
 
-Windows 使用已有计划任务：
+Windows 使用已创建的计划任务：
 
 ```powershell
-.\deploy\update.ps1 -Ref <git-ref> -Python python -TaskName CapsWriter-Server -Port 6016 -ModelType qwen_asr
+.\deploy\update.ps1 -Ref <git-ref> -Python .\.venv\Scripts\python.exe -TaskName My-ASR -Port 6016 -ModelType paraformer
 ```
 
-`-Python` 必填，可填 PATH 上守护进程实际使用的 `python` 命令或解释器路径。计划任务的 `run_server.bat` 由 clone 中的未跟踪文件维护。
+`-Python` 必填，应指向计划任务实际使用且带 pip 的解释器。计划任务的启动脚本和环境变量由部署者自行维护。
 
-对每个服务分别调用脚本。脚本先 `git fetch --tags origin`，再 detached checkout 目标 ref；llama 预检通过后用指定解释器安装 requirements，随后重启并轮询本机 `/health`，最多 300 秒。HTTP 未到 200、超时或 `git_sha` 与 checkout 提交不一致都会以非零退出；失败诊断只列 `/health` 的 `status`、`git_sha`、`model`、`worker_alive`。`/health` 的 `git_sha` 表示运行中进程启动时加载的代码版本，磁盘 HEAD 改变后要等进程重启才会更新。
+两个脚本会抓取 tags 并 detached checkout 目标 ref；llama 预检通过后，以指定解释器安装目标 requirements，再重启并轮询本机 `/health`，最多等待 300 秒。HTTP 状态非 200、超时或运行进程 `git_sha` 与目标提交不同会以非零退出。失败诊断只显示 `/health` 的 `status`、`git_sha`、`model` 和 `worker_alive`。
 
-## llama 库
+`/health` 的 `git_sha` 表示当前运行进程启动时加载的代码版本；磁盘上的 Git HEAD 改变后，只有服务重启完成才会更新。
 
-代码从 `core/server/engines/llama/bin/<LLAMA_BUILD>/` 加载动态库。需要 llama 的模型是 `qwen_asr`、`qwen_asr_mlx`、`fun_asr_nano`；`paraformer`、`sensevoice` 和 `proxy` 不需要。当前 build 值见 `core/server/engines/llama_build_info.py`。下载对应的 llama.cpp release 资产后，把其中的动态库解压到 build 子目录，三个必需文件应直接位于该目录：
+## 可选模型所需的 llama.cpp 动态库
 
-- macOS：`llama-<build>-bin-macos-arm64.tar.gz`，解压到 `core/server/engines/llama/bin/<build>/`。使用 `tar -xzf` 解压，保留资产内的符号链接。
-- Windows：`llama-<build>-bin-win-vulkan-x64.zip`，解压到 `core/server/engines/llama/bin/<build>/`。
+Paraformer、SenseVoice、proxy 不需要 llama.cpp 库。`qwen_asr`、`fun_asr_nano` 和 `qwen_asr_mlx` 的强制对齐路径会加载 llama.cpp。当前版本由 [`llama_build_info.py`](../core/server/engines/llama_build_info.py) 固定为 `b10621`，动态库必须直接放在 `core/server/engines/llama/bin/b10621/`；程序不会退回 `bin/` 根目录。
 
-macOS 目录需要 `libggml.dylib`、`libggml-base.dylib`、`libllama.dylib`；Windows 目录需要 `ggml.dll`、`ggml-base.dll`、`llama.dll`。缺失时更新脚本会在重启前失败、输出缺失文件与对应资产名，并保持仓库工作树原样。`bin/` 根目录中的旧版本库要保留，旧代码回滚时仍从那里加载。
+从 [llama.cpp b10621 官方发行页](https://github.com/ggml-org/llama.cpp/releases/tag/b10621)获取匹配操作系统和 CPU 架构的资产。仓库中记录的资产包括：
 
-## 回滚到 T17 之前的版本
+- macOS Apple Silicon：`llama-b10621-bin-macos-arm64.tar.gz`
+- Windows x64 Vulkan：`llama-b10621-bin-win-vulkan-x64.zip`
+- Windows x64 CPU：`llama-b10621-bin-win-cpu-x64.zip`
+- Linux Ubuntu x64 CPU：`llama-b10621-bin-ubuntu-x64.tar.gz`
 
-旧代码的端口预检可能把刚关闭连接留下的 `TIME_WAIT` 误报为端口冲突并挂起。回滚到 T17 之前的 ref（例如 `ed8ab58`）时，先停目标进程，等待约 40 秒，再切换代码并启动：
+解压后，当前平台的 `ggml`、`ggml-base` 和 `llama` 三个核心动态库应直接位于 `b10621/` 子目录。Linux GPU 部署需要针对具体发行版、驱动和后端单独验证；本页不提供通用 CUDA/Vulkan 配方。不同平台和后端的资产不能混放进同一版本目录。
 
-1. Mac 上运行 `pm2 stop <进程名>`；Windows 上运行 `Stop-ScheduledTask -TaskName CapsWriter-Server`。
-2. 等待 40 秒。
-3. 使用更新脚本切换并启动。手工操作时，先 `git checkout --detach <git-ref>`，再运行原有的 `pm2 start` 或 `Start-ScheduledTask`。
-
-这段等待只针对 T17 之前的 ref。llama 预检在 checkout 后读取目标版本；旧 ref 没有 `llama_build_info.py` 时会打印跳过日志后继续。
+保留旧版本库目录，以便回滚到要求旧版本的代码。首次从旧版代码升级时，先按目标提交的 `LLAMA_BUILD` 准备新目录，再重启服务。
