@@ -27,27 +27,12 @@ class SocketManager:
         self._is_running = False
         self._server = None  # websockets.serve 返回的 server 对象
 
-    def _check_port(self):
-        """检查端口可用性"""
-        import socket
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind((Config.addr, int(Config.port)))
-                return True
-            except socket.error:
-                logger.error(f"端口冲突：{Config.addr}:{Config.port} 已被占用，请检查是否已有服务端正在运行。")
-                return False
-
     async def start(self):
         """
         启动 WebSocket 网络服务
         """
         if self._is_running: return
         
-        # 0. 启动前自检环境（无头守护下没有 tty 等待回车，必须 fail fast 非零退出）
-        if not self._check_port():
-            raise SystemExit(1)
-
         self._is_running = True
 
         loop = self.app.loop
@@ -62,7 +47,7 @@ class SocketManager:
         # 3. 启动服务
         logger.info(f"正在拉起 WebSocket 服务 (监听: {Config.addr}:{Config.port})")
         
-        async with websockets.serve(
+        serve = websockets.serve(
             handler,
             Config.addr,
             Config.port,
@@ -72,7 +57,14 @@ class SocketManager:
             # pong 无法在默认 20s 内送达，服务端会误判超时并以 1011 断连
             # （与 core/proxy/proxy_server.py 的 serve 保持一致）
             ping_interval=None,
-        ) as server:
+        )
+        try:
+            server = await serve
+        except OSError as exc:
+            logger.error(f"端口被占用：{Config.addr}:{Config.port}，监听异常：{exc}")
+            raise SystemExit(1)
+
+        async with server:
             self._server = server  # 保存 server 引用，用于外部关闭
 
             # sender 与 worker 看门狗并行；任一异常结束都让服务端主循环退出。
