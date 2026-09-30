@@ -103,6 +103,10 @@ celerybeat.pid
 
 # 虚拟环境
 .env
+# 忽略本地 dotenv，保留可公开模板
+.env.*
+!.env.example
+!.env.*.example
 .venv
 env/
 venv/
