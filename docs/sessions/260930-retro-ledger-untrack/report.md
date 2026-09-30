@@ -66,13 +66,7 @@ backup-compare: identical
 
 ## 推送与草稿 PR
 
-工作区 `origin` 实际配置为：
-
-```text
-git@github.com:zlxlabs/CapsWriter-ASR-Server.git
-```
-
-它不是本卡仓库，未向该地址推送。按本仓目录名尝试目标地址：
+GitHub 将任务卡中的旧仓名重定向到当前规范仓；当前 `origin` 为规范仓地址。第一次按任务卡旧仓名直接尝试：
 
 ```text
 $ git push git@github.com:zlxlabs/CapsWriter-Offline-with-AI.git HEAD:refs/heads/card/retro-ledger-untrack-260930
@@ -80,11 +74,20 @@ ERROR: Repository not found.
 fatal: Could not read from remote repository.
 ```
 
-随后对该地址执行 `git ls-remote`，同样返回仓库不存在；目标分支没有远端命中。因此本次没有进入 pre-push `public-scan`，也没有创建 draft PR，避免把分支推到错误仓库。任务卡所述的 public-scan 预期阻断在本次实际推送尝试中未发生。
+随后向规范 `origin` 推送，按预期被公开内容扫描阻断：
+
+```text
+pre-push public-scan blocked: docs/sessions/260930-retro-ledger-untrack/report.md:89:local_absolute_path
+pre-push public-scan blocked: docs/sessions/260930-retro-ledger-untrack/report.md:89:username
+pre-push public-scan: public content rejected
+error: failed to push some refs
+```
+
+目标分支未产生远端命中；扫描阻断发生在推送写入前，因此没有创建 draft PR。修正本报告后仍需由主脑决定是否以公开安全的报告再次尝试推送。
 
 ## 接手巡检记录
 
 - 接手简报：无交接单。
 - `archive_orphan_debts.py --oneline`：`summary: orphan 0 owned 0 unattributable 0 too-new 0 recent-7d 0 stale-over-7d 0 missing_ledger_repos 0`
-- `memory_report.py --oneline`：退出码 2，`memory 巡检报告不可用：memory_dir_mismatch（/home/zlx/.local/state/memory-doctor/latest.json）`
+- `memory_report.py --oneline`：退出码 2，`memory 巡检报告不可用：memory_dir_mismatch（本机状态文件路径已省略）`
 - 开放问题收件箱：无条目。
