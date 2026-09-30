@@ -18,8 +18,9 @@ import websockets
 
 from config_server import ServerConfig
 from core.server.schema import Task
-from core.server.state import ServerState, WorkerState
+from core.server.state import ServerState, TaskLifecycle, WorkerState
 from core.server.worker.task_handler import TaskHandler
+import core.server.connection.ws_recv as ws_recv_module
 from core.server.connection.ws_recv import ws_recv
 from core.server.connection.ws_send import ws_send
 from tests.harness.fake_engine import ProgrammableFakeEngine
@@ -324,6 +325,77 @@ async def test_backpressure_pauses_upload_idle_timer(monkeypatch, server_factory
     finally:
         release.set()
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_compressed_idle_state_version_survives_transition_before_wait(
+    monkeypatch,
+):
+    """背压状态在等待任务启动前变化时，接收循环仍不能误报空闲超时。"""
+    loop = asyncio.get_running_loop()
+    key = ("socket", "task")
+    record = TaskLifecycle(
+        segment_slots=asyncio.Semaphore(0),
+        idle_deadline=loop.time() + 0.05,
+    )
+    # 仅供坏实现使用：模拟旧 Event 在 waiter 启动前经历 clear->set->clear。
+    record.idle_state_event = asyncio.Event()
+    receive_allowed = asyncio.Event()
+    closed = asyncio.Event()
+
+    class ControlledWebSocket:
+        async def recv(self):
+            await receive_allowed.wait()
+            return "audio-frame"
+
+        async def wait_closed(self):
+            await closed.wait()
+
+    websocket = ControlledWebSocket()
+    state = SimpleNamespace(tasks={key: record})
+    consumer = asyncio.create_task(asyncio.sleep(60))
+    real_create_task = asyncio.create_task
+    create_task_count = 0
+    acquiring = None
+
+    def create_task(coro, *args, **kwargs):
+        nonlocal acquiring, create_task_count
+        create_task_count += 1
+        if create_task_count == 2:
+            # 先注入旧 Event 的丢信号序列，再启动真实背压协程。
+            record.idle_state_event.set()
+            record.idle_state_event.clear()
+            acquiring = real_create_task(
+                ws_recv_module._acquire_segment_slot(state, key, websocket)
+            )
+        return real_create_task(coro, *args, **kwargs)
+
+    monkeypatch.setattr(ws_recv_module.asyncio, "create_task", create_task)
+    receiving = real_create_task(
+        ws_recv_module._receive_compressed_frame(websocket, record, consumer)
+    )
+    try:
+        deadline = loop.time() + 1
+        while not record.backpressured:
+            assert loop.time() < deadline
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.08)
+        assert not receiving.done(), "状态转移被吞后不应按原始 deadline 超时"
+
+        receive_allowed.set()
+        assert await receiving == "audio-frame"
+    finally:
+        receive_allowed.set()
+        if not receiving.done():
+            receiving.cancel()
+        await asyncio.gather(receiving, return_exceptions=True)
+        if acquiring is not None and not acquiring.done():
+            record.segment_slots.release()
+        if acquiring is not None:
+            await asyncio.gather(acquiring, return_exceptions=True)
+        closed.set()
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
 
 
 @pytest.mark.asyncio
