@@ -9,6 +9,7 @@ qwen_asr_mlx 引擎单元测试共享夹具。
 """
 import asyncio
 import functools
+import logging
 import multiprocessing
 import sys
 import types
@@ -32,6 +33,57 @@ def pytest_configure(config):
         ConfigValue("120", origin="file", mode="ini"),
     )
     config._inicache.pop("faulthandler_timeout", None)
+
+
+class _CaplogForwarder(logging.Handler):
+    """把 propagate=False 的本仓 logger 补进 caplog。
+
+    pytest 9.1 起会在每个阶段开始时，把 caplog.handler 挂到当时已经存在、
+    且不再向 root 传播的 logger 上。转发前若发现它已经挂上，就跳过，
+    避免同一条日志进 caplog 两次。9.0 只挂 root，必须靠这次转发才能看见。
+    """
+
+    def __init__(self, caplog_handler: logging.Handler) -> None:
+        super().__init__(level=logging.NOTSET)
+        self._caplog_handler = caplog_handler
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._caplog_handler in logging.getLogger(record.name).handlers:
+            return
+        if record.levelno < self._caplog_handler.level:
+            return
+        self._caplog_handler.handle(record)
+
+
+@pytest.fixture(autouse=True)
+def _capture_nonpropagating_repo_loggers(caplog):
+    """测试期间让 core.logger 的具名 logger 能被 caplog 看见。"""
+    from core.logger import Logger
+
+    forwarder = _CaplogForwarder(caplog.handler)
+    attached: list[logging.Logger] = []
+
+    def attach(logger: logging.Logger) -> None:
+        if any(isinstance(handler, _CaplogForwarder) for handler in logger.handlers):
+            return
+        logger.addHandler(forwarder)
+        attached.append(logger)
+
+    for logger in list(Logger._loggers.values()):
+        attach(logger)
+
+    original_setup = Logger.setup
+
+    def setup_with_capture(cls, *args, **kwargs):
+        logger = original_setup.__func__(cls, *args, **kwargs)
+        attach(logger)
+        return logger
+
+    Logger.setup = classmethod(setup_with_capture)
+    yield
+    Logger.setup = original_setup
+    for logger in attached:
+        logger.removeHandler(forwarder)
 
 
 class FakeResult:

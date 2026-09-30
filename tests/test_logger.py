@@ -1,5 +1,6 @@
 # coding: utf-8
 
+import logging
 import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -51,3 +52,26 @@ def test_default_log_dir_is_repo_root(tmp_path):
             logger.removeHandler(handler)
         Logger._loggers.pop(logger_name, None)
         log_file.unlink(missing_ok=True)
+
+
+def test_caplog_captures_nonpropagating_repo_logger(tmp_path, caplog):
+    """阶段开始后才创建的 propagate=False logger，caplog 仍能看到它的记录。
+
+    pytest 9.1 只给阶段开始时已经存在的非传播 logger 挂捕获 handler，
+    这条用来锁住 conftest 里的转发，两种 pytest 组合缺了它都会红。
+    """
+    caplog.set_level(logging.INFO)
+    logger_name = "test-caplog-nonpropagate"
+    logger = Logger.setup(logger_name, log_dir=str(tmp_path), level="INFO")
+    try:
+        assert logger.propagate is False
+        logger.info("task_end synthetic marker")
+        assert any(
+            record.getMessage() == "task_end synthetic marker"
+            for record in caplog.records
+        )
+    finally:
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+        Logger._loggers.pop(logger_name, None)
