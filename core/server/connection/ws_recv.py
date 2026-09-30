@@ -242,8 +242,10 @@ async def _acquire_segment_slot(state, key, websocket) -> bool:
     try:
         if not acquire.done():
             paused_at = asyncio.get_running_loop().time()
-            record.backpressured = True
-            record.idle_state_event.set()
+            async with record.idle_state_condition:
+                record.backpressured = True
+                record.idle_state_version += 1
+                record.idle_state_condition.notify_all()
         done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
         if terminal in done or closed in done or record.status in {'DONE', 'FAILED'}:
             if acquire.done() and acquire.result():
@@ -256,8 +258,10 @@ async def _acquire_segment_slot(state, key, websocket) -> bool:
         if paused_at is not None:
             if record.status == 'RECEIVING' and record.idle_deadline is not None:
                 record.idle_deadline += asyncio.get_running_loop().time() - paused_at
-            record.backpressured = False
-            record.idle_state_event.set()
+            async with record.idle_state_condition:
+                record.backpressured = False
+                record.idle_state_version += 1
+                record.idle_state_condition.notify_all()
         for waiter in waiters:
             if not waiter.done():
                 waiter.cancel()
@@ -490,11 +494,18 @@ async def _receive_compressed_frame(websocket, record, consumer):
             if consumer.done():
                 consumer.result()
                 raise RuntimeError('压缩音频消费协程在末帧前结束')
-            record.idle_state_event.clear()
+            seen_idle_state_version = record.idle_state_version
             timeout = None if record.backpressured else max(
                 0.0, record.idle_deadline - asyncio.get_running_loop().time()
             )
-            changed = asyncio.create_task(record.idle_state_event.wait())
+
+            async def wait_for_idle_state_change():
+                async with record.idle_state_condition:
+                    await record.idle_state_condition.wait_for(
+                        lambda: record.idle_state_version != seen_idle_state_version
+                    )
+
+            changed = asyncio.create_task(wait_for_idle_state_change())
             done, _ = await asyncio.wait(
                 (receive, changed, consumer),
                 timeout=timeout,

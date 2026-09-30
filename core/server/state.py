@@ -29,7 +29,8 @@ class TaskLifecycle:
     status: str = 'RECEIVING'
     segment_slots: asyncio.Semaphore | None = None
     terminal_event: asyncio.Event = field(default_factory=asyncio.Event)
-    idle_state_event: asyncio.Event = field(default_factory=asyncio.Event)
+    idle_state_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    idle_state_version: int = 0
     idle_deadline: float | None = None
     backpressured: bool = False
     started_at: float = field(default_factory=time.monotonic)
