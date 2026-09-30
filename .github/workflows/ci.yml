@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
-          pip install numpy rich "${{ matrix.websockets }}" colorama pytest soundfile pytest-asyncio
+          pip install numpy rich "${{ matrix.websockets }}" colorama "pytest>=9.1.1" soundfile "pytest-asyncio>=1.4.0"
 
       - name: 打印 websockets 版本
         run: python -c "import websockets; print(websockets.__version__)"
