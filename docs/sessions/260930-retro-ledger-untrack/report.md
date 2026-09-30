@@ -74,7 +74,7 @@ ERROR: Repository not found.
 fatal: Could not read from remote repository.
 ```
 
-随后向规范 `origin` 推送，按预期被公开内容扫描阻断：
+随后先向规范 `origin` 推送，按预期被公开内容扫描阻断：
 
 ```text
 pre-push public-scan blocked: docs/sessions/260930-retro-ledger-untrack/report.md:89:local_absolute_path
@@ -83,7 +83,14 @@ pre-push public-scan: public content rejected
 error: failed to push some refs
 ```
 
-目标分支未产生远端命中；扫描阻断发生在推送写入前，因此没有创建 draft PR。修正本报告后仍需由主脑决定是否以公开安全的报告再次尝试推送。
+读取远端确认该次阻断没有产生分支。移除报告中的本机路径和用户名后再次推送成功：
+
+```text
+To github.com:zlxlabs/CapsWriter-ASR-Server.git
+ * [new branch]      HEAD -> card/retro-ledger-untrack-260930
+```
+
+已创建指向 `master` 的草稿 PR：[PR #34](https://github.com/zlxlabs/CapsWriter-ASR-Server/pull/34)。
 
 ## 接手巡检记录
 
