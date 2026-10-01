@@ -26,13 +26,26 @@ class RecognizerWorker:
     
     统一调度模型加载器与任务处理器，负责识别进程的完整运行。
     """
-    def __init__(self, queue_in: Queue, queue_out: Queue, sockets_id: ListProxy, stdin_fn: int = None):
+    def __init__(
+        self,
+        queue_in: Queue,
+        queue_out: Queue,
+        sockets_id: ListProxy,
+        stdin_fn: int = None,
+        active_http_jobs: ListProxy = None,
+    ):
         # 1. 初始化核心状态
         self.state = WorkerState()
         
         # 2. 初始化核心组件 (注入 state)
         self.loader = ModelLoader()
-        self.handler = TaskHandler(queue_in, queue_out, sockets_id, self.state)
+        self.handler = TaskHandler(
+            queue_in,
+            queue_out,
+            sockets_id,
+            self.state,
+            active_http_jobs,
+        )
         
         # 3. 状态追踪
         self.stdin_fn = stdin_fn

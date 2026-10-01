@@ -10,9 +10,21 @@ from multiprocessing.managers import ListProxy
 from .. import logger
 from .worker import RecognizerWorker
 
-def start_worker(queue_in: Queue, queue_out: Queue, sockets_id: ListProxy, stdin_fn: int):
+def start_worker(
+    queue_in: Queue,
+    queue_out: Queue,
+    sockets_id: ListProxy,
+    stdin_fn: int,
+    active_http_jobs: ListProxy = None,
+):
     """识别子进程启动入口"""
-    worker = RecognizerWorker(queue_in, queue_out, sockets_id, stdin_fn)
+    worker = RecognizerWorker(
+        queue_in,
+        queue_out,
+        sockets_id,
+        stdin_fn,
+        active_http_jobs,
+    )
     worker.run()
 
 __all__ = ['RecognizerWorker', 'start_worker']

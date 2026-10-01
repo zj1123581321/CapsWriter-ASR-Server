@@ -24,6 +24,7 @@ class Task:
         overlap: 片段重叠时间（秒），用于去重
         task_id: 任务唯一标识
         socket_id: WebSocket 连接标识
+        owner_kind: 任务归属类型（'ws' 或 'http'）
         is_final: 是否为音频流的最后一个片段
         time_start: 录音/音频开始时间戳
         time_submit: 任务提交时间戳
@@ -42,6 +43,7 @@ class Task:
     language: str = 'auto'
     samplerate: int = 16000
     command: str = ''           # 特殊命令，如 'gpu_boost' / 'gpu_unboost'
+    owner_kind: str = 'ws'
 
 
 @dataclass
@@ -54,6 +56,7 @@ class Result:
     Attributes:
         task_id: 任务唯一标识
         socket_id: WebSocket 连接标识
+        owner_kind: 任务归属类型（'ws' 或 'http'）
         source: 音频来源 ('mic' 或 'file')
         duration: 已处理的音频总时长（秒）
         time_start: 录音/音频开始时间戳
@@ -87,6 +90,7 @@ class Result:
     is_final: bool = False
     error_code: str = ''
     error_message: str = ''
+    owner_kind: str = 'ws'
 
 @dataclass
 class RecognitionSession:

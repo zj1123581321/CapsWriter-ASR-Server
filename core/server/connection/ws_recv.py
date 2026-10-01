@@ -20,11 +20,13 @@ from ..state import console
 from ..state import (
     begin_task,
     ensure_server_runtime,
+    make_task_key,
     register_segment_submission,
     transition_terminal,
     set_task_draining,
 )
 from ..schema import Task
+from ..segmenter import PcmSegmenter
 from config_server import (
     ServerConfig as Config,
     Qwen3ASRGGUFArgs,
@@ -45,39 +47,23 @@ MAX_AUDIO_FRAME_BYTES = 64 * 1024 * 1024
 SAMPLES_TOTAL_TOLERANCE = 16000
 
 
-class AudioCache:
+class AudioCache(PcmSegmenter):
     """
     音频缓冲区
 
     用于缓存接收到的音频数据，直到达到分段阈值后提交处理。
     """
     def __init__(self):
-        self.chunks: bytes = b''    # 音频数据缓冲
-        self.offset: float = 0.0    # 当前偏移时间（秒）
-        self.byte_count: int = 0    # 累计接收字节数
-        self.search_to: float = 0.0 # 切点吸附已搜索到的位置（秒），避免重复扫描
+        super().__init__()
         self.task_id: str | None = None
         self.segmentation_params: tuple[float, float] | None = None
         self.started = False
         self.decoder: AudioDecoder | None = None
         self.decoder_task: asyncio.Task | None = None
 
-    @property
-    def duration(self) -> float:
-        """缓冲区音频时长（秒）"""
-        return AudioFormat.bytes_to_seconds(len(self.chunks))
-
-    @property
-    def total_duration(self) -> float:
-        """累计接收的音频总时长（秒）"""
-        return AudioFormat.bytes_to_seconds(self.byte_count)
-
     def reset(self) -> None:
         """重置缓冲区"""
-        self.chunks = b''
-        self.offset = 0.0
-        self.byte_count = 0
-        self.search_to = 0.0
+        super().reset()
         self.task_id = None
         self.segmentation_params = None
         self.started = False
@@ -165,66 +151,31 @@ async def _submit_segments(
     - mic 任务：音频按 1 倍速实时到达，只在已有缓冲内就地取最优点，
       绝不额外等待，不增加实时反馈延迟。
     """
-    nominal, overlap = msg.seg_duration, msg.seg_overlap
-
-    if not Config.seg_cut_snap:
-        # 固定时长盲切（原始行为）
-        limit = _engine_segment_limit()
-        final_limit = limit if limit is not None else nominal + overlap
-        while (
-            cache.duration > final_limit
-            if is_final
-            else cache.duration >= nominal + overlap * 2
-        ):
-            if not await _cut_and_submit(
-                msg, cache, queue_in, socket_id, cut=nominal, state=state,
-                websocket=state.sockets.get(socket_id) if state is not None else None,
-            ):
-                return False
-        return True
-
-    w_before, w_after = Config.seg_search_before, Config.seg_search_after
-    max_cut = max(Config.seg_max_cut, nominal + w_after)
-    lo = max(nominal - w_before, min(nominal, 1.0))
-    limit = _engine_segment_limit()
-    final_limit = limit if limit is not None else max_cut + overlap
-    finder = get_cut_finder()
-    loop = asyncio.get_running_loop()
-
-    while True:
-        if is_final:
-            if cache.duration <= final_limit:
-                return True
-        elif cache.duration < nominal + w_after + overlap:
-            return True
-
-        if msg.source == 'file':
-            hi = min(cache.duration - overlap, max_cut)
-            # 弹性等待期间没有新增可搜索区域时，等下一条消息再扫
-            if not is_final and hi < max_cut and hi <= cache.search_to:
-                return True
-        else:
-            hi = nominal + w_after
-
-        cut, confident = await loop.run_in_executor(
-            None, finder.find, cache.chunks, lo, hi, nominal
-        )
-
-        if not is_final and not confident and msg.source == 'file' and hi < max_cut:
-            cache.search_to = hi
-            logger.debug(f"切点吸附: [{lo:.1f}, {hi:.1f}]s 无可信断点，等待更多音频延长搜索")
-            return True
-        if confident:
-            logger.debug(f"切点吸附: 名义 {nominal}s，在 {cut:.2f}s 找到静音断点")
-        else:
-            logger.info(f"切点吸附: [{lo:.1f}, {hi:.1f}]s 内无可信静音断点，取最低分点 {cut:.2f}s 下刀")
-
-        cache.search_to = 0.0
-        if not await _cut_and_submit(
-            msg, cache, queue_in, socket_id, cut=cut, state=state,
+    cache.configure(
+        cut_finder=get_cut_finder() if Config.seg_cut_snap else None,
+        engine_segment_limit=_engine_segment_limit(),
+        cut_snap=Config.seg_cut_snap,
+        search_before=Config.seg_search_before,
+        search_after=Config.seg_search_after,
+        max_cut=Config.seg_max_cut,
+    )
+    segments = await cache.drain_ready(
+        source=msg.source,
+        nominal=msg.seg_duration,
+        overlap=msg.seg_overlap,
+        is_final=is_final,
+    )
+    for segment in segments:
+        if not await _submit_pcm_segment(
+            msg,
+            segment,
+            queue_in,
+            socket_id,
+            state=state,
             websocket=state.sockets.get(socket_id) if state is not None else None,
         ):
             return False
+    return True
 
 
 async def _acquire_segment_slot(state, key, websocket) -> bool:
@@ -268,52 +219,43 @@ async def _acquire_segment_slot(state, key, websocket) -> bool:
         await asyncio.gather(*waiters, return_exceptions=True)
 
 
-async def _cut_and_submit(
+async def _submit_pcm_segment(
     msg: AudioMessage,
-    cache: AudioCache,
+    segment,
     queue_in,
     socket_id: str,
-    cut: float,
     state=None,
     websocket=None,
 ) -> bool:
-    """从缓冲区头部切出 [0, cut+overlap] 提交识别，缓冲区前移 cut 秒。"""
-    n_stride = int(round(cut * AudioFormat.SAMPLE_RATE))
-    n_segment = n_stride + int(round(msg.seg_overlap * AudioFormat.SAMPLE_RATE))
-    stride_bytes = n_stride * AudioFormat.BYTES_PER_SAMPLE
-    segment_bytes = n_segment * AudioFormat.BYTES_PER_SAMPLE
-
-    segment_data = cache.chunks[:segment_bytes]
-    _assert_segment_within_limit(len(segment_data) / AudioFormat.BYTES_PER_SECOND)
-    cache.chunks = cache.chunks[stride_bytes:]
-
+    """把共享 PCM 段绑定到真实 WS Task 并提交到 multiprocessing Queue。"""
+    key = make_task_key('ws', msg.task_id, socket_id)
     task = Task(
         type=msg.source,
-        data=segment_data,
-        offset=cache.offset,
-        task_id=msg.task_id,
+        data=segment.data,
+        offset=segment.offset,
+        task_id=key[2],
         socket_id=socket_id,
-        overlap=msg.seg_overlap,
-        is_final=False,
+        overlap=segment.overlap,
+        is_final=segment.is_final,
         time_start=msg.time_start,
         time_submit=time.time(),
         context=msg.context,
         language=msg.language,
+        owner_kind='ws',
     )
-    cache.offset += stride_bytes / AudioFormat.BYTES_PER_SECOND
     if state is not None and not await _acquire_segment_slot(
-        state, (socket_id, msg.task_id), websocket
+        state, key, websocket
     ):
         return False
     queue_in.put(task)
     if state is not None:
-        record = state.tasks.get((socket_id, msg.task_id))
+        record = state.tasks.get(key)
         if record is not None:
             record.segments += 1
-        register_segment_submission(state, (socket_id, msg.task_id), time.monotonic())
+        register_segment_submission(state, key, time.monotonic())
     logger.debug(
-        f"提交音频片段，任务ID: {msg.task_id}, 切点: {cut:.2f}s, "
-        f"偏移: {cache.offset}s, 缓冲区: {len(cache.chunks)} bytes"
+        f"提交音频片段，任务ID: {msg.task_id}, 切点: {segment.offset:.2f}s, "
+        f"偏移: {segment.offset}s, 数据大小: {len(segment.data)} bytes"
     )
     return True
 
@@ -329,7 +271,7 @@ def _check_task_duration(samples: int) -> None:
 
 
 async def _consume_compressed_pcm(websocket, msg, cache, app) -> bool:
-    key = (str(websocket.id), msg.task_id)
+    key = make_task_key('ws', msg.task_id, str(websocket.id))
     async for pcm in cache.decoder.pcm_chunks():
         data = pcm.astype('<f4', copy=False).tobytes()
         cache.chunks += data
@@ -338,7 +280,7 @@ async def _consume_compressed_pcm(websocket, msg, cache, app) -> bool:
         record.samples_total = cache.byte_count // AudioFormat.BYTES_PER_SAMPLE
         _check_task_duration(record.samples_total)
         if not await _submit_segments(
-            msg, cache, app.state.queue_in, key[0], app.state
+            msg, cache, app.state.queue_in, key[1], app.state
         ):
             return False
     return True
@@ -376,28 +318,30 @@ async def _submit_final_audio(websocket, msg, cache, app, socket_id: str) -> boo
         msg, cache, app.state.queue_in, socket_id, app.state, is_final=True
     ):
         return False
-    _assert_segment_within_limit(cache.duration)
+    segment = cache.final_segment(msg.seg_overlap)
+    key = make_task_key('ws', msg.task_id, socket_id)
     task = Task(
         type=msg.source,
-        data=cache.chunks,
-        offset=cache.offset,
-        task_id=msg.task_id,
+        data=segment.data,
+        offset=segment.offset,
+        task_id=key[2],
         socket_id=socket_id,
-        overlap=msg.seg_overlap,
-        is_final=True,
+        overlap=segment.overlap,
+        is_final=segment.is_final,
         time_start=msg.time_start,
         time_submit=time.time(),
         context=msg.context,
         language=msg.language,
+        owner_kind='ws',
     )
     if not await _acquire_segment_slot(
-        app.state, (socket_id, msg.task_id), websocket
+        app.state, key, websocket
     ):
         return False
     app.state.queue_in.put(task)
-    app.state.tasks[(socket_id, msg.task_id)].segments += 1
-    register_segment_submission(app.state, (socket_id, msg.task_id), time.monotonic())
-    logger.debug(f"提交最终片段，任务ID: {msg.task_id}, 数据大小: {len(cache.chunks)} bytes")
+    app.state.tasks[key].segments += 1
+    register_segment_submission(app.state, key, time.monotonic())
+    logger.debug(f"提交最终片段，任务ID: {msg.task_id}, 数据大小: {len(segment.data)} bytes")
     cache.reset()
     return True
 
@@ -418,7 +362,7 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
     global status_mic
     state = app.state
     queue_in = state.queue_in
-    key = (str(websocket.id), msg.task_id)
+    key = make_task_key('ws', msg.task_id, str(websocket.id))
     record = state.tasks[key]
     is_start = not cache.started
     cache.started = True
@@ -426,8 +370,8 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
     if is_start and msg.source == 'mic' and Config.gpu_boost_enabled:
         queue_in.put(Task(
             type='cmd', task_id='gpu_boost', data=b'', offset=0, overlap=0,
-            socket_id=key[0], is_final=False, time_start=0, time_submit=0,
-            command='gpu_boost'
+            socket_id=key[1], is_final=False, time_start=0, time_submit=0,
+            command='gpu_boost', owner_kind='ws',
         ))
 
     encoding = msg.encoding or 'f32le'
@@ -458,9 +402,9 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
             elif is_start:
                 console.print('正在接收音频文件...')
                 logger.info(f"开始接收音频文件，任务ID: {msg.task_id}")
-            return await _submit_segments(msg, cache, queue_in, key[0], state)
+            return await _submit_segments(msg, cache, queue_in, key[1], state)
         _verify_samples_total(msg, record)
-        return await _submit_final_audio(websocket, msg, cache, app, key[0])
+        return await _submit_final_audio(websocket, msg, cache, app, key[1])
 
     if cache.decoder_task is None:
         cache.decoder_task = asyncio.create_task(
@@ -483,7 +427,7 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
         return False
     record.samples_total = cache.decoder.samples_emitted
     _verify_samples_total(msg, record)
-    return await _submit_final_audio(websocket, msg, cache, app, key[0])
+    return await _submit_final_audio(websocket, msg, cache, app, key[1])
 
 
 async def _receive_compressed_frame(websocket, record, consumer):
@@ -590,7 +534,7 @@ async def ws_recv(websocket, app) -> None:
                 if active is not None:
                     await _cancel_audio_cache(cache)
                     await queue_error_and_close(
-                        state, websocket, socket_id, active[1], 'bad_request',
+                        state, websocket, socket_id, active[2], 'bad_request',
                         'upload idle timeout', False,
                     )
                 return
@@ -598,7 +542,7 @@ async def ws_recv(websocket, app) -> None:
                 if active is not None:
                     await _cancel_audio_cache(cache)
                     await queue_error_and_close(
-                        state, websocket, socket_id, active[1], e.code,
+                        state, websocket, socket_id, active[2], e.code,
                         e.message, False,
                     )
                 return
@@ -618,8 +562,8 @@ async def ws_recv(websocket, app) -> None:
                 if active:
                     await _cancel_audio_cache(cache)
                     transition_terminal(state, active, 'FAILED', code='bad_request')
-                if task_id and active != (socket_id, task_id):
-                    malformed_key = (socket_id, task_id)
+                malformed_key = make_task_key('ws', task_id, socket_id) if task_id else None
+                if malformed_key is not None and active != malformed_key:
                     begin_task(state, malformed_key)
                     transition_terminal(state, malformed_key, 'FAILED', code='bad_request')
                 await queue_error_and_close(
@@ -628,7 +572,7 @@ async def ws_recv(websocket, app) -> None:
                 )
                 return
 
-            key = (socket_id, msg.task_id)
+            key = make_task_key('ws', msg.task_id, socket_id)
             active = state.connection_tasks.get(socket_id)
             if active is not None and active != key:
                 await _cancel_audio_cache(cache)
@@ -637,7 +581,7 @@ async def ws_recv(websocket, app) -> None:
                 transition_terminal(state, key, 'FAILED', code='task_conflict')
                 await queue_error_and_close(
                     state, websocket, socket_id, msg.task_id, 'task_conflict',
-                    f"连接上任务 {active[1]} 尚未终结，不能开始任务 {msg.task_id}", False,
+                    f"连接上任务 {active[2]} 尚未终结，不能开始任务 {msg.task_id}", False,
                 )
                 return
 
@@ -736,7 +680,7 @@ async def ws_recv(websocket, app) -> None:
         if active:
             await _cancel_audio_cache(cache)
             await queue_error_and_close(
-                state, websocket, socket_id, active[1], 'internal',
+                state, websocket, socket_id, active[2], 'internal',
                 f"{type(e).__name__}: {e}", True,
             )
     finally:
@@ -750,7 +694,7 @@ async def ws_recv(websocket, app) -> None:
         active = state.connection_tasks.get(socket_id)
         if active:
             transition_terminal(state, active, 'FAILED')
-        for key in [key for key in state.tasks if key[0] == socket_id]:
+        for key in [key for key in state.tasks if key[0] == 'ws' and key[1] == socket_id]:
             state.tasks.pop(key, None)
             state.pending_segments.pop(key, None)
         state.connection_tasks.pop(socket_id, None)

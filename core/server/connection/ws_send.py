@@ -4,6 +4,8 @@ from ..schema import Result
 from ..state import (
     acknowledge_segment_result,
     ensure_server_runtime,
+    make_task_key,
+    task_key_from_result,
     transition_terminal,
 )
 from core.protocol import ErrorMessage, RecognitionMessage
@@ -40,7 +42,13 @@ def schedule_error_close(
 ) -> asyncio.Task:
     """将 error 放入单连接队列，并安排队列冲刷后关闭连接。"""
     ensure_server_runtime(state)
-    transition_terminal(state, (socket_id, task_id), 'FAILED', code=code)
+    if task_id:
+        transition_terminal(
+            state,
+            make_task_key('ws', task_id, socket_id),
+            'FAILED',
+            code=code,
+        )
     outbound = state.out_queues.get(socket_id)
     if outbound is None:
         logger.debug(f"连接 {socket_id} 无出站队列，直接关闭 code={code}")
@@ -77,12 +85,12 @@ async def fail_active_tasks(state, code: str, message: str, *, skip_key=None) ->
     for key, record in list(state.tasks.items()):
         if key == skip_key or record.status in {'DONE', 'FAILED'}:
             continue
-        websocket = state.sockets.get(key[0])
+        websocket = state.sockets.get(key[1]) if key[0] == 'ws' else None
         if websocket is None:
             transition_terminal(state, key, 'FAILED')
             continue
         closing.append(schedule_error_close(
-            state, websocket, key[0], key[1], code, message, True
+            state, websocket, key[1], key[2], code, message, True
         ))
     if closing:
         await asyncio.wait_for(asyncio.gather(*closing), timeout=15)
@@ -123,14 +131,42 @@ async def ws_send(app):
         if result is True:
             continue
 
-        key = (result.socket_id, result.task_id)
+        key = task_key_from_result(result)
         record = state.tasks.get(key)
-        if record is None or record.status in {'DONE', 'FAILED'}:
-            logger.debug(f"丢弃终态或无主迟到结果 task={result.task_id} socket={result.socket_id}")
+        if record is None:
+            if result.owner_kind == 'http':
+                raise RuntimeError(
+                    f"HTTP 结果没有对应活动任务: task={result.task_id}"
+                )
+            logger.debug(
+                f"丢弃终态或无主迟到结果 task={result.task_id} "
+                f"socket={result.socket_id}"
+            )
+            continue
+        if record.status in {'DONE', 'FAILED'}:
+            logger.debug(
+                f"丢弃终态或无主迟到结果 task={result.task_id} "
+                f"socket={result.socket_id}"
+            )
+            continue
+
+        if result.owner_kind == 'http':
+            sink = state.http_result_sink
+            if sink is None:
+                raise RuntimeError('HTTP 结果持久消费者未注入')
+            await sink(result)
+            acknowledge_segment_result(state, key)
+            if result.error_code:
+                transition_terminal(
+                    state, key, 'FAILED', code=result.error_code
+                )
+            elif result.is_final:
+                transition_terminal(state, key, 'DONE')
+            logger.debug(f"已提交 HTTP 识别结果 task={result.task_id}")
             continue
 
         acknowledge_segment_result(state, key)
-        websocket = state.sockets.get(result.socket_id)
+        websocket = state.sockets.get(key[1])
         outbound = state.out_queues.get(result.socket_id)
         if websocket is None or outbound is None:
             logger.debug(f"客户端 {result.socket_id} 已断开，丢弃结果 task={result.task_id}")
