@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -61,6 +62,24 @@ def _upload(store: HttpStore, payload: bytes, token: str = "token-a", create_key
     )
 
 
+def _final_result(job_id: str, text: str = "已完成") -> dict:
+    return {
+        "task_id": job_id,
+        "socket_id": "",
+        "type": "file",
+        "owner_kind": "http",
+        "duration": 1.0,
+        "time_start": 1.0,
+        "time_submit": 2.0,
+        "time_complete": 3.0,
+        "text": text,
+        "text_accu": text,
+        "tokens": [text],
+        "timestamps": [0.1],
+        "is_final": True,
+    }
+
+
 def test_create_is_exclusive_file_then_zero_offset_commit(tmp_path):
     payload = b"abcdefghij" * 10
     with HttpStore(tmp_path / "data") as store:
@@ -93,6 +112,50 @@ def test_append_fsync_offset_transaction_and_ack_order(tmp_path):
         assert ahead.value.confirmed_offset == 4
         assert store.append_bytes(record.upload_id, "token-a", 4, payload[4:]) == 10
         assert source.read_bytes() == payload
+
+
+def test_append_uses_portable_positioned_write_and_completes_short_writes(tmp_path, monkeypatch):
+    payload = b"portable-write-payload"
+    with HttpStore(tmp_path / "data") as store:
+        record = _upload(store, payload)
+        original_write = os.write
+
+        def short_write(fd, data):
+            return original_write(fd, data[:max(1, len(data) // 2)])
+
+        # 旧实现会调用 pwrite；让它声称写入成功但不写字节，最终文件字节断言必须变红。
+        with monkeypatch.context() as mutation:
+            mutation.setattr(os, "write", short_write)
+            mutation.setattr(os, "pwrite", lambda _fd, data, _offset: len(data), raising=False)
+            assert store.append_bytes(record.upload_id, "token-a", 0, payload) == len(payload)
+        source = tmp_path / "data" / "sources" / f"{record.upload_id}.bin"
+        assert source.read_bytes() == payload
+        assert store.get_upload(record.upload_id, "token-a").confirmed_offset == len(payload)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not Windows ACL proof")
+def test_http_store_files_are_private_under_umask_0002(tmp_path):
+    data_dir = tmp_path / "private-data"
+    previous_umask = os.umask(0o002)
+    try:
+        with HttpStore(data_dir) as store:
+            payload = b"private-source"
+            record = _upload(store, payload)
+            store.append_bytes(record.upload_id, "token-a", 0, payload)
+            source = data_dir / "sources" / f"{record.upload_id}.bin"
+            targets = {
+                data_dir: 0o700,
+                data_dir / "sources": 0o700,
+                data_dir / "http.lock": 0o600,
+                data_dir / "http.sqlite3": 0o600,
+                data_dir / "http.sqlite3-wal": 0o600,
+                data_dir / "http.sqlite3-shm": 0o600,
+                source: 0o600,
+            }
+            modes = {path: stat.S_IMODE(path.stat().st_mode) for path in targets}
+            assert modes == targets
+    finally:
+        os.umask(previous_umask)
 
 
 def test_unconfirmed_tail_is_truncated_to_database_offset(tmp_path):
@@ -199,11 +262,7 @@ def test_restart_converges_queued_and_running_but_keeps_partial_and_done(tmp_pat
         done = _upload(store, payload, token="token-d", create_key="key-d")
         store.append_bytes(done.upload_id, "token-d", 0, payload)
         job_d = store.commit_upload(done.upload_id, "token-d")
-        store.record_result(job_d.job_id, {
-            "task_id": job_d.job_id, "text": "已完成", "tokens": [], "timestamps": [],
-            "duration": 1.0, "time_start": 1.0, "time_submit": 2.0, "time_complete": 3.0,
-            "text_accu": "已完成", "is_final": True,
-        })
+        store.record_result(job_d.job_id, _final_result(job_d.job_id))
     finally:
         store.close()
 
@@ -224,6 +283,80 @@ def test_restart_converges_queued_and_running_but_keeps_partial_and_done(tmp_pat
         assert reopened.get_upload(queued.upload_id, "token-q").state == "COMMITTED"
     finally:
         reopened.close()
+
+
+def test_record_result_requires_matching_complete_payload_and_preserves_terminal_jobs(tmp_path):
+    payload = b"result-source"
+    store = HttpStore(tmp_path / "data", inference_ready=lambda: True).open()
+    try:
+        upload = _upload(store, payload, token="result-token", create_key="result-key")
+        store.append_bytes(upload.upload_id, "result-token", 0, payload)
+        job = store.commit_upload(upload.upload_id, "result-token")
+
+        with pytest.raises(HttpStoreError) as mismatch:
+            store.record_result(job.job_id, _final_result("different-task"))
+        assert mismatch.value.code == "invalid_result"
+        partial = _final_result(job.job_id)
+        partial["is_final"] = False
+        with pytest.raises(HttpStoreError) as unfinished:
+            store.record_result(job.job_id, partial)
+        assert unfinished.value.code == "invalid_result"
+        missing_field = _final_result(job.job_id)
+        del missing_field["timestamps"]
+        with pytest.raises(HttpStoreError) as incomplete:
+            store.record_result(job.job_id, missing_field)
+        assert incomplete.value.code == "invalid_result"
+        assert store.conn.execute(
+            "SELECT state FROM jobs WHERE job_id=?", (job.job_id,)
+        ).fetchone()["state"] == "QUEUED"
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM results WHERE job_id=?", (job.job_id,)
+        ).fetchone()[0] == 0
+
+        store.record_result(job.job_id, _final_result(job.job_id))
+        before_job = dict(store.conn.execute(
+            "SELECT state, time_complete, terminal_at, started_at FROM jobs WHERE job_id=?",
+            (job.job_id,),
+        ).fetchone())
+        before_payload = store.conn.execute(
+            "SELECT payload FROM results WHERE job_id=?", (job.job_id,)
+        ).fetchone()["payload"]
+        for text in ("迟到覆盖一", "迟到覆盖二"):
+            with pytest.raises(HttpStoreError) as duplicate:
+                store.record_result(job.job_id, _final_result(job.job_id, text))
+            assert duplicate.value.code == "result_terminal"
+        after_job = dict(store.conn.execute(
+            "SELECT state, time_complete, terminal_at, started_at FROM jobs WHERE job_id=?",
+            (job.job_id,),
+        ).fetchone())
+        after_payload = store.conn.execute(
+            "SELECT payload FROM results WHERE job_id=?", (job.job_id,)
+        ).fetchone()["payload"]
+        assert after_job == before_job
+        assert after_payload == before_payload
+
+        failed_upload = _upload(store, payload, token="failed-token", create_key="failed-key")
+        store.append_bytes(failed_upload.upload_id, "failed-token", 0, payload)
+        failed = store.commit_upload(failed_upload.upload_id, "failed-token")
+        store.conn.execute(
+            "UPDATE jobs SET state='FAILED', error_code='probe' WHERE job_id=?", (failed.job_id,)
+        )
+        failed_before = dict(store.conn.execute(
+            "SELECT state, error_code, time_complete, terminal_at FROM jobs WHERE job_id=?",
+            (failed.job_id,),
+        ).fetchone())
+        with pytest.raises(HttpStoreError) as terminal:
+            store.record_result(failed.job_id, _final_result(failed.job_id))
+        assert terminal.value.code == "result_terminal"
+        assert dict(store.conn.execute(
+            "SELECT state, error_code, time_complete, terminal_at FROM jobs WHERE job_id=?",
+            (failed.job_id,),
+        ).fetchone()) == failed_before
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM results WHERE job_id=?", (failed.job_id,)
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
 
 
 def test_expired_upload_is_410_and_metadata_kept(tmp_path):

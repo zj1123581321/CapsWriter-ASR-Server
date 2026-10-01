@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -144,12 +145,23 @@ def token_matches(stored_hash: str, token: str) -> bool:
     return hmac.compare_digest(stored_hash, hash_token(token))
 
 
+def _ensure_private_file(path: Path) -> None:
+    """POSIX 下以 0600 建立或收紧 HTTP 持久文件，不受进程 umask 放宽。"""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
 def _acquire_exclusive_lock(lock_path: Path):
     """在 POSIX 上用 flock、在 Windows 上用 msvcrt 对单目录持有 OS 独占锁。
 
     不删除 PID 锁猜活跃：拿不到就是拿不到，直接 fail fast。
     """
     handle = open(lock_path, "a+b")
+    if os.name == "posix":
+        os.fchmod(handle.fileno(), 0o600)
     try:
         if os.name == "nt":  # pragma: no cover - Windows 部署路径
             import msvcrt
@@ -187,7 +199,13 @@ class HttpStore:
         if not self.data_dir.is_absolute():  # pragma: no cover - 由 resolve_http_settings 先行拦截
             raise HttpStoreError("invalid_data_dir", "HTTP 数据目录必须是稳定绝对路径", status=500)
         self.sources_dir.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(self.data_dir, 0o700)
+            os.chmod(self.sources_dir, 0o700)
         self._lock_handle = _acquire_exclusive_lock(self.lock_path)
+        if os.name == "posix":
+            for path in (self.db_path, Path(f"{self.db_path}-wal"), Path(f"{self.db_path}-shm")):
+                _ensure_private_file(path)
         conn = sqlite3.connect(self.db_path, timeout=0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -414,6 +432,8 @@ class HttpStore:
         path = self._source_path(source_name)
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         try:
+            if os.name == "posix":
+                os.fchmod(fd, 0o600)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -471,9 +491,13 @@ class HttpStore:
         try:
             # 未确认尾显式恢复：先按数据库 offset 截断，再写新块，绝不以文件长度冒充确认
             os.ftruncate(fd, confirmed)
+            os.lseek(fd, confirmed, os.SEEK_SET)
             written = 0
             while written < len(payload):
-                written += os.pwrite(fd, payload[written:], confirmed + written)
+                count = os.write(fd, payload[written:])
+                if count == 0:
+                    raise OSError("HTTP 文件写入未取得进展")
+                written += count
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -576,6 +600,37 @@ class HttpStore:
 
     def record_result(self, job_id: str, result: dict) -> None:
         """完整 result 与 DONE 必须同一次提交（供 E3 runner 使用，本增量不主动调用）。"""
+        if not isinstance(result, dict):
+            raise HttpStoreError("invalid_result", "识别结果必须是对象", status=422)
+        numeric_fields = ("duration", "time_start", "time_submit", "time_complete")
+        numeric_values = [result.get(field) for field in numeric_fields]
+        tokens = result.get("tokens")
+        timestamps = result.get("timestamps")
+        valid_numbers = all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            and (not isinstance(value, float) or math.isfinite(value))
+            for value in numeric_values
+        )
+        valid_timestamps = (
+            isinstance(timestamps, list)
+            and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and (not isinstance(value, float) or math.isfinite(value)) for value in timestamps)
+        )
+        if (
+            result.get("task_id") != job_id
+            or result.get("type") != "file"
+            or result.get("socket_id") != ""
+            or result.get("owner_kind") != "http"
+            or result.get("is_final") is not True
+            or not isinstance(result.get("text"), str)
+            or not isinstance(result.get("text_accu"), str)
+            or not isinstance(tokens, list)
+            or not all(isinstance(token, str) for token in tokens)
+            or not valid_timestamps
+            or len(tokens) != len(timestamps)
+            or not valid_numbers
+        ):
+            raise HttpStoreError("invalid_result", "识别结果字段与完整文件任务不匹配", status=422)
         payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         if len(payload.encode("utf-8")) > MAX_RESULT_BYTES:
             raise HttpStoreError("result_too_large", "识别结果超过 64 MiB 上限", status=507)
@@ -583,14 +638,19 @@ class HttpStore:
         conn = self.conn
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                "INSERT OR REPLACE INTO results(job_id, payload) VALUES(?,?)", (job_id, payload)
-            )
-            conn.execute(
+            job = conn.execute("SELECT state FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if job is None:
+                raise HttpStoreError("unknown_job", "没有对应的 HTTP 文件任务", status=404)
+            if job["state"] not in (JOB_QUEUED, JOB_RUNNING):
+                raise HttpStoreError("result_terminal", "终态任务不能发布或覆盖结果", status=409)
+            cursor = conn.execute(
                 "UPDATE jobs SET state=?, time_complete=?, terminal_at=?, started_at=COALESCE(started_at, ?)"
-                " WHERE job_id=? AND state != ?",
-                (JOB_DONE, now, now, now, job_id, JOB_DONE),
+                " WHERE job_id=? AND state IN (?,?)",
+                (JOB_DONE, now, now, now, job_id, JOB_QUEUED, JOB_RUNNING),
             )
+            if cursor.rowcount != 1:
+                raise HttpStoreError("result_terminal", "终态任务不能发布或覆盖结果", status=409)
+            conn.execute("INSERT INTO results(job_id, payload) VALUES(?,?)", (job_id, payload))
         except BaseException:
             conn.execute("ROLLBACK")
             raise
