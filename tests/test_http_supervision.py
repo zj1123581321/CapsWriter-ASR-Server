@@ -258,6 +258,55 @@ def _wait_for(process: subprocess.Popen, needle: str, timeout: float = 60.0) -> 
     raise AssertionError(f"未等到 {needle}；已输出：{''.join(collected)}")
 
 
+def _run_bare_probe(tmp_path: Path, **env_overrides) -> subprocess.Popen:
+    """无 PI/DELEGATE 身份的正式 CapsWriterServer 子进程。"""
+    script = tmp_path / "probe_http_server.py"
+    script.write_text(PROBE.replace("__REPO__", repr(str(REPO_ROOT))), encoding="utf-8")
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "PYTHONPATH": str(REPO_ROOT),
+        "LANG": "C.UTF-8",
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+        "COLUMNS": "200",
+    }
+    env.update(env_overrides)
+    return subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def _read_http_from_socket(sock: socket.socket, timeout: float) -> bytes:
+    sock.settimeout(timeout)
+    chunks = []
+    try:
+        while True:
+            piece = sock.recv(4096)
+            if not piece:
+                break
+            chunks.append(piece)
+            data = b"".join(chunks)
+            header_end = data.find(b"\r\n\r\n")
+            if header_end < 0:
+                continue
+            header = data[:header_end]
+            length = 0
+            for line in header.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    length = int(line.split(b":", 1)[1].strip())
+            if len(data) - header_end - 4 >= length:
+                return data
+    except socket.timeout as exc:
+        raise AssertionError(f"真实进程未在期限内返回 HTTP 响应：{exc}") from exc
+    raise AssertionError(f"真实进程连接在完整响应前关闭：{b''.join(chunks)!r}")
+
+
 def test_http_is_off_by_default_and_sigterm_still_exits_zero(tmp_path):
     ws_port = _free_port()
     process = _run_probe(tmp_path, CW_PORT=str(ws_port), CW_ADDR="127.0.0.1",
@@ -584,3 +633,52 @@ def test_result_producer_payload_and_done_survive_new_process(tmp_path):
             process.send_signal(signal.SIGTERM)
             assert process.wait(timeout=15) == 0
             process.communicate(timeout=5)
+
+
+def test_real_process_body_idle_timeout_is_not_fatal_and_releases_port(tmp_path):
+    """正式全量进程消费既有 CW_UPLOAD_IDLE_SECONDS：半开 body 408 后仍可 GET，SIGTERM 0。"""
+    data_dir = tmp_path / "data"
+    ws_port = _free_port()
+    http_port = _free_port()
+    process = _run_bare_probe(
+        tmp_path,
+        CW_PORT=str(ws_port),
+        CW_ADDR="127.0.0.1",
+        CW_HTTP_PORT=str(http_port),
+        CW_HTTP_DATA_DIR=str(data_dir),
+        CW_UPLOAD_IDLE_SECONDS="0.4",
+    )
+    sock = None
+    try:
+        _wait_for(process, "HTTP_LISTENER_READY=")
+        sock = socket.create_connection(("127.0.0.1", http_port), timeout=2)
+        sock.sendall((
+            f"POST /v1/uploads HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n"
+            "Authorization: Bearer process-idle\r\nIdempotency-Key: process-idle\r\n"
+            "Content-Type: application/json\r\nContent-Length: 80\r\n\r\n"
+        ).encode())
+        raw = _read_http_from_socket(sock, timeout=2.0)
+        assert b" 408 " in raw.split(b"\r\n", 1)[0], raw
+        payload = json.loads(raw.split(b"\r\n\r\n", 1)[1])
+        assert payload["code"] == "request_timeout"
+        assert payload["request_id"]
+        import httpx
+        response = httpx.get(
+            f"http://127.0.0.1:{http_port}/v1/jobs/missing",
+            headers={"Authorization": "Bearer process-idle"},
+            timeout=5,
+        )
+        assert response.status_code == 404
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=60) == 0
+        leftover = process.stdout.read()
+        assert "EXIT_CODE=0" in leftover
+    finally:
+        if sock is not None:
+            sock.close()
+        if process.poll() is None:
+            process.kill()
+    with socket.socket() as released:
+        released.settimeout(2)
+        with pytest.raises(OSError):
+            released.connect(("127.0.0.1", http_port))

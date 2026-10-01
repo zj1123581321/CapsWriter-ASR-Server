@@ -24,6 +24,7 @@ sys.path.insert(0, str(REPO_ROOT / "sdk"))
 from capswriter_asr import AsrError, resume_file_http, submit_file_http  # noqa: E402
 from capswriter_asr import http_client as sdk_http  # noqa: E402
 
+from config_server import ServerConfig  # noqa: E402
 from core.server.http_server import HttpServer  # noqa: E402
 from core.server.http_store import HttpStoreError  # noqa: E402
 # HTTP listener 默认关闭，aiohttp 只在显式启用时安装：缺它就跳过，不假装通过
@@ -123,6 +124,35 @@ async def _wait_for_worker_pending(worker, expected: int) -> None:
     while len(worker._pending) != expected and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.005)
     assert len(worker._pending) == expected
+
+
+async def _read_raw_http_response(reader: asyncio.StreamReader, timeout: float) -> tuple[str, bytes]:
+    """读完整 HTTP 响应；超时或半截必须变成 AssertionError，不能盲等挂死。"""
+    try:
+        header = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
+        text = header.decode("iso-8859-1")
+        status = text.split("\r\n", 1)[0]
+        length = 0
+        for line in text.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                length = int(line.split(":", 1)[1].strip())
+        body = await asyncio.wait_for(reader.readexactly(length), timeout=timeout) if length else b""
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError) as exc:
+        raise AssertionError(f"服务端未在期限内返回完整 HTTP 响应：{exc}") from exc
+    return status, body
+
+
+async def _hang_http_body(host: str, port: int, headers: bytes, prefix: bytes, timeout: float):
+    """发送声明了长度的请求头与可选前缀后停住，对端不关闭。"""
+    reader, writer = await asyncio.open_connection(host, port)
+    writer.write(headers + prefix)
+    await writer.drain()
+    try:
+        status, body = await _read_raw_http_response(reader, timeout)
+    except Exception:
+        writer.close()
+        raise
+    return reader, writer, status, body
 
 
 @pytest.mark.asyncio
@@ -695,3 +725,220 @@ async def test_options_missing_and_none_default_but_falsy_wrong_types_are_reject
                 "model": None, "language": None, "context": None,
                 "seg_duration": 15.0, "seg_overlap": 2.0,
             }
+
+
+def _short_idle(monkeypatch, seconds: float = 0.4) -> float:
+    monkeypatch.setattr(ServerConfig, "upload_idle_seconds", seconds)
+    return seconds
+
+
+async def _create_upload_json(client, base_url: str, token: str, payload: bytes, key: str):
+    response = await client.post(
+        base_url + "/v1/uploads",
+        headers={"Authorization": f"Bearer {token}", "Idempotency-Key": key},
+        json={"size_bytes": len(payload), "sha256": sha256(payload).hexdigest(), "options": {}},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize("route", ("create", "patch", "commit"))
+@pytest.mark.asyncio
+async def test_body_idle_timeout_is_408_on_create_patch_commit(tmp_path, monkeypatch, route):
+    """三共同入口：对端不关、客户端超时足够大时，每次等下一块超过既有空闲值返回 408。"""
+    idle = _short_idle(monkeypatch)
+    token = "idle-timeout-token"
+    async with running_server(tmp_path) as (server, base_url):
+        host, port = "127.0.0.1", int(base_url.rsplit(":", 1)[1])
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=10) as client:
+            for trial in range(5):
+                payload = bytes((trial + 3, trial + 7, trial + 11, trial + 13))
+                created = await _create_upload_json(client, base_url, token, payload, f"{route}-{trial}")
+                upload_id = created["upload_id"]
+                if route == "patch":
+                    first = await client.patch(
+                        f"{base_url}/v1/uploads/{upload_id}",
+                        headers={"Authorization": f"Bearer {token}", "Content-Length": "2",
+                                 "Upload-Offset": "0", "Content-Type": "application/octet-stream"},
+                        content=payload[:2],
+                    )
+                    assert first.status_code == 204
+                    before = dict(_read_db(
+                        server.data_dir,
+                        "SELECT confirmed_offset, source_name, updated_at, expires_at FROM uploads WHERE upload_id=?",
+                        (upload_id,),
+                    )[0])
+                    source_bytes = (server.data_dir / "sources" / before["source_name"]).read_bytes()
+                    headers = (
+                        f"PATCH /v1/uploads/{upload_id} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                        f"Authorization: Bearer {token}\r\nContent-Length: 2\r\n"
+                        f"Upload-Offset: 2\r\nContent-Type: application/octet-stream\r\n\r\n"
+                    ).encode()
+                    prefix = b""
+                elif route == "commit":
+                    headers = (
+                        f"POST /v1/uploads/{upload_id}/commit HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                        f"Authorization: Bearer {token}\r\nContent-Length: 8\r\n"
+                        f"Content-Type: application/json\r\n\r\n"
+                    ).encode()
+                    prefix = b""
+                    before = dict(_read_db(
+                        server.data_dir,
+                        "SELECT confirmed_offset, source_name, updated_at, expires_at FROM uploads WHERE upload_id=?",
+                        (upload_id,),
+                    )[0])
+                    source_bytes = (server.data_dir / "sources" / before["source_name"]).read_bytes()
+                else:
+                    headers = (
+                        f"POST /v1/uploads HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                        f"Authorization: Bearer {token}\r\nIdempotency-Key: hang-{route}-{trial}\r\n"
+                        f"Content-Type: application/json\r\nContent-Length: 80\r\n\r\n"
+                    ).encode()
+                    prefix = b""
+                    before = None
+                    source_bytes = None
+                reader, writer, status, body = await _hang_http_body(
+                    host, port, headers, prefix, timeout=idle + 1.5,
+                )
+                try:
+                    assert " 408 " in status, status
+                    payload_json = json.loads(body.decode("utf-8"))
+                    assert payload_json["code"] == "request_timeout"
+                    assert payload_json["request_id"]
+                    assert server.fatal is None
+                    if before is not None:
+                        after = dict(_read_db(
+                            server.data_dir,
+                            "SELECT confirmed_offset, source_name, updated_at, expires_at FROM uploads WHERE upload_id=?",
+                            (upload_id,),
+                        )[0])
+                        assert after == before
+                        assert (server.data_dir / "sources" / after["source_name"]).read_bytes() == source_bytes
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+                if route == "patch":
+                    resume = await client.patch(
+                        f"{base_url}/v1/uploads/{upload_id}",
+                        headers={"Authorization": f"Bearer {token}", "Content-Length": "2",
+                                 "Upload-Offset": "2", "Content-Type": "application/octet-stream"},
+                        content=payload[2:],
+                    )
+                    assert resume.status_code == 204
+                    assert resume.headers["Upload-Offset"] == "4"
+                    assert (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes() == payload
+                    get = await client.get(
+                        f"{base_url}/v1/uploads/{upload_id}",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    assert get.status_code == 200
+                    assert get.json()["confirmed_offset"] == 4
+        assert server.fatal is None
+        assert server._body_slots._value == 2
+        assert server._handler_slots._value == 16
+
+
+@pytest.mark.asyncio
+async def test_two_half_open_bodies_timeout_then_new_requests_succeed(tmp_path, monkeypatch):
+    """两半开占满 body 名额：第三请求立刻 429；deadline 后不关对端也能新 POST/PATCH。"""
+    idle = _short_idle(monkeypatch)
+    token = "half-open-token"
+    async with running_server(tmp_path) as (server, base_url):
+        host, port = "127.0.0.1", int(base_url.rsplit(":", 1)[1])
+        hang = (
+            f"POST /v1/uploads HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            f"Authorization: Bearer {token}\r\nIdempotency-Key: half-{{n}}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: 80\r\n\r\n"
+        )
+        held = []
+        try:
+            for index in range(2):
+                reader, writer = await asyncio.open_connection(host, port)
+                writer.write(hang.format(n=index).encode())
+                await writer.drain()
+                held.append((reader, writer))
+            deadline = asyncio.get_running_loop().time() + 1
+            while server._body_slots._value != 0 and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.005)
+            assert server._body_slots._value == 0
+            third_reader, third_writer = await asyncio.open_connection(host, port)
+            third_writer.write(hang.format(n=2).encode())
+            await third_writer.drain()
+            status, body = await _read_raw_http_response(third_reader, 1)
+            third_writer.close()
+            await third_writer.wait_closed()
+            assert " 429 " in status, status
+            assert json.loads(body)["code"] == "body_overloaded"
+            async with httpx.AsyncClient(trust_env=False, timeout=5) as client:
+                missing = await client.get(
+                    f"{base_url}/v1/jobs/missing",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert missing.status_code == 404
+            for reader, writer in held:
+                status, body = await _read_raw_http_response(reader, idle + 1.5)
+                assert " 408 " in status, status
+                assert json.loads(body)["code"] == "request_timeout"
+                assert json.loads(body)["request_id"]
+            assert server.fatal is None
+            assert server._body_slots._value == 2
+            assert server._handler_slots._value == 16
+            payload = b"slow-ok"
+            async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
+                created = await _create_upload_json(client, base_url, token, payload, "after-idle")
+                patched = await client.patch(
+                    f"{base_url}/v1/uploads/{created['upload_id']}",
+                    headers={"Authorization": f"Bearer {token}",
+                             "Content-Length": str(len(payload)), "Upload-Offset": "0",
+                             "Content-Type": "application/octet-stream"},
+                    content=payload,
+                )
+                assert patched.status_code == 204
+        finally:
+            for _, writer in held:
+                writer.close()
+            await asyncio.gather(*(writer.wait_closed() for _, writer in held), return_exceptions=True)
+        assert server.fatal is None
+
+
+@pytest.mark.asyncio
+async def test_slow_chunks_succeed_when_each_gap_is_below_idle(tmp_path, monkeypatch):
+    """持续慢传：每块间隔 < idle、总历时 > idle，仍按整段成功，不是全 request 截止。"""
+    idle = _short_idle(monkeypatch, 0.35)
+    gap = 0.12
+    token = "slow-token"
+    async with running_server(tmp_path) as (server, base_url):
+        host, port = "127.0.0.1", int(base_url.rsplit(":", 1)[1])
+        async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
+            for trial in range(5):
+                payload = bytes((trial + n * 17) % 251 for n in range(8))
+                created = await _create_upload_json(client, base_url, token, payload, f"slow-{trial}")
+                upload_id = created["upload_id"]
+                started = asyncio.get_running_loop().time()
+                reader, writer = await asyncio.open_connection(host, port)
+                writer.write((
+                    f"PATCH /v1/uploads/{upload_id} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                    f"Authorization: Bearer {token}\r\nContent-Length: {len(payload)}\r\n"
+                    f"Upload-Offset: 0\r\nContent-Type: application/octet-stream\r\n\r\n"
+                ).encode())
+                await writer.drain()
+                for byte in payload:
+                    writer.write(bytes([byte]))
+                    await writer.drain()
+                    await asyncio.sleep(gap)
+                status, _ = await _read_raw_http_response(reader, idle + 2)
+                writer.close()
+                await writer.wait_closed()
+                elapsed = asyncio.get_running_loop().time() - started
+                assert elapsed > idle
+                assert " 204 " in status, status
+                row = _read_db(
+                    server.data_dir,
+                    "SELECT confirmed_offset, sha256 FROM uploads WHERE upload_id=?",
+                    (upload_id,),
+                )[0]
+                disk = (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes()
+                assert disk == payload
+                assert sha256(disk).hexdigest() == row["sha256"]
+                assert row["confirmed_offset"] == len(payload)
+        assert server.fatal is None

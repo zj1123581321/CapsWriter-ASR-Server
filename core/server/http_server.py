@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
+from config_server import ServerConfig
 from core.server.http_store import (
     IO_MAILBOX,
     MAX_BODY_CONCURRENCY,
@@ -150,7 +151,9 @@ class HttpServer:
             raise HttpServerError(f"HTTP 存储初始化失败：{exc}") from exc
         application = self._web.Application()
         self._add_routes(application)
-        self._runner = self._web.AppRunner(application, access_log=None)
+        # 半开 body 超时后必须能写完 408 再结束连接：lingering drain 会把未完成
+        # request 再挂 10 秒，这里用框架自带 lingering_time=0，不另做 timer。
+        self._runner = self._web.AppRunner(application, access_log=None, lingering_time=0)
         return self
 
     def _open_store(self) -> HttpStore:
@@ -246,7 +249,10 @@ class HttpServer:
         payload = {"code": code, "message": message, "request_id": request_id}
         if confirmed_offset is not None:
             payload["confirmed_offset"] = confirmed_offset
-        return self._json(status, payload)
+        response = self._json(status, payload)
+        if status == 408:
+            response.force_close()
+        return response
 
     def _json(self, status, payload, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -280,15 +286,28 @@ class HttpServer:
         except ValueError as exc:
             raise HttpStoreError("length_required", "Content-Length 必须是整数", status=400) from exc
 
+    @staticmethod
+    def _read_idle_seconds() -> float:
+        """每次等待下一块请求体的空闲期限：复用既有 CW_UPLOAD_IDLE_SECONDS。"""
+        return float(ServerConfig.upload_idle_seconds)
+
     async def _read_body(self, request, limit: int, expected: Optional[int] = None) -> bytes:
         """按 64 KiB 有界读取，绝不把整份 1 GiB 上传 append 进内存。"""
         if self._body_slots.locked():
             raise HttpStoreError("body_overloaded", "HTTP 请求体名额已满", status=429)
         await self._body_slots.acquire()
         try:
+            idle = self._read_idle_seconds()
             buffer = bytearray()
             while True:
-                chunk = await request.content.read(READ_CHUNK_BYTES)
+                try:
+                    chunk = await asyncio.wait_for(request.content.read(READ_CHUNK_BYTES), timeout=idle)
+                except asyncio.TimeoutError as exc:
+                    raise HttpStoreError(
+                        "request_timeout",
+                        "读取请求体超时：超过空闲等待期限未收到新数据",
+                        status=408,
+                    ) from exc
                 if not chunk:
                     break
                 buffer.extend(chunk)

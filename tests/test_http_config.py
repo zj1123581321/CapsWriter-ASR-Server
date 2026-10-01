@@ -2,6 +2,7 @@
 """CW_HTTP_PORT / CW_HTTP_DATA_DIR 的启用契约测试（真实子进程消费环境）。"""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -84,3 +85,45 @@ def test_addr_follows_current_asr_address(tmp_path):
                     CW_HTTP_PORT="6117", CW_HTTP_DATA_DIR=str(tmp_path / "d"))
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().startswith('OK:["127.0.0.1", 6117,')
+
+
+IDLE_PROBE = '''\
+import json, sys
+sys.path.insert(0, {repo!r})
+from config_server import ServerConfig
+from core.server.http_server import HttpServer
+print("IDLE:" + json.dumps({{
+    "config": ServerConfig.upload_idle_seconds,
+    "reader": HttpServer._read_idle_seconds(),
+}}))
+'''
+
+
+def _idle_probe(tmp_path: Path, **env_overrides) -> subprocess.CompletedProcess:
+    script = tmp_path / "probe_idle.py"
+    script.write_text(IDLE_PROBE.format(repo=str(REPO_ROOT)), encoding="utf-8")
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "PYTHONPATH": str(REPO_ROOT),
+        "LANG": "C.UTF-8",
+    }
+    env.update(env_overrides)
+    return subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def test_upload_idle_default_300_reaches_http_reader(tmp_path):
+    """裸子进程读既有 CW_UPLOAD_IDLE_SECONDS：默认 300，有值传给 HTTP reader。"""
+    default = _idle_probe(tmp_path)
+    assert default.returncode == 0, default.stderr
+    payload = json.loads(default.stdout.strip().split("IDLE:", 1)[1])
+    assert payload["config"] == 300
+    assert payload["reader"] == 300
+    override = _idle_probe(tmp_path, CW_UPLOAD_IDLE_SECONDS="12")
+    assert override.returncode == 0, override.stderr
+    payload = json.loads(override.stdout.strip().split("IDLE:", 1)[1])
+    assert payload["config"] == 12
+    assert payload["reader"] == 12
