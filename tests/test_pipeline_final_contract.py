@@ -193,7 +193,59 @@ def test_mic_without_real_tokens_keeps_uniform_character_fallback():
 
     assert result.tokens == ["测", "试"]
     assert result.timestamps == [0.0, pytest.approx(0.05)]
-    assert "".join(result.tokens) == result.text_accu == "测试"
+    assert result.text_accu == "测试"
+
+
+def test_mic_no_token_fallback_excludes_ordinary_spaces():
+    recognizer = _Recognizer("hello world", [], [])
+    result = _pipeline(recognizer).process(
+        _task("mic-space", task_type="mic", samples=1600)
+    )
+
+    assert result.is_final is True
+    assert result.text_accu == "hello world"
+    assert result.tokens == list("helloworld")
+    assert " " not in result.tokens
+    assert result.timestamps == [pytest.approx(i * 0.01) for i in range(10)]
+
+
+def test_mic_short_tail_and_nonfinal_keep_existing_boundaries():
+    recognizer = _Recognizer("hello world", [], [])
+    state = WorkerState()
+    pipeline = _pipeline(recognizer, state=state)
+
+    nonfinal = pipeline.process(
+        _task("mic-bound", task_type="mic", samples=1600, is_final=False)
+    )
+    assert nonfinal.is_final is False
+    assert recognizer.calls == 1
+
+    short_final = pipeline.process(
+        _task("mic-bound", task_type="mic", samples=1599, is_final=True)
+    )
+    assert recognizer.calls == 1
+    assert short_final.is_final is True
+    assert short_final.text_accu == "hello world"
+    assert short_final.tokens == list("helloworld")
+    assert " " not in short_final.tokens
+
+
+def test_mic_native_tokens_are_not_rejected_by_file_join_check(monkeypatch):
+    recognizer = _Recognizer("hello world", ["hello", "world"], [0.0, 0.05])
+    monkeypatch.setattr(
+        pipeline_module,
+        "sync_tokens_from_text",
+        lambda tokens, timestamps, text: (["hello"], [0.0]),
+    )
+
+    result = _pipeline(recognizer).process(
+        _task("mic-native-join", task_type="mic")
+    )
+
+    assert result.is_final is True
+    assert result.tokens == ["hello"]
+    assert result.timestamps == [0.0]
+    assert result.text_accu == "helloworld"
 
 
 def test_pipeline_rejects_native_mismatched_raw_arrays_before_merge():
