@@ -5,7 +5,6 @@ import asyncio
 import base64
 import inspect
 import json
-import math
 import shutil
 import time
 import urllib.error
@@ -80,39 +79,17 @@ async def _run_process(*args: str) -> tuple[int, bytes, bytes]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    stdout_task = asyncio.create_task(process.stdout.read())
+    stderr_task = asyncio.create_task(process.stderr.read())
     try:
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+        await process.wait()
         return process.returncode, stdout, stderr
     finally:
         if process.returncode is None:
             process.kill()
             await process.wait()
-
-
-async def _audio_duration(path: Path) -> float:
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe is None:
-        raise AsrError("decode_failed", "找不到 ffprobe，无法读取音频时长")
-    try:
-        code, stdout, stderr = await _run_process(
-            ffprobe,
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        )
-    except OSError as exc:
-        raise AsrError("decode_failed", f"无法启动 ffprobe: {exc}") from exc
-    if code != 0:
-        detail = stderr.decode("utf-8", errors="replace").strip()
-        raise AsrError("decode_failed", detail or f"ffprobe 退出码 {code}")
-    try:
-        duration = float(stdout.decode("ascii").strip())
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise AsrError("decode_failed", "ffprobe 未返回有效音频时长") from exc
-    if not math.isfinite(duration) or duration < 0:
-        raise AsrError("decode_failed", "ffprobe 返回了无效音频时长")
-    return duration
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
 
 
 async def _transcode(path: Path, encoding: str) -> bytes:
@@ -143,6 +120,65 @@ async def _transcode(path: Path, encoding: str) -> bytes:
         samples = np.frombuffer(stdout, dtype="<i2").size
         return stdout[:samples * 2]
     return stdout
+
+
+async def _count_decoded_samples(audio: bytes, encoding: str) -> int:
+    """从 SDK 将要发送的压缩字节流累计解码样本数。"""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise AsrError("decode_failed", "找不到 ffmpeg")
+    input_format = {"flac": "flac", "ogg_opus": "ogg"}[encoding]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-nostdin",
+            "-f", input_format,
+            "-i", "pipe:0",
+            "-ar", str(_RAW_SAMPLE_RATE),
+            "-ac", "1",
+            "-f", "s16le",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise AsrError("decode_failed", f"无法启动 ffmpeg: {exc}") from exc
+
+    async def feed_input() -> None:
+        for offset in range(0, len(audio), _CHUNK_BYTES):
+            process.stdin.write(audio[offset:offset + _CHUNK_BYTES])
+            await process.stdin.drain()
+        process.stdin.close()
+        await process.stdin.wait_closed()
+
+    async def count_output() -> int:
+        byte_count = 0
+        while chunk := await process.stdout.read(_CHUNK_BYTES):
+            byte_count += len(chunk)
+        return byte_count
+
+    tasks = (
+        asyncio.create_task(feed_input()),
+        asyncio.create_task(count_output()),
+        asyncio.create_task(process.stderr.read()),
+    )
+    try:
+        _, output_bytes, stderr = await asyncio.gather(*tasks)
+        code = await process.wait()
+    except OSError as exc:
+        raise AsrError("decode_failed", f"无法读取 ffmpeg 解码输出: {exc}") from exc
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    if code != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise AsrError("decode_failed", detail or f"ffmpeg 退出码 {code}")
+    if output_bytes % 2:
+        raise AsrError("decode_failed", "ffmpeg 解码输出未按样本对齐")
+    return output_bytes // 2
 
 
 def _health_url(url: str) -> str:
@@ -357,18 +393,18 @@ async def _operation(
     on_progress: Callable[[dict], object] | None,
     set_deadline,
 ) -> Transcript:
-    duration = await _audio_duration(path)
-    set_deadline(max(120.0, duration + 60.0))
+    if not path.is_file():
+        raise AsrError("decode_failed", f"音频文件不存在: {path}")
     await _check_server(url, encoding, model)
     audio = await _transcode(path, encoding)
     if encoding == "f32le":
         samples_total = np.frombuffer(audio, dtype="<f4").size
-        duration = samples_total / _RAW_SAMPLE_RATE
     elif encoding == "s16le":
         samples_total = np.frombuffer(audio, dtype="<i2").size
-        duration = samples_total / _RAW_SAMPLE_RATE
     else:
-        samples_total = round(duration * _RAW_SAMPLE_RATE)
+        samples_total = await _count_decoded_samples(audio, encoding)
+    duration = samples_total / _RAW_SAMPLE_RATE
+    set_deadline(max(120.0, duration + 60.0))
     try:
         return await _transcribe_connected(
             url,

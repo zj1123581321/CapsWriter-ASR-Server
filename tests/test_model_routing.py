@@ -105,17 +105,14 @@ async def test_server_rejects_model_different_from_its_config(fake_asr_server, m
 @pytest.mark.asyncio
 async def test_sdk_rejects_direct_server_model_before_websocket(monkeypatch, tmp_path):
     audio_path = tmp_path / "unused.wav"
+    audio_path.touch()
     awaitable_calls = []
     websocket_calls = []
-
-    async def audio_duration(_path):
-        return 1.0
 
     def connect(*_args, **_kwargs):
         websocket_calls.append(True)
         raise AssertionError("模型校验失败后不得建立 WebSocket")
 
-    monkeypatch.setattr(sdk_client, "_audio_duration", audio_duration)
     monkeypatch.setattr(sdk_client, "_transcode", lambda *_args: awaitable_calls.append(True))
     monkeypatch.setattr(
         sdk_client,
