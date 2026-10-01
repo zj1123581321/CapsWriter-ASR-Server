@@ -195,6 +195,43 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _assert_port_released(port: int) -> None:
+    """收尾断言：进程结束后端口必须因已关闭而连不上。"""
+    with socket.socket() as sock:
+        sock.settimeout(2)
+        with pytest.raises(OSError):
+            sock.connect(("127.0.0.1", port))
+
+def _sigterm_and_join(process) -> None:
+    """共用收尾：仍存活才发 SIGTERM，等零退出并回收输出。"""
+    if process.poll() is None:
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=15) == 0
+        process.communicate(timeout=5)
+
+
+def _kill_during_patch(process, client, port, upload, token, body, marker):
+    """崩溃窗口共用骨架：PATCH 线程、等崩溃标记、kill；客户端必须没拿到响应。"""
+    import httpx
+
+    ack = []
+
+    def send():
+        try:
+            ack.append(_patch_upload(client, f"http://127.0.0.1:{port}", upload, token, body, 0))
+        except httpx.HTTPError as exc:
+            ack.append(exc)
+
+    request_thread = threading.Thread(target=send, daemon=True)
+    request_thread.start()
+    _wait_for(process, marker, timeout=15)
+    process.kill()
+    process.communicate(timeout=10)
+    request_thread.join(timeout=10)
+    assert not request_thread.is_alive()
+    assert ack and not isinstance(ack[0], httpx.Response)
+
+
 def _run_probe(tmp_path: Path, **env_overrides) -> subprocess.Popen:
     script = tmp_path / "probe_http_server.py"
     script.write_text(PROBE.replace("__REPO__", repr(str(REPO_ROOT))), encoding="utf-8")
@@ -321,10 +358,7 @@ def test_http_is_off_by_default_and_sigterm_still_exits_zero(tmp_path):
         if process.poll() is None:
             process.kill()
     # WS 端口已释放
-    with socket.socket() as sock:
-        sock.settimeout(2)
-        with pytest.raises(OSError):
-            sock.connect(("127.0.0.1", ws_port))
+    _assert_port_released(ws_port)
 
 
 def test_enabled_http_serves_and_sigterm_exits_zero_releasing_port(tmp_path):
@@ -345,10 +379,7 @@ def test_enabled_http_serves_and_sigterm_exits_zero_releasing_port(tmp_path):
     finally:
         if process.poll() is None:
             process.kill()
-    with socket.socket() as sock:
-        sock.settimeout(2)
-        with pytest.raises(OSError):
-            sock.connect(("127.0.0.1", http_port))
+    _assert_port_released(http_port)
 
 
 def test_bad_data_dir_fails_fast_with_nonzero_exit(tmp_path):
@@ -422,10 +453,7 @@ def test_unknown_http_operation_stops_listener_and_exits_nonzero(tmp_path):
     finally:
         if process.poll() is None:
             process.kill()
-    with socket.socket() as sock:
-        sock.settimeout(2)
-        with pytest.raises(OSError):
-            sock.connect(("127.0.0.1", http_port))
+    _assert_port_released(http_port)
 
 
 def test_cancelled_http_handler_io_failure_reaches_process_supervisor(tmp_path):
@@ -481,28 +509,11 @@ def test_http_offset_crash_windows_recover_in_new_processes(tmp_path):
     prefix_size = 2048
     unconfirmed_tail = bytes((byte + 1) % 251 for byte in payload)
     process, port = _start_http_process(tmp_path, data_dir, PROBE_OFFSET_WINDOW="before")
-    before_upload = None
-    before_ack = []
     with httpx.Client(trust_env=False, timeout=30) as client:
         before_upload = _create_upload(client, f"http://127.0.0.1:{port}", payload, token, "before-offset")
 
-        def send_unconfirmed_prefix():
-            try:
-                before_ack.append(_patch_upload(
-                    client, f"http://127.0.0.1:{port}", before_upload, token,
-                    unconfirmed_tail, 0,
-                ))
-            except httpx.HTTPError as exc:
-                before_ack.append(exc)
-
-        request_thread = threading.Thread(target=send_unconfirmed_prefix, daemon=True)
-        request_thread.start()
-        _wait_for(process, "FILE_FSYNCED_BEFORE_OFFSET", timeout=15)
-        process.kill()
-        process.communicate(timeout=10)
-        request_thread.join(timeout=10)
-        assert not request_thread.is_alive()
-        assert before_ack and not isinstance(before_ack[0], httpx.Response)
+        _kill_during_patch(process, client, port, before_upload, token,
+                           unconfirmed_tail, "FILE_FSYNCED_BEFORE_OFFSET")
 
     process, port = _start_http_process(tmp_path, data_dir)
     try:
@@ -534,35 +545,16 @@ def test_http_offset_crash_windows_recover_in_new_processes(tmp_path):
             assert confirmed.json()["confirmed_offset"] == len(payload)
             assert sha256(prefix_path.read_bytes()).hexdigest() == sha256(payload).hexdigest()
     finally:
-        if process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            assert process.wait(timeout=15) == 0
-            process.communicate(timeout=5)
+        _sigterm_and_join(process)
 
     after_payload = b"offset-before-ack" * 128
     process, port = _start_http_process(tmp_path, data_dir, PROBE_OFFSET_WINDOW="after")
-    after_upload = None
-    after_ack = []
     with httpx.Client(trust_env=False, timeout=30) as client:
         after_upload = _create_upload(client, f"http://127.0.0.1:{port}",
                                       after_payload, token, "after-offset")
 
-        def send_before_ack():
-            try:
-                after_ack.append(_patch_upload(
-                    client, f"http://127.0.0.1:{port}", after_upload, token, after_payload, 0,
-                ))
-            except httpx.HTTPError as exc:
-                after_ack.append(exc)
-
-        request_thread = threading.Thread(target=send_before_ack, daemon=True)
-        request_thread.start()
-        _wait_for(process, "OFFSET_COMMITTED_BEFORE_ACK", timeout=15)
-        process.kill()
-        process.communicate(timeout=10)
-        request_thread.join(timeout=10)
-        assert not request_thread.is_alive()
-        assert after_ack and not isinstance(after_ack[0], httpx.Response)
+        _kill_during_patch(process, client, port, after_upload, token,
+                           after_payload, "OFFSET_COMMITTED_BEFORE_ACK")
 
     process, port = _start_http_process(tmp_path, data_dir)
     try:
@@ -578,10 +570,7 @@ def test_http_offset_crash_windows_recover_in_new_processes(tmp_path):
             assert source_path.read_bytes() == after_payload
             assert sha256(source_path.read_bytes()).hexdigest() == sha256(after_payload).hexdigest()
     finally:
-        if process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            assert process.wait(timeout=15) == 0
-            process.communicate(timeout=5)
+        _sigterm_and_join(process)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="真实子进程重启探针只在 POSIX 上执行")
@@ -629,10 +618,7 @@ def test_result_producer_payload_and_done_survive_new_process(tmp_path):
             assert result.status_code == 200
             assert result.json() == producer_payload
     finally:
-        if process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            assert process.wait(timeout=15) == 0
-            process.communicate(timeout=5)
+        _sigterm_and_join(process)
 
 
 def test_real_process_body_idle_timeout_is_not_fatal_and_releases_port(tmp_path):
@@ -678,7 +664,4 @@ def test_real_process_body_idle_timeout_is_not_fatal_and_releases_port(tmp_path)
             sock.close()
         if process.poll() is None:
             process.kill()
-    with socket.socket() as released:
-        released.settimeout(2)
-        with pytest.raises(OSError):
-            released.connect(("127.0.0.1", http_port))
+    _assert_port_released(http_port)
