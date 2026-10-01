@@ -24,11 +24,11 @@ Mac mini 仍人为停用，未复活。Studio 三角色本次未重启；复核�
 
 ## 验证
 
-原 Mac 烟测保留：Studio-Paraformer/MLX 的 file 短尾、普通 final、mic 均为 pass；Studio-Proxy 短尾 pass 且当时路由到健康 `6b7a2b8` 后端。
+原 Mac 烟测保留并校准标签：Studio-Paraformer/MLX 的 file 小末帧上传、普通 final、mic 均为 pass；Studio-Proxy 小末帧上传路由 pass，且当时路由到健康 `6b7a2b8` 后端。
 
 Windows 补部署后：
 
-| 角色 | file 短尾 `5.05s` | file 普通 final | mic 短句 | 稳定窗口 |
+| 角色 | file 小末帧上传 `5.05s` | file 普通 final | mic 短句 | 稳定窗口 |
 |---|---|---|---|---|
 | Windows-Qwen | `pass`；final=true；text_accu 长度=12；tokens/timestamps=`12/12`；join=pass | `pass`；duration=5.050；`12/12`；join=pass | `pass`；duration=1.000；`6/6` | 两次健康/监听进程 CreationDate 一致 |
 | Studio-Proxy（未重启） | `pass`；history delta=1；completed；路由到健康 `6b7a2b8` 的 6016 后端 | `not-required` | `not-required` | Studio 进程未重启；Windows 后端 git_sha 已变为 `6b7a2b8`；停用后端仍 unhealthy |
@@ -36,6 +36,7 @@ Windows 补部署后：
 ## 风险和偏差
 
 - 首次阻塞原因是把「监听 PID 以外的 Python」直接当无关进程；复核证明那 2 个 Python 是同一 cmd 包装树的后代 worker。原阻塞记录保留，不改写成从未阻塞。
+- 标签校准：5.05s 上传由 80,000 samples 与末帧 800 samples 组成；它验证末帧上传与 file final 契约，不代表 worker 收到小于 1600 samples 的分段。实际配置重放见 [segmentation-proof.md](segmentation-proof.md)。历史阻塞和 Windows 进程归属复核保持原样。
 - `run_server.bat` 仍会结束全部 Python；本次因无关数为 0 才沿现有机制更新，未改脚本。
 - Windows CommandLine 对 python.exe 未同时命中 `start_server.py`+clone（布尔 false），归属以 PID/PPID 后代集合与 cmd 包装层布尔为准，未回显 argv。
 - Studio/Mini 未作为本次写入目标；无回滚。
