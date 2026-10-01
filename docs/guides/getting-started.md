@@ -108,7 +108,7 @@ curl --fail http://127.0.0.1:6016/health
 
 ## 5. 让应用完成首次识别
 
-保持服务进程运行，再按照 [Python SDK 文档](../../sdk/README.md)安装 SDK，并使用其中的 `s16le` 示例转录一段本地音频。SDK 在客户端读取音频时仍需文档列出的 `ffmpeg` / `ffprobe`；`s16le` 上传路径不要求服务端安装 `ffmpeg`。若改用默认的 FLAC 编码，服务端也需安装 `ffmpeg`，并先确认 `/health` 的 `encodings` 包含 `flac`。使用其它语言时，从 [WebSocket 协议](../reference/protocol.md)和[下游客户端接入指南](下游客户端接入指南.md)开始。
+保持服务进程运行，再按照 [Python SDK 文档](../../sdk/README.md)安装 SDK，并使用其中的 `s16le` 示例转录一段本地音频。SDK 在客户端读取音频时只需文档列出的 `ffmpeg`；`s16le` 上传路径不要求服务端安装 `ffmpeg`。若改用默认的 FLAC 编码，服务端也需安装 `ffmpeg`，并先确认 `/health` 的 `encodings` 包含 `flac`。使用其它语言时，从 [WebSocket 协议](../reference/protocol.md)和[下游客户端接入指南](下游客户端接入指南.md)开始。
 
 ## 后续部署
 
