@@ -9,3 +9,14 @@
   2. 查看 draft PR 两个 WebSocket CI 矩阵的真实 conclusion，pending 不当作审查通过。
   3. 写入完整委派报告，分列继承红与新红、红验原输出、边界偏差和最贵步骤。
   4. 将 E1 交回主脑继续 E2；保持七个未完成目标为 active/pending，不把本卡写成 HTTP 已可用。
+
+## 2026-10-01 续修：采样点量化与公开合同
+
+- **当前阶段**：repairing；补齐原重构冻结的 float32 采样点量化，并把 R1–R7 机械合同写入公开设计/QA。HTTP 默认仍关闭，本卡不合并、不部署。
+- **本段结论**：`_cut` 的 stride/overlap 恢复为先 `round(seconds * SAMPLE_RATE)` 再乘 4 字节。真实 `_validate_segmentation` + `_submit_segments` 下，固定切点 `5.00001/0.5` 产出 352000 字节，吸附切点 5.12 s 且 overlap `0.50001` 产出 359680 字节；`process_audio_task` 能消费完整样本。未新增对齐抽象、状态或参数限制。公开 `design.md` 补齐 R1–R7 必要 HTTP 接口、持久提交、监督和容量约束；`qa.md` 列出 12 组待测/已锁证明，不声称全部已实测。
+- **锁定与否决**：Task/Result kind 与派生 key、旧 WS 协议/背压/时间戳/模型算法不变；合法小数分段参数仍合法。外部 PCM 意见保持 P2，不扩其它意见。继续否决网关、proxy、WS 库迁移、自动 retry/重跑、账号、模型改造、PR30、假 socket、重复 owner_id。
+- **原范围偏差**：原卡 Scope-Globs 漏列 `core/server/worker/__init__.py`。该文件是 ProcessManager 向子进程传递 `active_http_jobs` 的必要 caller；主脑已复核并认可必须接线。这是拆卡方遗漏，不是本续修回退项，本轮未改该文件。
+- **下一步**：
+  1. 全量 Verify-Command 为 243 passed、3 skipped、85 warnings、退出码 0。
+  2. 背压/错误/协议/分段组合连续 5 次均为 45 passed、61 warnings、退出码 0。
+  3. 本增量保持 draft PR 37，不合并、不部署；交回主脑处理缺 gate 例外。
