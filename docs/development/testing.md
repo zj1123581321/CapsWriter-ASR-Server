@@ -3,7 +3,7 @@
 正式测试位于 [`tests/`](../../tests/)。完整验证命令：
 
 ```sh
-uv run --no-project --python 3.12 --with numpy --with rich --with websockets --with colorama --with pytest --with soundfile --with pytest-asyncio python -m pytest tests/ -q -p no:cacheprovider
+uv run --no-project --python 3.12 --with numpy --with rich --with websockets --with colorama --with pytest==9.1.1 --with soundfile --with pytest-asyncio==1.4.0 --with aiohttp==3.14.3 --with httpx==0.28.1 python -m pytest tests/ -q -p no:cacheprovider
 ```
 
 - **服务端与协议**：测试真实 WebSocket 接收、解码、分段、背压、错误帧和任务终态；`tests/harness/` 提供假引擎及服务端夹具。

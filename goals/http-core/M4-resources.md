@@ -1,16 +1,16 @@
 ---
 lane: http-core
-id: E4
+id: M4
 slug: resources
 status: 未开始
 owner: pi协调
 order: 4
 priority: 高
-depends_on: [http-core/E3]
+depends_on: [http-core/M3]
 merged_pr: null
 ---
 
-# 里程碑进度：<!-- http-core/E4：资源边界与重启清理 -->
+# 里程碑进度：http-core/M4：资源边界与重启清理
 
 - **预期产出**：上传、解码、队列、结果和磁盘配额；部分上传/任务重启收敛；终态源音频清理与活跃引用保护。
 - **当前范围**：落实已锁定的资源起点和 7 天源音频策略，不新增自动重跑或删除任务记录/结果。
