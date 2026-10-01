@@ -111,6 +111,11 @@ def test_http_registration_precedes_task_lifecycle():
     assert state.connection_tasks == {}
 
 
+def test_unknown_owner_kind_fails_fast():
+    with pytest.raises(ValueError, match="未知任务归属类型"):
+        make_task_key("ftp", "job-1")
+
+
 @pytest.mark.parametrize("active", [True, False])
 def test_http_owner_gate_crosses_real_queue(active):
     manager = multiprocessing.Manager()
