@@ -180,8 +180,9 @@ async def test_inflight_limit_stops_reads_and_returns_all_results(monkeypatch, s
             deadline = asyncio.get_running_loop().time() + 5
             while len(server.calls) < 1 or sum(
                 len(pending)
-                for (socket_id, pending_task_id), pending in server.state.pending_segments.items()
-                if pending_task_id == task_id
+                for (owner_kind, socket_id, pending_task_id), pending
+                in server.state.pending_segments.items()
+                if owner_kind == "ws" and pending_task_id == task_id
             ) < 2:
                 assert asyncio.get_running_loop().time() < deadline
                 await asyncio.sleep(0.01)

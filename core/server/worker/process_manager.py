@@ -30,6 +30,7 @@ class ProcessManager:
     """
     def __init__(self, app: CapsWriterServer):
         self._process = None
+        self._manager = None
         self.app = app
         self.is_alive = False
         self.models_ready = False
@@ -54,7 +55,9 @@ class ProcessManager:
         # 2. 初始化共享资源
         # 使用 Manager 管理共享列表，用于追踪活动连接
         state = self.app.state
-        state.sockets_id = Manager().list()
+        self._manager = Manager()
+        state.sockets_id = self._manager.list()
+        state.active_http_jobs = self._manager.list()
 
         # 获取标准输入文件描述符，用于 Windows 下的信号传递补丁
         stdin_fn = sys.stdin.fileno()
@@ -65,7 +68,8 @@ class ProcessManager:
             args=(state.queue_in,
                   state.queue_out,
                   state.sockets_id,
-                  stdin_fn),
+                  stdin_fn,
+                  state.active_http_jobs),
             daemon=True
         )
         self._process.start()
@@ -136,14 +140,18 @@ class ProcessManager:
             ]
             if expired:
                 key, submitted_at = min(expired, key=lambda item: item[1])
-                websocket = state.sockets.get(key[0])
+                websocket = (
+                    state.sockets.get(key[1])
+                    if key[0] == 'ws'
+                    else None
+                )
                 if websocket is not None:
                     from ..connection.ws_send import schedule_error_close
                     timeout_close = schedule_error_close(
                         state,
                         websocket,
-                        key[0],
                         key[1],
+                        key[2],
                         'inference_timeout',
                         f"推理段超时，最早提交时间距今 {now - submitted_at:.3f}s",
                         True,
@@ -151,7 +159,9 @@ class ProcessManager:
                     await timeout_close
                 else:
                     from ..state import transition_terminal
-                    transition_terminal(state, key, 'FAILED')
+                    transition_terminal(
+                        state, key, 'FAILED', code='inference_timeout'
+                    )
                 from ..connection.ws_send import fail_active_tasks
                 await fail_active_tasks(
                     state,
@@ -182,3 +192,6 @@ class ProcessManager:
                 self._process.join(timeout=2)
                 if self._process.is_alive():
                     raise RuntimeError("识别子进程在强制终止后 2 秒内仍存活")
+        if self._manager is not None:
+            self._manager.shutdown()
+            self._manager = None
