@@ -5,6 +5,11 @@
 处理音频片段的识别、去重和拼接。支持两种拼接策略：
 1. text (简单拼接): 基于文本重叠匹配，不依赖时间戳
 2. text_accu (精确拼接): 基于时间戳去重，用于字幕生成
+
+最终文件结果契约：file 任务 tokens 与 timestamps 必须等长，且最终
+''.join(tokens) 必须等于 text_accu。正常 final 与短尾/空 EOF 共用同一收尾，
+文件结果不自洽时在 is_final 置为 True 前失败。麦克风无真实 token 的均分回退
+保持去掉普通空格的旧口径，不套用文件正文拼接检查。
 """
 
 import re
@@ -83,7 +88,9 @@ class TaskPipeline:
             if samples is None:
                 result.time_start, result.time_submit = task.time_start, task.time_submit
                 result.time_complete = time.time()
-                result.is_final = task.is_final
+                if task.is_final:
+                    return self._finish_final_result(task, result)
+                result.is_final = False
                 return result
 
             # 3. 执行识别推理
@@ -118,6 +125,12 @@ class TaskPipeline:
                 stream.result.tokens = [it.text for it in align_res.items]
                 stream.result.timestamps = [it.start_time for it in align_res.items]
 
+            if len(stream.result.tokens) != len(stream.result.timestamps):
+                raise RuntimeError(
+                    "模型 tokens/timestamps 长度不一致: "
+                    f"task={task.task_id}, tokens={len(stream.result.tokens)}, "
+                    f"timestamps={len(stream.result.timestamps)}"
+                )
 
             # 6. 精确 Token 级拼接 (即便没有对齐器，原生支持时间戳的模型也会走这里)
             new_tokens = process_tokens_safely(stream.result.tokens)
@@ -140,44 +153,68 @@ class TaskPipeline:
             if not task.is_final:
                 return result
 
-            # 任务结束清理与最终格式化
-            raw_text = result.text
-            result.text = self.formatter.format(result.text)
-            result.text_accu = self.formatter.format(result.text_accu)
-            console.print(f'  片段拼接：[purple]{raw_text}', soft_wrap=True)
-            console.print(f'  格式化后：[green]{result.text}\n', soft_wrap=True)
-
-            logger.debug(f'格式调整：{raw_text} --> {result.text}')
-
-            # 将格式化引入的标点同步回 token 序列
-            if result.tokens and result.text_accu:
-                result.tokens, result.timestamps = sync_tokens_from_text(
-                    result.tokens, result.timestamps, result.text_accu
-                )
-            
-            # 如果依然没有 tokens (麦克风跳过了对齐)，则用 text 回退
-            if not result.tokens and result.text:
-                if task.type == 'file':
-                    raise RuntimeError(
-                        f"文件任务没有真实时间戳: task={task.task_id}, 文本长度={len(result.text)}"
-                    )
-                result.text_accu = result.text
-                chars = list(result.text_accu.replace(' ', ''))
-                if chars and result.duration > 0:
-                    t_per_char = result.duration / len(chars)
-                    result.tokens, result.timestamps = chars, [i * t_per_char for i in range(len(chars))]
-            
-            result.is_final = True
-            
-            # 打印统计
-            process_time = result.time_complete - task.time_submit
-            rtf = process_time / result.duration if result.duration > 0 else 0
-            logger.info(f"任务完成: {task.task_id[:8]}, 时长={result.duration:.2f}s, 耗时={process_time:.3f}s, RTF={rtf:.3f}")
-
-            return result
+            return self._finish_final_result(task, result)
 
         except Exception as e:
             logger.error(f"推理管线错误: {e}", exc_info=True)
             raise
+
+    def _finish_final_result(self, task: Task, result: Result) -> Result:
+        """统一收尾正常 final 与已有 session 的短尾/空 EOF final。
+
+        最终正文拼接等式只约束 file 任务。
+        """
+        raw_text = result.text
+        result.text = self.formatter.format(result.text)
+        result.text_accu = self.formatter.format(result.text_accu)
+        console.print(f'  片段拼接：[purple]{raw_text}', soft_wrap=True)
+        console.print(f'  格式化后：[green]{result.text}\n', soft_wrap=True)
+
+        logger.debug(f"格式调整：{raw_text} --> {result.text}")
+
+        # 将格式化引入的标点同步回 token 序列
+        if result.tokens and result.text_accu:
+            result.tokens, result.timestamps = sync_tokens_from_text(
+                result.tokens, result.timestamps, result.text_accu
+            )
+
+        # 如果依然没有 tokens (麦克风跳过了对齐)，则用 text 回退
+        if not result.tokens and result.text:
+            if task.type == 'file':
+                raise RuntimeError(
+                    f"文件任务没有真实时间戳: task={task.task_id}, 文本长度={len(result.text)}"
+                )
+            result.text_accu = result.text
+            chars = list(result.text_accu.replace(' ', ''))
+            if chars and result.duration > 0:
+                t_per_char = result.duration / len(chars)
+                result.tokens, result.timestamps = chars, [
+                    i * t_per_char for i in range(len(chars))
+                ]
+
+        if len(result.tokens) != len(result.timestamps):
+            raise RuntimeError(
+                "最终结果 tokens/timestamps 长度不一致: "
+                f"task={task.task_id}, tokens={len(result.tokens)}, "
+                f"timestamps={len(result.timestamps)}"
+            )
+        if task.type == 'file' and "".join(result.tokens) != result.text_accu:
+            raise RuntimeError(
+                "最终结果 tokens 拼接与 text_accu 不一致: "
+                f"task={task.task_id}, token_text={''.join(result.tokens)!r}, "
+                f"text_accu={result.text_accu!r}"
+            )
+
+        result.is_final = True
+
+        # 打印统计
+        process_time = result.time_complete - task.time_submit
+        rtf = process_time / result.duration if result.duration > 0 else 0
+        logger.info(
+            f"任务完成: {task.task_id[:8]}, 时长={result.duration:.2f}s, "
+            f"耗时={process_time:.3f}s, RTF={rtf:.3f}"
+        )
+
+        return result
 
 

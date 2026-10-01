@@ -87,7 +87,37 @@ proxy 每 30 秒探测后端健康状态；探测请求超时为 5 秒。压缩�
 | `duration` | 已处理音频时长，单位秒 |
 | `time_start`、`time_submit`、`time_complete` | 音频起始、片段提交、任务完成的 Unix 时间戳 |
 
-不要假设不同模型输出相同粒度的 token；生成字幕时直接使用服务端给出的 token 与时间数组，不要从 `text` 反推索引。
+对文件任务的 `is_final: true` 结果，`tokens` 与 `timestamps` 是字幕权威数据，必须满足：
+
+```python
+assert len(message["tokens"]) == len(message["timestamps"])
+assert "".join(message["tokens"]) == message["text_accu"]
+```
+
+下游应直接按相同下标配对这两个数组；空识别是合法结果，此时三个值都可以为空：
+`tokens == []`、`timestamps == []`、`text_accu == ""`。正文中的空格和标点也属于拼接计数，
+不能从 `text` 重新推导数组。例如，下面的最终消息中逗号和空格都占一个 token：
+
+```json
+{
+  "is_final": true,
+  "text": "普通回显稿",
+  "text_accu": "你好，世界",
+  "tokens": ["你好", "，", " ", "世界"],
+  "timestamps": [0.20, 0.20, 0.20, 0.55]
+}
+```
+
+`text` 是独立的普通回显稿，可能与 `text_accu` 不同，不能用它替换或校验
+`text_accu` 的字符索引。不同模型可以输出不同粒度的 token；模型原生时间戳和外挂对齐器
+都遵守上述数组契约，但不承诺固定的字/词粒度。每个 timestamp 是对应 token 的起点，
+不是中心点或终点；协议不提供 token 结束时间，也不保证词尾时间。格式化产生的标点、
+空格、ITN 或热词改写会继承相邻（替换时为被替换片段起点）的时间，因此时间戳可以重复。
+
+最终文件结果统一收尾：少于 1600 samples 的片段不执行识别，但已有 session 的短尾或
+空 EOF 仍会走最终格式化、同步和上述检查；此前没有结果的合法全空任务仍可成功。非 final
+消息保持中间结果语义，不能拿来替代最终契约。麦克风在没有真实 token 时保留均分字符
+回退：时间从 0 起按字符均分，起点不代表中心或终点；有真实 token 时不使用该回退。
 
 ### 4.2 error
 
