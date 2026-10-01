@@ -20,3 +20,7 @@ uv run --no-project --python 3.12 --with numpy --with rich --with websockets --w
 - MLX 设备验证脚本见 `scripts/_verify_mlx_asr.py` 和 `scripts/_smoke_mlx_subprocess.py`。
 
 SDK 安装和 CLI 用法见 [`sdk/README.md`](../../sdk/README.md)。
+
+## 已知问题
+
+- [`known-issues/token-text-alignment-request.md`](known-issues/token-text-alignment-request.md)：下游提出的协议增强请求（issue #40），让 tokens 与最终 text 的对应关系可被验证；非缺陷、非阻塞。
