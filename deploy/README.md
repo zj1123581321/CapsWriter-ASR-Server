@@ -58,4 +58,6 @@ export CW_HTTP_DATA_DIR=/var/lib/capswriter/http
 
 约束：`CW_HTTP_PORT` 不得与 `CW_PORT` 相同，不自动推算邻近端口；`CW_HTTP_DATA_DIR` 必须是绝对路径，且同一时刻只允许一个 server 实例持有（OS 独占锁，进程退出后自动释放，不做网络盘与多实例共写承诺）。任一条件不满足或数据目录不可用时，服务端直接启动失败并以非零退出，不会退回关闭状态。服务端依赖里已声明 `aiohttp==3.14.3`（Python ≥ 3.10），仅在启用时导入。
 
+POSIX 下服务端会将数据目录与 `sources/` 收紧为 `0700`，并将数据库、WAL/SHM、锁文件和 source 文件设为 `0600`，不依赖进程 umask。Windows 上代码未设置或验证 NTFS ACL；启用前需确认 `CW_HTTP_DATA_DIR` 的 ACL 仅允许服务账户与管理员访问，本仓未在真实 Windows 环境验证该 ACL。
+
 当前该入口只交付上传与查询底座：文件识别协调者装配前，`commit` 明确返回 `503 inference_unavailable`，已上传字节与恢复凭据都保留，可在该入口可用后显式继续。
