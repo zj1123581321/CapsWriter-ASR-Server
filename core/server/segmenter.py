@@ -10,10 +10,57 @@ WebSocket 接收层，后续 HTTP runner 复用同一段输出契约。
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 
+from config_server import (
+    Qwen3ASRGGUFArgs,
+    QwenASRMLXArgs,
+    ServerConfig as Config,
+)
 from core.constants import AudioFormat
 from . import logger
+
+
+def engine_segment_limit() -> float | None:
+    """读取当前 ASR 配置的单段上限，不加载识别模型。"""
+    model_type = Config.model_type.lower()
+    if model_type == 'qwen_asr':
+        return Qwen3ASRGGUFArgs.chunk_size
+    if model_type == 'qwen_asr_mlx':
+        return QwenASRMLXArgs.chunk_size
+    return None
+
+
+def validate_segment_params(nominal: float, overlap: float) -> None:
+    """无状态校验分段参数取值范围与引擎单段上限预算。
+
+    与连接无关，只依赖 Config/QwenArgs 的权威取值；WS 接收层与后续 HTTP
+    runner 共用这一份规则。任务首帧锁定等连接级语义由各自 caller 负责。
+    """
+    if not math.isfinite(nominal) or nominal < 5:
+        raise ValueError(f"seg_duration={nominal:g} 不在允许范围 [5, +∞)")
+    if not math.isfinite(overlap) or overlap < 0 or overlap >= nominal / 2:
+        raise ValueError(
+            f"seg_overlap={overlap:g} 不在允许范围 [0, seg_duration/2={nominal / 2:g})"
+        )
+
+    limit = engine_segment_limit()
+    if limit is not None:
+        if Config.seg_cut_snap:
+            max_cut = max(Config.seg_max_cut, nominal + Config.seg_search_after)
+            max_segment = max_cut + overlap
+            values = (
+                f"seg_max_cut={Config.seg_max_cut:g}, seg_duration={nominal:g}, "
+                f"seg_search_after={Config.seg_search_after:g}, seg_overlap={overlap:g}"
+            )
+        else:
+            max_segment = nominal + overlap
+            values = f"seg_duration={nominal:g}, seg_overlap={overlap:g}"
+        if max_segment > limit:
+            raise ValueError(
+                f"{values} 导致单段最长 {max_segment:g}s，允许范围 ≤ 引擎上限 {limit:g}s"
+            )
 
 
 @dataclass(frozen=True)
