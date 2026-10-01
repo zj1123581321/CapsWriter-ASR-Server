@@ -14,6 +14,12 @@
 4. worker 子进程调用配置的 ASR、标点或对齐引擎。
 5. 服务端合并各段文本与时间戳，生成结果帧并通过原连接返回。
 
+### HTTP 文件任务（后续增量，当前关闭）
+
+HTTP 文件任务不会复用 WebSocket 假连接，也不会把完整文件交给 worker。未来显式启用时，接收/持久化层先确认受理，再由文件 runner 将输入解码为有限 PCM 段；共享 `core/server/segmenter.py` 产生带 offset、overlap 和 `is_final` 的段，真实 `Task` 以 `owner_kind=http`、空 `socket_id` 和稳定 job ID 进入既有 Queue。`active_http_jobs` 是主/子进程共享的运行门控，父进程通过注入 sink 持久化 Result；E1 只提供接线，不开放 HTTP listener/store/runner。
+
+WS 与 HTTP 的共享边界止于有界 PCM 段和有限提交。WS 的 socket 取消、出站队列和断线清理，HTTP 的持久 ACK、查询、领取和源文件清理各自保持独立。
+
 ### Proxy 路由流程
 
 Proxy 为每个任务选择健康且协议兼容的后端，并保持任务期间的连接关联。路由策略、健康检查和限制见 [ASR 负载均衡代理](../guides/ASR负载均衡代理.md) 与 [proxy 路由设计](designs/proxy-concurrent-routing.md)。
