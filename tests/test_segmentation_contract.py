@@ -18,6 +18,7 @@ import websockets
 
 from config_server import ServerConfig
 from core.protocol import AudioMessage
+from core.server import segmenter as shared_segmenter
 from core.server.connection import ws_recv
 from core.server.connection.ws_recv import AudioCache
 from tests.harness.client import collect_terminal, transcribe
@@ -59,12 +60,12 @@ def test_rejects_segmentation_values_outside_allowed_range(
 
 def test_engine_segment_limits_follow_config_without_loading_models(monkeypatch):
     monkeypatch.setattr(ServerConfig, "model_type", "qwen_asr")
-    assert ws_recv._engine_segment_limit() == 80.0
+    assert shared_segmenter.engine_segment_limit() == 80.0
     monkeypatch.setattr(ServerConfig, "model_type", "qwen_asr_mlx")
-    assert ws_recv._engine_segment_limit() == 80.0
+    assert shared_segmenter.engine_segment_limit() == 80.0
     for model_type in ("paraformer", "sensevoice", "fun_asr_nano"):
         monkeypatch.setattr(ServerConfig, "model_type", model_type)
-        assert ws_recv._engine_segment_limit() is None
+        assert shared_segmenter.engine_segment_limit() is None
 
 
 def test_snap_validation_accounts_for_maximum_cut_and_search_after(monkeypatch):
@@ -129,7 +130,7 @@ async def test_final_file_cut_does_not_wait_for_more_audio(monkeypatch):
             return 72.0, False
 
     monkeypatch.setattr(ServerConfig, "seg_cut_snap", True)
-    monkeypatch.setattr(ws_recv, "_engine_segment_limit", lambda: 80.0)
+    monkeypatch.setattr(shared_segmenter, "engine_segment_limit", lambda: 80.0)
     monkeypatch.setattr(ws_recv, "get_cut_finder", Finder)
     cache = AudioCache()
     cache.chunks = bytes(100 * 16000 * 4)
