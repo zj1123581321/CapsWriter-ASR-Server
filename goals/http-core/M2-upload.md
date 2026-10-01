@@ -25,4 +25,5 @@ merged_pr: null
   - 本地全量 `pytest tests/`：294 passed / 3 skipped（3 项为既有模型依赖缺失 skip：ForceAligner ×2、silero-VAD）。
   - 启用可见性：默认关闭、坏数据目录/端口冲突/同目录第二实例均真实非零退出，SIGTERM 零退出并释放端口。
   - 文件识别仍不可用：无推理协调者时 `commit` 明确 `503 inference_unavailable`，真实 runner 属于 M3。
+  - 共同 `_read_body` 每次等下一块复用 `CW_UPLOAD_IDLE_SECONDS`：create/PATCH/commit 半开 408、两半开释放后新请求成功、慢传总时长大于 idle 仍成功；见 `tests/test_http_file_tasks.py` 与 `tests/test_http_supervision.py::test_real_process_body_idle_timeout_is_not_fatal_and_releases_port`。未把默认 300 冒充实跑 300 秒。
 - **完成条件**：六个 HTTP 基础操作和五个提交窗口有跨进程测试，HTTP 未显式启用时旧 WS 全量不变。

@@ -61,3 +61,5 @@ export CW_HTTP_DATA_DIR=/var/lib/capswriter/http
 POSIX 下服务端会将数据目录与 `sources/` 收紧为 `0700`，并将数据库、WAL/SHM、锁文件和 source 文件设为 `0600`，不依赖进程 umask。Windows 上代码未设置或验证 NTFS ACL；启用前需确认 `CW_HTTP_DATA_DIR` 的 ACL 仅允许服务账户与管理员访问，本仓未在真实 Windows 环境验证该 ACL。
 
 当前该入口只交付上传与查询底座：文件识别协调者装配前，`commit` 明确返回 `503 inference_unavailable`，已上传字节与恢复凭据都保留，可在该入口可用后显式继续。
+
+HTTP 读取请求体时复用既有 `CW_UPLOAD_IDLE_SECONDS`（默认 300 秒）：每次等待下一块数据的空闲期限，不是整个 request 的总时长。超时只结束该请求并返回 `408 request_timeout`，不删除已确认前缀，也不把 TimeoutError 当成未知 fatal。本页不把默认 300 说成已在 Windows/macOS 或真实墙上时钟跑过 300 秒。
