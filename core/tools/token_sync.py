@@ -13,6 +13,9 @@
   避免多字符 token 被局部修改时丢字符（如 "cloud" → "Claude" 中 "l" 被跳过的问题）。
 - _handle_insert 不再只保留标点：所有插入文本（热词、标点等）都用 _tokenize_replacement
   切分后完整保留。
+
+契约：输入 tokens 与 timestamps 必须一一对应；本模块不得通过 zip 截断不等长 raw
+数组。最终文件结果由 pipeline 收尾阶段继续校验拼接正文。
 """
 
 import difflib
@@ -94,6 +97,12 @@ def sync_tokens_from_text(
     Returns:
         (new_tokens, new_timestamps) 同步后的 token 序列
     """
+    if len(raw_tokens) != len(raw_timestamps):
+        raise ValueError(
+            "tokens 和 timestamps 长度必须一致: "
+            f"{len(raw_tokens)} != {len(raw_timestamps)}"
+        )
+
     # ── Phase 1: 展开多字符 token ──────────────────────────
     need_merge = any(len(t) > 1 for t in raw_tokens)
     if need_merge:

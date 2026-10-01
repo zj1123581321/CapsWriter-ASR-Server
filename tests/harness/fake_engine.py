@@ -38,6 +38,9 @@ class ProgrammableFakeEngine(BaseASREngine):
         delay_seconds: float = 0.0,
         supports_punc: bool = False,
         supports_timestamps: bool = False,
+        result_text: Optional[str] = None,
+        result_tokens: Optional[list[str]] = None,
+        result_timestamps: Optional[list[float]] = None,
         calls=None,
     ):
         super().__init__(config)
@@ -46,6 +49,9 @@ class ProgrammableFakeEngine(BaseASREngine):
         self.delay_seconds = delay_seconds
         self.supports_punc = supports_punc
         self.supports_timestamps = supports_timestamps
+        self.result_text = result_text
+        self.result_tokens = result_tokens
+        self.result_timestamps = result_timestamps
         self.calls = calls if calls is not None else []
         self.call_count = 0
 
@@ -84,7 +90,15 @@ class ProgrammableFakeEngine(BaseASREngine):
 
         start_ms = round(start_sample * 1000 / sample_rate)
         duration_ms = round(len(samples) * 1000 / sample_rate)
-        stream.result.text = f"{start_ms}ms=[s={start_ms},n={duration_ms}]"
+        stream.result.text = (
+            self.result_text
+            if self.result_text is not None
+            else f"{start_ms}ms=[s={start_ms},n={duration_ms}]"
+        )
+        if self.result_tokens is not None:
+            stream.result.tokens = list(self.result_tokens)
+        if self.result_timestamps is not None:
+            stream.result.timestamps = list(self.result_timestamps)
         return stream.result
 
     def cleanup(self):
