@@ -8,7 +8,6 @@ WebSocket 接收处理模块
 import asyncio
 import binascii
 import json
-import math
 import os
 import time
 from base64 import b64decode
@@ -26,11 +25,10 @@ from ..state import (
     set_task_draining,
 )
 from ..schema import Task
+from .. import segmenter as shared_segmenter
 from ..segmenter import PcmSegmenter
 from config_server import (
     ServerConfig as Config,
-    Qwen3ASRGGUFArgs,
-    QwenASRMLXArgs,
 )
 from core.protocol import AudioMessage
 from core.constants import AudioFormat
@@ -71,42 +69,14 @@ class AudioCache(PcmSegmenter):
         self.decoder_task = None
 
 
-def _engine_segment_limit() -> float | None:
-    """读取当前 ASR 配置的单段上限，不加载识别模型。"""
-    model_type = Config.model_type.lower()
-    if model_type == 'qwen_asr':
-        return Qwen3ASRGGUFArgs.chunk_size
-    if model_type == 'qwen_asr_mlx':
-        return QwenASRMLXArgs.chunk_size
-    return None
-
-
 def _validate_segmentation(msg: AudioMessage, cache: AudioCache) -> None:
-    """校验当前帧分段参数，并锁定任务首帧的参数值。"""
-    nominal, overlap = float(msg.seg_duration), float(msg.seg_overlap)
-    if not math.isfinite(nominal) or nominal < 5:
-        raise ValueError(f"seg_duration={nominal:g} 不在允许范围 [5, +∞)")
-    if not math.isfinite(overlap) or overlap < 0 or overlap >= nominal / 2:
-        raise ValueError(
-            f"seg_overlap={overlap:g} 不在允许范围 [0, seg_duration/2={nominal / 2:g})"
-        )
+    """校验当前帧分段参数，并锁定任务首帧的参数值。
 
-    limit = _engine_segment_limit()
-    if limit is not None:
-        if Config.seg_cut_snap:
-            max_cut = max(Config.seg_max_cut, nominal + Config.seg_search_after)
-            max_segment = max_cut + overlap
-            values = (
-                f"seg_max_cut={Config.seg_max_cut:g}, seg_duration={nominal:g}, "
-                f"seg_search_after={Config.seg_search_after:g}, seg_overlap={overlap:g}"
-            )
-        else:
-            max_segment = nominal + overlap
-            values = f"seg_duration={nominal:g}, seg_overlap={overlap:g}"
-        if max_segment > limit:
-            raise ValueError(
-                f"{values} 导致单段最长 {max_segment:g}s，允许范围 ≤ 引擎上限 {limit:g}s"
-            )
+    取值范围与引擎单段上限是无状态共享规则，由 core.server.segmenter 统一提供；
+    此处只保留 WS 连接的首帧锁定与缓冲任务匹配语义。
+    """
+    nominal, overlap = float(msg.seg_duration), float(msg.seg_overlap)
+    shared_segmenter.validate_segment_params(nominal, overlap)
 
     if cache.task_id == msg.task_id:
         first_nominal, first_overlap = cache.segmentation_params
@@ -126,7 +96,7 @@ def _validate_segmentation(msg: AudioMessage, cache: AudioCache) -> None:
 
 
 def _assert_segment_within_limit(duration: float) -> None:
-    limit = _engine_segment_limit()
+    limit = shared_segmenter.engine_segment_limit()
     if limit is not None and duration > limit:
         raise AssertionError(
             f"提交段长 {duration:.6f}s 超过引擎单段上限 {limit:.6f}s"
@@ -153,7 +123,7 @@ async def _submit_segments(
     """
     cache.configure(
         cut_finder=get_cut_finder() if Config.seg_cut_snap else None,
-        engine_segment_limit=_engine_segment_limit(),
+        engine_segment_limit=shared_segmenter.engine_segment_limit(),
         cut_snap=Config.seg_cut_snap,
         search_before=Config.seg_search_before,
         search_after=Config.seg_search_after,

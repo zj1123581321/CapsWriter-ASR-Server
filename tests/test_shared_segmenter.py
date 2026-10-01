@@ -11,6 +11,7 @@ from core.protocol import AudioMessage
 from core.server.connection import ws_recv
 from core.server.connection.ws_recv import AudioCache, _submit_segments, _validate_segmentation
 from core.server.schema import Result
+from core.server import segmenter as shared_segmenter
 from core.server.segmenter import PcmSegmenter
 from core.server.worker.audio import process_audio_task
 
@@ -306,3 +307,30 @@ async def test_final_segment_keeps_complete_samples_after_quantized_stride(
         Result(task_id=final_task.task_id, socket_id=final_task.socket_id, type=final_task.type),
     )
     assert samples.tobytes() == remaining
+
+
+@pytest.mark.parametrize(
+    ("snap", "nominal", "overlap", "expected"),
+    [
+        (False, 4.999, 0.0, "seg_duration=4.999"),
+        (False, 5.0, -0.5, "seg_overlap=-0.5"),
+        (False, 5.0, 2.5, "seg_overlap=2.5"),
+        (False, 79.0, 2.0, "单段最长 81s"),
+        (True, 70.0, 8.0, "单段最长 83s"),
+    ],
+)
+def test_shared_segment_params_rule_is_connection_free(
+    monkeypatch, snap, nominal, overlap, expected
+):
+    """共享无状态规则独立于 WS 缓存/连接，直接按 Config 判定。"""
+    monkeypatch.setattr(shared_segmenter.Config, "model_type", "qwen_asr")
+    monkeypatch.setattr(shared_segmenter.Config, "seg_cut_snap", snap)
+    with pytest.raises(ValueError, match=expected):
+        shared_segmenter.validate_segment_params(nominal, overlap)
+
+
+def test_shared_segment_params_rule_accepts_decimal_and_snap_budget(monkeypatch):
+    monkeypatch.setattr(shared_segmenter.Config, "model_type", "qwen_asr")
+    monkeypatch.setattr(shared_segmenter.Config, "seg_cut_snap", True)
+    shared_segmenter.validate_segment_params(70.0, 5.0)
+    shared_segmenter.validate_segment_params(5.00001, 0.50001)
