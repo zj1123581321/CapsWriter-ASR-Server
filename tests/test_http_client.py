@@ -404,3 +404,65 @@ def test_cli_http_result_has_nonzero_failure_without_token_in_stderr(tmp_path):
     assert result.returncode != 0
     assert "not json" not in result.stderr
     assert "token-for-test-only" not in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_cli_submit_subprocess_emits_real_http_requests_and_no_token(tmp_path):
+    source = tmp_path / "clip.aac"
+    source.write_bytes(b"012345")
+    resume_path = tmp_path / "resume.json"
+
+    async def handler(request: TcpRequest):
+        if request.target == "/v1/uploads":
+            payload = json.loads(request.body)
+            assert payload["size_bytes"] == 6
+            assert request.headers["authorization"].startswith("Bearer ")
+            return response(
+                201,
+                {
+                    "upload_id": "upload-cli",
+                    "state": "UPLOADING",
+                    "size_bytes": 6,
+                    "confirmed_offset": 0,
+                    "expires_at": "2026-10-08T00:00:00Z",
+                },
+            )
+        if request.method == "PATCH":
+            offset = int(request.headers["upload-offset"])
+            assert request.body == source.read_bytes()[offset : offset + len(request.body)]
+            return 204, {
+                "Upload-Offset": str(offset + len(request.body)),
+                "Content-Length": "0",
+            }, b""
+        assert request.target == "/v1/uploads/upload-cli/commit"
+        return response(202, {"job_id": "job-cli", "state": "QUEUED"})
+
+    async with TcpCapture(handler) as server:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "capswriter_asr",
+            "http",
+            "submit",
+            str(source),
+            "--url",
+            server.url,
+            "--resume-file",
+            str(resume_path),
+            "--chunk-bytes",
+            "3",
+            env={
+                **os.environ,
+                "PYTHONPATH": str(REPO_ROOT / "sdk"),
+                "HTTP_PROXY": "http://127.0.0.1:1",
+                "HTTPS_PROXY": "http://127.0.0.1:1",
+            },
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+
+    assert process.returncode == 0, stderr
+    assert str(resume_path) in stdout.decode()
+    assert b"Bearer" not in stdout + stderr
+    assert [request.method for request in server.requests] == ["POST", "PATCH", "PATCH", "POST"]

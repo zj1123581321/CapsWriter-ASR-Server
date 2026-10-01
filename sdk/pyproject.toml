@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "CapsWriter ASR protocol v2 client SDK"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["websockets>=15.0.1", "numpy"]
+dependencies = ["websockets>=15.0.1", "numpy", "httpx==0.28.1"]
 
 [tool.setuptools]
 packages = ["capswriter_asr"]

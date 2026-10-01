@@ -51,6 +51,41 @@ SDK 也提供命令行字幕导出，默认写入 SRT：
 python -m capswriter_asr meeting.m4a --url ws://127.0.0.1:6016 --encoding s16le --out-dir subtitles --format srt,txt,json
 ```
 
+## HTTP 文件任务（显式提交与恢复）
+
+HTTP 文件入口直接连接固定的 ASR HTTP 地址，上传的是原文件二进制，不会在客户端
+额外转码或把文件改成有损格式。它使用 HTTPX 0.28.1，并关闭环境代理、重定向和库级
+重试；网络失败后不会自动重发，也不会回退到 WebSocket。当前服务端 HTTP 文件任务由
+后续增量交付，本节的 SDK/CLI 不能单独让尚未实现该接口的服务端可用。
+
+提交前 SDK 会先把包含领取凭据的恢复文件原子写入指定路径并设为用户私有权限。该文件
+是恢复上传、查询状态和领取结果的唯一凭据，应放在安全位置，不要提交到版本库、复制到
+日志或发给他人。成功提交只表示文件已被服务端受理，不表示识别已经完成：
+
+```bash
+python -m capswriter_asr http submit meeting.m4a \
+  --url http://127.0.0.1:6017 \
+  --resume-file ~/.capswriter/meeting.resume.json
+
+python -m capswriter_asr http resume meeting.m4a \
+  --url http://127.0.0.1:6017 \
+  --resume-file ~/.capswriter/meeting.resume.json
+
+python -m capswriter_asr http status \
+  --url http://127.0.0.1:6017 \
+  --resume-file ~/.capswriter/meeting.resume.json
+
+python -m capswriter_asr http result \
+  --url http://127.0.0.1:6017 \
+  --resume-file ~/.capswriter/meeting.resume.json \
+  --out-dir subtitles --format srt,txt,json
+```
+
+`resume` 是用户在失败后明确执行的恢复动作：它会重新核对源文件大小和 SHA-256，
+查询服务端确认的 offset，只上传未确认的原始字节，且不能替换原地址或提交参数。
+`status` 只查一次，`result` 只领取 DONE 的完整结果，不会后台轮询。服务端源音频按
+协议保留终端任务后的 7 天，任务记录和结果不因源文件清理而删除。
+
 ## 直接使用 WebSocket
 
 非 Python 客户端可直接按[协议 v2](../docs/reference/protocol.md)接入。仓库提供了一个只接受 16 kHz、单声道、PCM16 WAV 短音频的[最小 Python 示例](../examples/websocket_transcribe.py)，展示末帧样本数、并发收发与服务端错误处理。
