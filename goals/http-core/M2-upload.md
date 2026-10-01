@@ -2,7 +2,7 @@
 lane: http-core
 id: M2
 slug: upload
-status: 进行中
+status: 实现完成待验收
 owner: pi协调
 order: 2
 priority: 高
@@ -17,6 +17,11 @@ merged_pr: null
 - **关键决策**：二进制请求体、Bearer capability、无隐式 retry/redirect/fallback；确认晚于文件与任务记录可靠提交。
 - **已知阻塞**：M1已合并，接口/依赖/资源契约已固定；本阶段开始受限上传与存储实现，真实模型runner属于M3。本条激活不代表HTTP已可用。
 - **推进前必须拿到的证据**：
-  - [ ] 实际 HTTP producer body、headers、恢复文件字节和文件落盘字节一致；环境：本地隔离 port 0/tmp，入口：真实 SDK/CLI 请求。
-  - [ ] 真实服务进程重启后 confirmed_offset 可继续；环境：本地隔离服务进程，入口：HTTP upload/resume。
+  - [x] 实际 HTTP producer body、headers、恢复文件字节和文件落盘字节一致；环境：本地隔离 port 0/tmp，入口：真实 SDK 请求（`tests/test_http_file_tasks.py::test_sdk_upload_reaches_disk_then_commit_is_explicitly_unavailable`）。
+  - [x] 重开同一数据目录后 confirmed_offset 与持久结果可继续；环境：本地隔离目录 + 全新 listener/连接；重启收敛与部分前缀保留见 `tests/test_http_store.py::test_restart_converges_queued_and_running_but_keeps_partial_and_done`。
+- **本卡证据**（待主脑验收，不自评完成）：
+  - PR #38（draft，未合并、未部署）：`card/http-e2-upload-261001`。
+  - 本地全量 `pytest tests/`：294 passed / 3 skipped（3 项为既有模型依赖缺失 skip：ForceAligner ×2、silero-VAD）。
+  - 启用可见性：默认关闭、坏数据目录/端口冲突/同目录第二实例均真实非零退出，SIGTERM 零退出并释放端口。
+  - 文件识别仍不可用：无推理协调者时 `commit` 明确 `503 inference_unavailable`，真实 runner 属于 M3。
 - **完成条件**：六个 HTTP 基础操作和五个提交窗口有跨进程测试，HTTP 未显式启用时旧 WS 全量不变。
