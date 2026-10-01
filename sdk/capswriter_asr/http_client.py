@@ -49,6 +49,9 @@ class FileTaskStatus:
     result_available: bool
     source_available: bool
     error_code: str | None
+    time_start: float | None
+    time_submit: float | None
+    time_complete: float | None
     raw: dict
 
 
@@ -143,16 +146,8 @@ def _write_recovery(path: Path, payload: dict) -> None:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
-    except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _persist(payload: dict, recovery_path: Path) -> None:
@@ -210,6 +205,21 @@ def _load_recovery(path: Path) -> dict:
         or not 0 <= payload["confirmed_offset"] <= payload["size_bytes"]
     ):
         raise AsrError("recovery_invalid", "恢复文件字段无效", recovery_path=path)
+    options = payload["options"]
+    if set(options) != {"language", "context", "model", "seg_duration", "seg_overlap"}:
+        raise AsrError("recovery_invalid", "恢复文件选项字段无效", recovery_path=path)
+    for field in ("language", "context", "model"):
+        if options[field] is not None and not isinstance(options[field], str):
+            raise AsrError("recovery_invalid", "恢复文件选项字段无效", recovery_path=path)
+    for field in ("seg_duration", "seg_overlap"):
+        value = options[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise AsrError("recovery_invalid", "恢复文件选项字段无效", recovery_path=path)
     try:
         payload["base_url"] = _base_url(payload["base_url"])
     except AsrError as exc:
@@ -686,12 +696,24 @@ async def get_file_job_http(base_url, *, resume_path) -> FileTaskStatus:
         result_available = payload["result_available"]
         source_available = payload["source_available"]
         error_code = payload["error_code"]
+        time_start = payload["time_start"]
+        time_submit = payload["time_submit"]
+        time_complete = payload["time_complete"]
         if (
             job_id != recovery["job_id"]
             or state not in _JOB_STATES
             or not isinstance(result_available, bool)
             or not isinstance(source_available, bool)
             or (error_code is not None and not isinstance(error_code, str))
+            or any(
+                value is not None
+                and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                )
+                for value in (time_start, time_submit, time_complete)
+            )
         ):
             raise ValueError("job")
     except (KeyError, TypeError, ValueError) as exc:
@@ -702,6 +724,9 @@ async def get_file_job_http(base_url, *, resume_path) -> FileTaskStatus:
         result_available=result_available,
         source_available=source_available,
         error_code=error_code,
+        time_start=None if time_start is None else float(time_start),
+        time_submit=None if time_submit is None else float(time_submit),
+        time_complete=None if time_complete is None else float(time_complete),
         raw=payload,
     )
 
@@ -772,30 +797,53 @@ async def get_file_result_http(base_url, *, resume_path) -> Transcript:
     return _transcript_from_http(payload, recovery_path)
 
 
-def submit_file_http_sync(path, base_url, **kwargs) -> FileTaskHandle:
+def submit_file_http_sync(
+    path,
+    base_url,
+    *,
+    resume_path,
+    language=None,
+    context=None,
+    model=None,
+    seg_duration=15.0,
+    seg_overlap=2.0,
+    chunk_bytes=1048576,
+) -> FileTaskHandle:
     """submit_file_http 的同步入口。"""
     import asyncio
 
-    return asyncio.run(submit_file_http(path, base_url, **kwargs))
+    return asyncio.run(
+        submit_file_http(
+            path,
+            base_url,
+            resume_path=resume_path,
+            language=language,
+            context=context,
+            model=model,
+            seg_duration=seg_duration,
+            seg_overlap=seg_overlap,
+            chunk_bytes=chunk_bytes,
+        )
+    )
 
 
-def resume_file_http_sync(path, base_url, **kwargs) -> FileTaskHandle:
+def resume_file_http_sync(path, base_url, *, resume_path) -> FileTaskHandle:
     """resume_file_http 的同步入口。"""
     import asyncio
 
-    return asyncio.run(resume_file_http(path, base_url, **kwargs))
+    return asyncio.run(resume_file_http(path, base_url, resume_path=resume_path))
 
 
-def get_file_job_http_sync(base_url, **kwargs) -> FileTaskStatus:
+def get_file_job_http_sync(base_url, *, resume_path) -> FileTaskStatus:
     """get_file_job_http 的同步入口。"""
     import asyncio
 
-    return asyncio.run(get_file_job_http(base_url, **kwargs))
+    return asyncio.run(get_file_job_http(base_url, resume_path=resume_path))
 
 
-def get_file_result_http_sync(base_url, **kwargs) -> Transcript:
+def get_file_result_http_sync(base_url, *, resume_path) -> Transcript:
     """get_file_result_http 的同步入口。"""
     import asyncio
 
-    return asyncio.run(get_file_result_http(base_url, **kwargs))
+    return asyncio.run(get_file_result_http(base_url, resume_path=resume_path))
 

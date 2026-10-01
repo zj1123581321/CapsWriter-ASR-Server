@@ -241,6 +241,12 @@ def _transcript(result: dict) -> Transcript:
         timestamps=result.get("timestamps", []),
         duration=float(result.get("duration", 0.0)),
         raw=result,
+        task_id=result.get("task_id"),
+        is_final=result.get("is_final", True),
+        time_start=result.get("time_start"),
+        time_submit=result.get("time_submit"),
+        time_complete=result.get("time_complete"),
+        text_accu=result.get("text_accu"),
     )
 
 

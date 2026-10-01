@@ -305,6 +305,9 @@ async def test_status_and_result_require_exact_fields_and_preserve_transcript(tm
                         "result_available": True,
                         "source_available": True,
                         "error_code": None,
+                        "time_start": 1.0,
+                        "time_submit": 2.0,
+                        "time_complete": 3.0,
                     },
                 )
             assert request.target == "/v1/jobs/job-1/result"
