@@ -188,7 +188,8 @@ async def test_submit_saves_recovery_before_real_binary_upload(tmp_path):
             )
             assert request.headers["upload-offset"] == str(previous)
             assert int(request.headers["content-length"]) == len(request.body)
-            return 204, {"Upload-Offset": "10", "Content-Length": "0"}, b""
+            new_offset = previous + len(request.body)
+            return 204, {"Upload-Offset": str(new_offset), "Content-Length": "0"}, b""
         if request.target == "/v1/uploads/upload-1/commit":
             assert request.method == "POST"
             assert request.body == b""
@@ -278,10 +279,10 @@ async def test_resume_queries_offset_and_only_sends_remaining_source_bytes(tmp_p
                 return response(202, {"job_id": "job-1", "state": "QUEUED"})
             raise AssertionError((request.method, request.target))
 
-        server.handler = actual_handler
+        unused.handler = actual_handler
         handle = await resume_file_http(source, unused.url, resume_path=resume_path)
         assert handle.job_id == "job-1"
-        assert [request.method for request in server.requests] == ["GET", "PATCH", "POST"]
+        assert [request.method for request in unused.requests] == ["GET", "PATCH", "POST"]
 
 
 @pytest.mark.asyncio
@@ -303,6 +304,7 @@ async def test_status_and_result_require_exact_fields_and_preserve_transcript(tm
                         "state": "DONE",
                         "result_available": True,
                         "source_available": True,
+                        "error_code": None,
                     },
                 )
             assert request.target == "/v1/jobs/job-1/result"
@@ -366,9 +368,10 @@ async def test_invalid_http_responses_are_visible(tmp_path, status, body, expect
     source = tmp_path / "source.mp3"
     source.write_bytes(b"audio")
     resume_path = tmp_path / "resume.json"
-    async with TcpCapture(
-        lambda _request: response(status, body, Location="http://elsewhere.invalid")
-    ) as server:
+    async def handler(_request: TcpRequest):
+        return response(status, body, Location="http://elsewhere.invalid")
+
+    async with TcpCapture(handler) as server:
         _write_recovery(resume_path, recovery_payload(source, server.url))
         payload = json.loads(resume_path.read_text())
         payload["job_id"] = "job-1"

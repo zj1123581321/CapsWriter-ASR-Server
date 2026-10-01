@@ -23,11 +23,19 @@ import websockets
 class AsrError(Exception):
     """服务端或 SDK 可识别的转录失败。"""
 
-    def __init__(self, code: str, message: str, retryable: bool = False):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        retryable: bool = False,
+        *,
+        recovery_path=None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.recovery_path = recovery_path
 
 
 @dataclass
@@ -37,6 +45,12 @@ class Transcript:
     timestamps: list[float]
     duration: float
     raw: dict
+    task_id: str | None = None
+    is_final: bool = True
+    time_start: float | None = None
+    time_submit: float | None = None
+    time_complete: float | None = None
+    text_accu: str | None = None
 
 
 _CHUNK_BYTES = 256 * 1024
