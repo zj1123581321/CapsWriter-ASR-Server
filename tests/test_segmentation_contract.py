@@ -77,6 +77,16 @@ def test_snap_validation_accounts_for_maximum_cut_and_search_after(monkeypatch):
     ws_recv._validate_segmentation(make_message(duration=70, overlap=4), cache)
 
 
+def test_finite_decimal_segmentation_values_remain_legal(monkeypatch):
+    monkeypatch.setattr(ServerConfig, "model_type", "qwen_asr")
+    monkeypatch.setattr(ServerConfig, "seg_cut_snap", False)
+    cache = AudioCache()
+    ws_recv._validate_segmentation(
+        make_message(duration=5.00001, overlap=0.50001), cache
+    )
+    assert cache.segmentation_params == (5.00001, 0.50001)
+
+
 def test_task_cannot_change_segmentation_parameters_after_first_frame(monkeypatch):
     monkeypatch.setattr(ServerConfig, "model_type", "qwen_asr")
     cache = AudioCache()

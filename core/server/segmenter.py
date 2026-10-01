@@ -196,10 +196,10 @@ class PcmSegmenter:
             segments.append(self._cut(cut, overlap))
 
     def _cut(self, cut: float, overlap: float) -> PcmSegment:
-        stride_bytes = round(cut * AudioFormat.BYTES_PER_SECOND)
-        segment_bytes = stride_bytes + round(
-            overlap * AudioFormat.BYTES_PER_SECOND
-        )
+        stride_samples = round(cut * AudioFormat.SAMPLE_RATE)
+        overlap_samples = round(overlap * AudioFormat.SAMPLE_RATE)
+        stride_bytes = stride_samples * AudioFormat.BYTES_PER_SAMPLE
+        segment_bytes = (stride_samples + overlap_samples) * AudioFormat.BYTES_PER_SAMPLE
         segment_data = self.chunks[:segment_bytes]
         self._assert_within_limit(segment_data)
         segment = PcmSegment(
