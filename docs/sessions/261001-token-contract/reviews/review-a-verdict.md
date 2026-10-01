@@ -39,6 +39,6 @@ failure-visibility: p2-only
 ## 验证与限制
 
 - 指定环境命令（Python 3.12、websockets==15.0.1；清除 PI_LEAD_SESSION、DELEGATE_DISPATCH_ID、DELEGATE_TASK_ID、DELEGATE_EXECUTOR；TASK_ID 起跑环境未设置）运行三个新增测试文件及 tests/test_aligner_failfast.py：32 passed, 6 warnings in 0.60s，退出码 0。六条 warning 是 multiprocessing fork 对多线程进程的弃用警告。
-- OCR envelope 为完整可解析 JSON（7055 bytes）：status=reviewed_fallback、coverage=complete、cli_status=complete、1 条 finding；reason=primary=leg_timeout; backup:deepseek=success。primary 诊断缓存：/home/zlx/.cache/ocr/ocr-failure-minimax-1790844152038679553.stderr；完整 envelope：/tmp/capswriter-issue40-review-a-ocr.json。finding 经上面的独立 mic 探针核实；工具标注 high 未直接当成本仓等级。
+- OCR envelope 为完整可解析 JSON（7055 bytes）：status=reviewed_fallback、coverage=complete、cli_status=complete、1 条 finding；reason=primary=leg_timeout; backup:deepseek=success。primary 诊断缓存：~/.cache/ocr/ocr-failure-minimax-1790844152038679553.stderr；完整 envelope：/tmp/capswriter-issue40-review-a-ocr.json。finding 经上面的独立 mic 探针核实；工具标注 high 未直接当成本仓等级。
 - 未做 base scratch-worktree 红验抽查。未读取 docs/sessions/261001-token-contract/progress/implementation.md，以遵守任务卡“不得读实现执行器 report/推理”的独立性边界；其余冻结实现、协议和新增测试 diff 已逐项审查。
 - 主干基线在派发时不可用（gh api request failed）；因此继承红/新红无法比较，继承红标记为未能判定。未测真实 HTTP 服务、真实模型音频质量或部署行为。
