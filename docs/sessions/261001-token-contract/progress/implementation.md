@@ -69,3 +69,21 @@
 
 ### 下一步唯一动作
 提交本进度记录，推送最终 head，读取远端 PR head/body/checks 和工作树状态，写入完整执行报告。
+
+## 里程碑：审查后范围修复
+
+### 当前阶段
+已按 Review-A 的唯一 P2 做最小减法修复：恢复 mic 旧空格口径，文件正文拼接检查只约束 file。准备推送 H1 并保持 PR 41 为草稿。
+
+### 本段结论
+- 独立探针与新增回归确认 H0 把 `hello world` 切成 11 个含空格 token、步长约 0.00909；修复后恢复 10 个非空格 token、步长 0.01，`text_accu` 仍为原文。
+- 最终 `"".join(tokens) == text_accu` 只对 `task.type == 'file'` 强制；mic 有原生 tokens 时不再被该等式误拒。raw 长度检查和最终等长检查保留。
+- 窄测 35 passed；裸消费环境两档全量均为 289 passed、3 skipped、91 warnings。
+- Review-A 结论文件按 `668be7c` 原样纳入，历史 FAIL 未改写。
+
+### 关键决策与已否决
+- 不把 mic 升格为全任务 join 保证，不新增状态、fallback 或错误码。
+- 不修改审查 verdict 文本来让它变绿；修复只记本进度段。
+
+### 下一步唯一动作
+推送 H1，回读 PR 41 草稿正文确认仅 file 保证并保持 draft，写入执行器报告后释放。
