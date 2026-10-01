@@ -78,7 +78,15 @@ class CapsWriterServer:
         # 3. 收尾 HTTP 文件任务（等在途 I/O 结束后再停 loop）
         if self.http_server is not None:
             future = asyncio.ensure_future(self.http_server.stop())
-            future.add_done_callback(lambda _f: self.loop.stop())
+
+            def finish_http_shutdown(done):
+                error = done.exception()
+                if error is not None:
+                    self.exit_code = 1
+                    logger.error("HTTP 收尾失败：%s", error)
+                self.loop.stop()
+
+            future.add_done_callback(finish_http_shutdown)
         else:
             self.loop.stop()
 
@@ -137,9 +145,12 @@ class CapsWriterServer:
         try:
             self.loop.run_until_complete(self._serve_all())
         except RuntimeError:
-            # 只容忍事件循环被 stop() 主动打断；HTTP 启动/监督失败不得被本宽 catch 吞掉
-            if self.exit_code:
-                raise SystemExit(self.exit_code)
+            # 正常信号会先将 is_alive 置 False，再由收尾回调 stop loop。
+            # 运行中的 listener RuntimeError 必须继续失败，不能按正常退出处理。
+            if self.is_alive:
+                if self.exit_code:
+                    raise SystemExit(self.exit_code)
+                raise
         if self.exit_code:
             raise SystemExit(self.exit_code)
 
@@ -154,15 +165,21 @@ class CapsWriterServer:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         error = None
         for task in done:
+            if task.cancelled():
+                continue
             exc = task.exception()
-            if exc is not None:
+            if exc is not None and error is None:
                 error = exc
-                if http_task is not None and task is http_task:
-                    self.exit_code = 1
-                break
+        if error is not None:
+            self.exit_code = 1
         for task in pending:
             task.cancel()
         if pending:
-            await asyncio.wait(pending, timeout=5)
+            outcomes = await asyncio.gather(*pending, return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                    if error is None:
+                        error = outcome
+                    self.exit_code = 1
         if error is not None:
             raise error

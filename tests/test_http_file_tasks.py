@@ -10,6 +10,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+import threading
 from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
@@ -24,6 +25,7 @@ from capswriter_asr import AsrError, resume_file_http, submit_file_http  # noqa:
 from capswriter_asr import http_client as sdk_http  # noqa: E402
 
 from core.server.http_server import HttpServer  # noqa: E402
+from core.server.http_store import HttpStoreError  # noqa: E402
 # HTTP listener 默认关闭，aiohttp 只在显式启用时安装：缺它就跳过，不假装通过
 pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 入口默认关闭")
 
@@ -95,6 +97,68 @@ async def _expect_error(coro, code: str) -> AsrError:
         await coro
     assert info.value.code == code, info.value.code
     return info.value
+
+
+async def _find_http_handler_task(path: str) -> asyncio.Task:
+    """取真实 aiohttp route task；不把客户端请求 task 当服务端 handler。"""
+    deadline = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < deadline:
+        for task in asyncio.all_tasks():
+            if task is asyncio.current_task() or task.done():
+                continue
+            coro = task.get_coro()
+            while coro is not None:
+                frame = getattr(coro, "cr_frame", None)
+                if frame is not None:
+                    request = frame.f_locals.get("request")
+                    if frame.f_code.co_name == "wrapped" and request is not None and request.path == path:
+                        return task
+                coro = getattr(coro, "cr_await", None)
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"没有找到真实 aiohttp handler task：{path}")
+
+
+async def _wait_for_worker_pending(worker, expected: int) -> None:
+    deadline = asyncio.get_running_loop().time() + 5
+    while len(worker._pending) != expected and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.005)
+    assert len(worker._pending) == expected
+
+
+@pytest.mark.asyncio
+async def test_io_mailbox_refuses_33rd_and_cancel_keeps_slot_until_future_done(tmp_path):
+    async with running_server(tmp_path) as (server, _base_url):
+        worker = server._worker
+        started, release = threading.Event(), threading.Event()
+
+        def blocked_operation():
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("test I/O barrier timed out")
+            return "done"
+
+        calls = [asyncio.create_task(worker.run(blocked_operation))]
+        assert await asyncio.to_thread(started.wait, 5)
+        calls.extend(asyncio.create_task(worker.run(lambda: "queued")) for _ in range(31))
+        try:
+            await _wait_for_worker_pending(worker, 32)
+            overflow = asyncio.create_task(worker.run(lambda: "must-reject"))
+            await asyncio.sleep(0)
+            assert overflow.done()
+            error = overflow.exception()
+            assert isinstance(error, HttpStoreError)
+            assert error.status == 429
+
+            calls[0].cancel()
+            cancelled = await asyncio.gather(calls[0], return_exceptions=True)
+            assert isinstance(cancelled[0], asyncio.CancelledError)
+            assert len(worker._pending) == 32
+            assert worker._mailbox._value == 0
+        finally:
+            release.set()
+            await asyncio.gather(*calls, return_exceptions=True)
+        await _wait_for_worker_pending(worker, 0)
+        assert worker._mailbox._value == 32
 
 
 @pytest.mark.asyncio
@@ -369,67 +433,184 @@ async def test_negative_matrix_keeps_old_bytes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_route_cancellation_does_not_end_underlying_io(tmp_path):
-    """主动暂停真实 I/O + 取消 route：写保护仍到 I/O 结束，新 PATCH 接着写而不是互相覆盖。"""
-    source = _source(tmp_path, size=2048)
-    digest = sha256(source.read_bytes()).hexdigest()
-    paused = asyncio.Event()
-    release = asyncio.Event()
-    calls = {"n": 0}
+async def test_body_and_handler_admission_rejects_without_waiting(tmp_path):
+    """17 条真实 TCP 请求停在 body 时超限快速 429，GET 不进入 semaphore 等待队列。"""
+    async with running_server(tmp_path) as (server, base_url):
+        port = int(base_url.rsplit(":", 1)[1])
+        pairs = []
+        request = (
+            f"POST /v1/uploads HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Authorization: Bearer admission-token\r\nIdempotency-Key: admission-key\r\n"
+            "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n"
+        ).encode()
+        try:
+            for _ in range(17):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(request)
+                await writer.drain()
+                pairs.append((reader, writer))
+            reads = [asyncio.create_task(reader.readline()) for reader, _ in pairs]
+            done, pending = await asyncio.wait(reads, timeout=1)
+            status_lines = [task.result() for task in done]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            assert len(status_lines) == 15
+            assert all(b" 429 " in line for line in status_lines)
+            assert server._handler_slots._value == 14
+            assert server._body_slots._value == 0
+            assert not server._handler_slots._waiters
+            assert not server._body_slots._waiters
 
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write((f"GET /v1/jobs/missing HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                          "Authorization: Bearer admission-token\r\nConnection: close\r\n\r\n").encode())
+            await writer.drain()
+            response = await asyncio.wait_for(reader.readline(), timeout=1)
+            assert b" 404 " in response
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            for _, writer in pairs:
+                writer.close()
+            await asyncio.gather(*(writer.wait_closed() for _, writer in pairs),
+                                 return_exceptions=True)
+        deadline = asyncio.get_running_loop().time() + 2
+        while server._body_slots._value != 2 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.005)
+        assert server.fatal is None
+        assert server._handler_slots._value == 16
+        assert server._body_slots._value == 2
+
+
+@pytest.mark.asyncio
+async def test_handler_cancellation_and_io_completion_orders_preserve_confirmed_bytes(tmp_path):
+    """真实 TCP route task 被取消；取消先/IO 先各五次，独立核对文件与 SQLite。"""
+    token = "capability-token-value"
     async with running_server(tmp_path, inference=True) as (server, base_url):
-        original = server._store.append_bytes
-
-        def pausing(*args, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                paused.set()
-                # 在 I/O 线程里同步等主循环放行，模拟真实慢写
-                asyncio.run_coroutine_threadsafe(release.wait(), server.app.loop).result()
-            return original(*args, **kwargs)
-
-        server._store.append_bytes = pausing
-        token = "capability-token-value"
-        headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": "create-key-1"}
         async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
-            created = await client.post(
-                base_url + "/v1/uploads",
-                headers=headers,
-                json={"size_bytes": source.stat().st_size, "sha256": digest, "options": {}},
-            )
-            assert created.status_code == 201
-            upload_id = created.json()["upload_id"]
-            patch_headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Length": "1024",
-                "Upload-Offset": "0",
-                "Content-Type": "application/octet-stream",
-            }
-            first = asyncio.ensure_future(
-                client.patch(f"{base_url}/v1/uploads/{upload_id}", headers=patch_headers,
-                             content=source.read_bytes()[:1024])
-            )
-            await asyncio.wait_for(paused.wait(), timeout=10)
-            first.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await first
-            # 取消只结束等待方：底层 I/O 仍在进行，数据库 offset 未前进
-            assert _confirmed_total(server.data_dir) == 0
-            release.set()
-            await asyncio.sleep(0.3)
-            # I/O 真正结束后 offset 才前进
-            assert _confirmed_total(server.data_dir) == 1024
-            # 随后的新 PATCH 从可信 offset 接着写，两种顺序都不丢字节
-            second = await client.patch(
-                f"{base_url}/v1/uploads/{upload_id}",
-                headers={**patch_headers, "Upload-Offset": "1024"},
-                content=source.read_bytes()[1024:],
-            )
-            assert second.status_code == 204
-            assert second.headers["Upload-Offset"] == "2048"
-        disk = server.data_dir / "sources" / f"{upload_id}.bin"
-        assert disk.read_bytes() == source.read_bytes()
-        assert _confirmed_total(server.data_dir) == 2048
+            for order in ("cancel-first", "io-first"):
+                for trial in range(5):
+                    source = bytes((65 + trial, 75 + trial, 85 + trial, 95 + trial))
+                    create = await client.post(
+                        base_url + "/v1/uploads",
+                        headers={"Authorization": f"Bearer {token}",
+                                 "Idempotency-Key": f"{order}-{trial}"},
+                        json={"size_bytes": len(source), "sha256": sha256(source).hexdigest(),
+                              "options": {}},
+                    )
+                    assert create.status_code == 201
+                    upload_id = create.json()["upload_id"]
+                    route_path = f"/v1/uploads/{upload_id}"
+                    patch_headers = {"Authorization": f"Bearer {token}",
+                                     "Content-Length": "2", "Upload-Offset": "0",
+                                     "Content-Type": "application/octet-stream"}
+                    io_started = threading.Event()
+                    io_release = threading.Event()
+                    io_finished = asyncio.Event()
+                    route_release = asyncio.Event()
+                    original_append = server._store.append_bytes
+                    original_run = server._worker.run
+
+                    def pause_before_io(upload, capability, offset, data):
+                        io_started.set()
+                        if not io_release.wait(5):
+                            raise RuntimeError("test I/O barrier timed out")
+                        return original_append(upload, capability, offset, data)
+
+                    async def pause_after_io(func, *args, **kwargs):
+                        result = await original_run(func, *args, **kwargs)
+                        if func is original_append and args[0] == upload_id and args[2] == 0:
+                            io_finished.set()
+                            await route_release.wait()
+                        return result
+
+                    if order == "cancel-first":
+                        server._store.append_bytes = pause_before_io
+                    else:
+                        server._worker.run = pause_after_io
+
+                    first_request = asyncio.create_task(client.patch(
+                        base_url + route_path, headers=patch_headers, content=source[:2]))
+                    try:
+                        if order == "cancel-first":
+                            assert await asyncio.to_thread(io_started.wait, 5)
+                        else:
+                            # 原 worker Future 已完整执行文件写入、fsync 与 SQLite offset commit。
+                            await asyncio.wait_for(io_finished.wait(), timeout=5)
+
+                        handler = await _find_http_handler_task(route_path)
+                        handler.cancel()
+                        cancelled = await asyncio.gather(handler, return_exceptions=True)
+                        assert isinstance(cancelled[0], asyncio.CancelledError)
+
+                        pending_after_cancel = 1 if order == "cancel-first" else 0
+                        await _wait_for_worker_pending(server._worker, pending_after_cancel)
+                        expected_free = server._worker._mailbox._value
+                        assert expected_free == (31 if order == "cancel-first" else 32)
+
+                        try:
+                            await asyncio.wait_for(first_request, timeout=5)
+                        except httpx.HTTPError:
+                            pass
+
+                        if order == "cancel-first":
+                            assert _read_db(server.data_dir,
+                                            "SELECT confirmed_offset FROM uploads WHERE upload_id=?",
+                                            (upload_id,))[0]["confirmed_offset"] == 0
+                            assert (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes() == b""
+                            get_request = asyncio.create_task(client.get(
+                                base_url + route_path,
+                                headers={"Authorization": f"Bearer {token}"}))
+                            stale_patch = asyncio.create_task(client.patch(
+                                base_url + route_path,
+                                headers={**patch_headers, "Upload-Offset": "0"}, content=source[:2]))
+                            await _wait_for_worker_pending(server._worker, 3)
+                            assert server._worker._mailbox._value == 29
+                            io_release.set()
+                            get_result, patch_result = await asyncio.gather(get_request, stale_patch)
+                            assert get_result.status_code == 200
+                            assert get_result.json()["confirmed_offset"] == 2
+                            assert patch_result.status_code == 409
+                            assert patch_result.json()["confirmed_offset"] == 2
+                        else:
+                            assert _read_db(server.data_dir,
+                                            "SELECT confirmed_offset FROM uploads WHERE upload_id=?",
+                                            (upload_id,))[0]["confirmed_offset"] == 2
+                            assert (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes() == source[:2]
+                            route_release.set()
+                            server._worker.run = original_run
+                            get_request = asyncio.create_task(client.get(
+                                base_url + route_path,
+                                headers={"Authorization": f"Bearer {token}"}))
+                            next_patch = asyncio.create_task(client.patch(
+                                base_url + route_path,
+                                headers={**patch_headers, "Upload-Offset": "2"}, content=source[2:]))
+                            get_result, patch_result = await asyncio.gather(get_request, next_patch)
+                            assert get_result.status_code == 200
+                            assert get_result.json()["confirmed_offset"] == 2
+                            assert patch_result.status_code == 204
+                            assert patch_result.headers["Upload-Offset"] == "4"
+
+                        if order == "cancel-first":
+                            await _wait_for_worker_pending(server._worker, 0)
+                            server._store.append_bytes = original_append
+                            resumed = await client.patch(
+                                base_url + route_path,
+                                headers={**patch_headers, "Upload-Offset": "2"}, content=source[2:])
+                            assert resumed.status_code == 204
+                            assert resumed.headers["Upload-Offset"] == "4"
+                        assert _read_db(server.data_dir,
+                                        "SELECT confirmed_offset FROM uploads WHERE upload_id=?",
+                                        (upload_id,))[0]["confirmed_offset"] == 4
+                        assert (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes() == source
+                        await _wait_for_worker_pending(server._worker, 0)
+                        assert server._worker._mailbox._value == 32
+                    finally:
+                        io_release.set()
+                        route_release.set()
+                        server._store.append_bytes = original_append
+                        server._worker.run = original_run
 
 
 @pytest.mark.asyncio
@@ -459,3 +640,58 @@ async def test_upload_identity_and_limit_validation(tmp_path):
         assert _read_db(server.data_dir, "SELECT COUNT(*) AS n FROM uploads")[0]["n"] == 0
         assert _read_db(server.data_dir, "SELECT COUNT(*) AS n FROM jobs")[0]["n"] == 0
         assert list((server.data_dir / "sources").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_options_missing_and_none_default_but_falsy_wrong_types_are_rejected(tmp_path):
+    source = b"keep"
+    digest = sha256(source).hexdigest()
+    async with running_server(tmp_path) as (server, base_url):
+        auth = {"Authorization": "Bearer option-token"}
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            missing = await client.post(
+                base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": "missing"},
+                json={"size_bytes": len(source), "sha256": digest},
+            )
+            explicit_none = await client.post(
+                base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": "none"},
+                json={"size_bytes": len(source), "sha256": digest, "options": None},
+            )
+            assert missing.status_code == 201
+            assert explicit_none.status_code == 201
+            upload_id = missing.json()["upload_id"]
+            written = await client.patch(
+                f"{base_url}/v1/uploads/{upload_id}",
+                headers={**auth, "Content-Length": str(len(source)), "Upload-Offset": "0",
+                         "Content-Type": "application/octet-stream"},
+                content=source,
+            )
+            assert written.status_code == 204
+            old_bytes = (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes()
+            old_row = dict(_read_db(server.data_dir,
+                                    "SELECT confirmed_offset, options_json FROM uploads WHERE upload_id=?",
+                                    (upload_id,))[0])
+            for index, wrong_type in enumerate(([], "", 0)):
+                rejected_existing = await client.post(
+                    base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": "missing"},
+                    json={"size_bytes": len(source), "sha256": digest, "options": wrong_type},
+                )
+                rejected_new = await client.post(
+                    base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": f"bad-{index}"},
+                    json={"size_bytes": len(source), "sha256": digest, "options": wrong_type},
+                )
+                assert rejected_existing.status_code == 400
+                assert rejected_new.status_code == 400
+            assert (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes() == old_bytes
+            assert dict(_read_db(server.data_dir,
+                                 "SELECT confirmed_offset, options_json FROM uploads WHERE upload_id=?",
+                                 (upload_id,))[0]) == old_row
+            assert _read_db(server.data_dir, "SELECT COUNT(*) AS n FROM uploads")[0]["n"] == 2
+            assert old_row["options_json"] == _read_db(
+                server.data_dir,
+                "SELECT options_json FROM uploads WHERE create_key='none'",
+            )[0]["options_json"]
+            assert json.loads(old_row["options_json"]) == {
+                "model": None, "language": None, "context": None,
+                "seg_duration": 15.0, "seg_overlap": 2.0,
+            }

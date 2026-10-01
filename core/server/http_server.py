@@ -25,7 +25,7 @@ import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from core.server.http_store import (
     IO_MAILBOX,
@@ -64,11 +64,12 @@ class HttpIoWorker:
     因此 SQLite 连接与文件写入永远在同一个线程。
     """
 
-    def __init__(self, mailbox: int = IO_MAILBOX):
+    def __init__(self, on_failure: Callable[[BaseException], None], mailbox: int = IO_MAILBOX):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="http-io")
         self._mailbox = asyncio.Semaphore(mailbox)
         self._pending: set = set()
         self._closed = False
+        self._on_failure = on_failure
 
     def run_sync(self, func, *args, timeout: float = 30.0):
         """在 I/O 线程里同步执行（装配/收尾用）：SQLite 连接只在那个线程创建与使用。"""
@@ -80,25 +81,26 @@ class HttpIoWorker:
         """把同步 store 操作交给 I/O worker；route 被取消时底层 I/O 仍会跑完。"""
         if self._closed:
             raise HttpServerError("HTTP I/O worker 已关闭")
+        if self._mailbox.locked():
+            raise HttpStoreError("io_overloaded", "HTTP I/O 操作名额已满", status=429)
         await self._mailbox.acquire()
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(self._executor, functools.partial(func, *args, **kwargs))
         task = asyncio.ensure_future(future)
         self._pending.add(task)
         task.add_done_callback(self._on_done)
-        try:
-            return await asyncio.shield(task)
-        finally:
-            self._mailbox.release()
+        # 等待方取消不代表线程里的 future 已完成，名额由 done callback 归还。
+        return await asyncio.shield(task)
 
     def _on_done(self, task: asyncio.Future) -> None:
         self._pending.discard(task)
+        self._mailbox.release()
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is not None:
-            # route 可能已取消等待方，这里是唯一观察真实 I/O 异常的地方
-            logger.error("http io operation failed: %s", exc)
+        if exc is not None and not isinstance(exc, HttpStoreError):
+            # route 可能已取消等待方；未知线程异常仍进入 listener 的监督链。
+            self._on_failure(exc)
 
     def close(self) -> None:
         """关闭时等待在途 I/O 结束（已在跑的字节写入不会被半途抛弃）。"""
@@ -122,6 +124,8 @@ class HttpServer:
         self._handler_slots = asyncio.Semaphore(MAX_HANDLERS)
         self._body_slots = asyncio.Semaphore(MAX_BODY_CONCURRENCY)
         self.fatal: Optional[BaseException] = None
+        self._fatal_event = asyncio.Event()
+        self._client_payload_error = None
         # 真实推理协调者是否已装配（M3 注入实现）；默认 False → commit 明确 503
         self.inference_available = False
         self._bound_port: Optional[int] = None
@@ -131,7 +135,10 @@ class HttpServer:
     def prepare(self) -> "HttpServer":
         """在事件循环外完成装配：aiohttp 导入、数据目录、schema、独占锁。失败即抛。"""
         self._web = _import_aiohttp()
-        self._worker = HttpIoWorker()
+        from aiohttp import ClientPayloadError
+
+        self._client_payload_error = ClientPayloadError
+        self._worker = HttpIoWorker(self._mark_fatal)
         try:
             # 存储装配（含 OS 独占锁与 schema 校验）也在 I/O 线程里完成，失败即抛
             self._store = self._worker.run_sync(self._open_store)
@@ -183,7 +190,9 @@ class HttpServer:
             self._bound_port = sockets.sockets[0].getsockname()[1]
         logger.info(f"HTTP 文件任务 listener 已就绪 (监听: {self.addr}:{self._bound_port or self.port})")
         try:
-            await asyncio.Event().wait()
+            await self._fatal_event.wait()
+            if self.fatal is not None:
+                raise self.fatal
         finally:
             await self.stop()
 
@@ -203,9 +212,12 @@ class HttpServer:
 
     def _wrap(self, handler):
         async def wrapped(request):
-            async with self._handler_slots:
-                request_id = uuid.uuid4().hex
-                request["request_id"] = request_id
+            request_id = uuid.uuid4().hex
+            request["request_id"] = request_id
+            if self._handler_slots.locked():
+                return self._error_response(429, "server_busy", "HTTP handler 名额已满", request_id)
+            await self._handler_slots.acquire()
+            try:
                 try:
                     return await handler(request)
                 except HttpStoreError as exc:
@@ -213,12 +225,22 @@ class HttpServer:
                 except asyncio.CancelledError:
                     # route 取消只结束等待方，底层 I/O 由 HttpIoWorker 跑完
                     raise
+                except (ConnectionError, asyncio.IncompleteReadError, self._client_payload_error):
+                    # 客户端断开或请求体不完整不影响已确认前缀，也不属于服务端 fatal。
+                    return self._error_response(400, "incomplete_request", "请求未完整送达", request_id)
                 except Exception as exc:  # 未知错误：显式失败并让监督看到，不静默成功
-                    logger.error("http request failed: %s", exc)
-                    self.fatal = exc
+                    self._mark_fatal(exc)
                     return self._error_response(500, "internal_error", "服务端内部错误", request_id)
+            finally:
+                self._handler_slots.release()
 
         return wrapped
+
+    def _mark_fatal(self, exc: BaseException) -> None:
+        if self.fatal is None:
+            self.fatal = exc
+            logger.error("HTTP 未知 operation 失败，listener 将停止：%s", exc)
+        self._fatal_event.set()
 
     def _error_response(self, status, code, message, request_id, confirmed_offset=None):
         payload = {"code": code, "message": message, "request_id": request_id}
@@ -260,7 +282,10 @@ class HttpServer:
 
     async def _read_body(self, request, limit: int, expected: Optional[int] = None) -> bytes:
         """按 64 KiB 有界读取，绝不把整份 1 GiB 上传 append 进内存。"""
-        async with self._body_slots:
+        if self._body_slots.locked():
+            raise HttpStoreError("body_overloaded", "HTTP 请求体名额已满", status=429)
+        await self._body_slots.acquire()
+        try:
             buffer = bytearray()
             while True:
                 chunk = await request.content.read(READ_CHUNK_BYTES)
@@ -272,6 +297,8 @@ class HttpServer:
             if expected is not None and len(buffer) != expected:
                 raise HttpStoreError("length_mismatch", "实际请求体长度与 Content-Length 不一致", status=400)
             return bytes(buffer)
+        finally:
+            self._body_slots.release()
 
     # ---------------- 六个 route ----------------
 
@@ -304,7 +331,7 @@ class HttpServer:
             self._store.create_upload,
             size_bytes=payload["size_bytes"],
             sha256=payload["sha256"],
-            options=payload.get("options") or {},
+            options={} if payload.get("options") is None else payload["options"],
             token=token,
             create_key=create_key,
         )
