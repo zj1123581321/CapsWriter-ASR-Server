@@ -562,3 +562,152 @@ async def test_lost_confirmation_requires_explicit_resume_without_restarting_pre
         assert after[1].body == b"def"
     else:
         assert [request.method for request in after] == ["GET"]
+
+
+def _complete_result(**overrides):
+    payload = {
+        "task_id": "job-1",
+        "is_final": True,
+        "duration": 2.5,
+        "time_start": 1.0,
+        "time_submit": 2.0,
+        "time_complete": 3.0,
+        "text": "wrong task transcript",
+        "text_accu": "wrong task transcript",
+        "tokens": ["错"],
+        "timestamps": [0.1],
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"task_id": "other-job"},
+        {"is_final": False},
+        {"is_final": None},
+        {"is_final": "false"},
+        {"is_final": "true"},
+        {"is_final": 1},
+    ],
+)
+async def test_result_rejects_mismatched_job_and_non_bool_final(tmp_path, override):
+    source = tmp_path / "clip.mp3"
+    source.write_bytes(b"audio")
+    resume_path = tmp_path / "resume.json"
+    out_dir = tmp_path / "outputs"
+    out_dir.mkdir()
+
+    async def handler(request: TcpRequest):
+        assert request.method == "GET"
+        assert request.target == "/v1/jobs/job-1/result"
+        return response(200, _complete_result(**override))
+
+    async with TcpCapture(handler) as server:
+        payload = recovery_payload(source, server.url)
+        payload["job_id"] = "job-1"
+        _write_recovery(resume_path, payload)
+        before = resume_path.read_bytes()
+        with pytest.raises(AsrError) as caught:
+            await get_file_result_http(server.url, resume_path=resume_path)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "capswriter_asr",
+            "http",
+            "result",
+            "--url",
+            server.url,
+            "--resume-file",
+            str(resume_path),
+            "--out-dir",
+            str(out_dir),
+            "--format",
+            "txt,json,srt",
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "sdk")},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+
+    assert caught.value.code == "invalid_response"
+    assert process.returncode != 0
+    assert not list(out_dir.iterdir())
+    combined = stdout + stderr
+    assert b"wrong task transcript" not in combined
+    assert b"token-for-test-only" not in combined
+    assert resume_path.read_bytes() == before
+    assert {request.target for request in server.requests} == {"/v1/jobs/job-1/result"}
+    assert all(request.method == "GET" for request in server.requests)
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_foreign_upload_id_without_patching(tmp_path):
+    source = tmp_path / "source.mp3"
+    source.write_bytes(b"abcdef")
+    resume_path = tmp_path / "resume.json"
+
+    async def handler(request: TcpRequest):
+        assert request.method == "GET"
+        assert request.target == "/v1/uploads/upload-1"
+        return response(
+            200,
+            {
+                "upload_id": "server-returned-other-upload",
+                "state": "UPLOADING",
+                "size_bytes": 6,
+                "sha256": sha256(source.read_bytes()).hexdigest(),
+                "confirmed_offset": 0,
+                "expires_at": "2026-10-08T00:00:00Z",
+            },
+        )
+
+    async with TcpCapture(handler) as server:
+        _write_recovery(resume_path, recovery_payload(source, server.url))
+        before = resume_path.read_bytes()
+        with pytest.raises(AsrError) as caught:
+            await resume_file_http(source, server.url, resume_path=resume_path)
+
+    assert caught.value.code == "invalid_response"
+    assert resume_path.read_bytes() == before
+    assert [request.method for request in server.requests] == ["GET"]
+    assert [request.target for request in server.requests] == ["/v1/uploads/upload-1"]
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_committed_short_offset(tmp_path):
+    source = tmp_path / "source.mp3"
+    source.write_bytes(b"abcdef")
+    resume_path = tmp_path / "resume.json"
+
+    async def handler(request: TcpRequest):
+        assert request.method == "GET"
+        assert request.target == "/v1/uploads/upload-1"
+        return response(
+            200,
+            {
+                "upload_id": "upload-1",
+                "state": "COMMITTED",
+                "size_bytes": 6,
+                "sha256": sha256(source.read_bytes()).hexdigest(),
+                "confirmed_offset": 0,
+                "expires_at": "2026-10-08T00:00:00Z",
+                "job_id": "job-short",
+            },
+        )
+
+    async with TcpCapture(handler) as server:
+        _write_recovery(resume_path, recovery_payload(source, server.url))
+        before = resume_path.read_bytes()
+        with pytest.raises(AsrError) as caught:
+            await resume_file_http(source, server.url, resume_path=resume_path)
+
+    assert caught.value.code == "invalid_response"
+    assert resume_path.read_bytes() == before
+    assert json.loads(before)["upload_id"] == "upload-1"
+    assert json.loads(before)["token"] == "token-for-test-only"
+    assert [request.method for request in server.requests] == ["GET"]
+    assert all(request.method != "PATCH" for request in server.requests)
+    assert all(not request.target.endswith("/commit") for request in server.requests)

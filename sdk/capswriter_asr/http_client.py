@@ -367,6 +367,8 @@ def _upload_info(
             raise ValueError("job_id")
         if state not in _UPLOAD_STATES or size_bytes != expected_size or not 0 <= offset <= size_bytes:
             raise ValueError("identity/state")
+        if state == "COMMITTED" and (offset != size_bytes or job_id is None):
+            raise ValueError("committed")
     except (TypeError, ValueError) as exc:
         raise AsrError("invalid_response", "服务端上传响应缺少有效字段", recovery_path=recovery_path) from exc
     return upload_id, state, offset, expires_at, job_id
@@ -468,12 +470,15 @@ async def _get_upload(
             raise ValueError("sha256")
     except (TypeError, ValueError) as exc:
         raise AsrError("invalid_response", "服务端上传身份与恢复信息不一致", recovery_path=recovery_path) from exc
-    return _upload_info(
+    upload_id, state, offset, expires_at, job_id = _upload_info(
         payload,
         expected_size=recovery["size_bytes"],
         recovery_path=recovery_path,
         token=recovery["token"],
     )
+    if upload_id != recovery["upload_id"]:
+        raise AsrError("invalid_response", "服务端上传编号与恢复信息不一致", recovery_path=recovery_path)
+    return upload_id, state, offset, expires_at, job_id
 
 
 async def _commit_upload(
@@ -731,7 +736,7 @@ async def get_file_job_http(base_url, *, resume_path) -> FileTaskStatus:
     )
 
 
-def _transcript_from_http(payload: dict, recovery_path: Path) -> Transcript:
+def _transcript_from_http(payload: dict, recovery_path: Path, expected_job_id: str) -> Transcript:
     try:
         task_id = _required_string(payload, "task_id")
         is_final = payload["is_final"]
@@ -745,7 +750,8 @@ def _transcript_from_http(payload: dict, recovery_path: Path) -> Transcript:
         timestamps = payload["timestamps"]
         numbers = (duration, time_start, time_submit, time_complete)
         if (
-            not is_final
+            task_id != expected_job_id
+            or is_final is not True
             or not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) for value in numbers)
             or not isinstance(text, str)
             or not isinstance(text_accu, str)
@@ -794,7 +800,7 @@ async def get_file_result_http(base_url, *, resume_path) -> Transcript:
         if exc.recovery_path is None:
             exc.recovery_path = recovery_path
         raise
-    return _transcript_from_http(payload, recovery_path)
+    return _transcript_from_http(payload, recovery_path, recovery["job_id"])
 
 
 def submit_file_http_sync(
