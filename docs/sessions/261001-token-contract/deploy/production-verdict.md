@@ -39,6 +39,7 @@ Windows 补部署后：
 - 标签校准：5.05s 上传由 80,000 samples 与末帧 800 samples 组成；它验证末帧上传与 file final 契约，不代表 worker 收到小于 1600 samples 的分段。实际配置重放见 [segmentation-proof.md](segmentation-proof.md)。历史阻塞和 Windows 进程归属复核保持原样。
 - `run_server.bat` 仍会结束全部 Python；本次因无关数为 0 才沿现有机制更新，未改脚本。
 - Windows CommandLine 对 python.exe 未同时命中 `start_server.py`+clone（布尔 false），归属以 PID/PPID 后代集合与 cmd 包装层布尔为准，未回显 argv。
+- 附加校准期间发生一次进程环境信息回显，已作私有跟进；这是工具调用事故，不是生产服务故障，不改变部署及烟测统计。
 - Studio/Mini 未作为本次写入目标；无回滚。
 - 主干基线仍不可用，继承红/新红未能判定。
 

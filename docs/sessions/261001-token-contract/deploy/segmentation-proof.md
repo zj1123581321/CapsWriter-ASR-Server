@@ -21,7 +21,7 @@
 | Studio-MLX | 3.12 | `qwen_asr_mlx` | 6017 | `6b7a2b8` | clean |
 | Windows-Qwen | 3.11 | `qwen_asr` | 6016 | `6b7a2b8` | clean |
 
-Windows 活跃计划任务的启动脚本将 `CW_MODEL_TYPE` 设为 `qwen_asr`；账号级和机器级同名覆盖均未发现。Studio 的 `CW_MODEL_TYPE` 和 `CW_PORT` 从对应 PM2 实例按白名单读取。没有读取或输出完整进程环境。
+Windows 活跃计划任务的启动脚本将 `CW_MODEL_TYPE` 设为 `qwen_asr`；账号级和机器级同名覆盖均未发现。Studio 的 `CW_MODEL_TYPE` 和 `CW_PORT` 从对应 PM2 实例按白名单读取。成功重跑只传入各自白名单变量；此前一次远程命令因引号错误曾将完整进程环境回显到工具记录，随后已停止该命令，回显未写入仓库文件。具体敏感内容仅记在私有处置报告中。
 
 ## 真实分段器重放
 
