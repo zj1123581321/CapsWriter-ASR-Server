@@ -2,7 +2,7 @@
 lane: http-core
 id: M2
 slug: upload
-status: 实现完成待验收
+status: 进行中
 owner: pi协调
 order: 2
 priority: 高
@@ -14,6 +14,7 @@ merged_pr: null
 
 - **预期产出**：显式 HTTP listener、受限落盘、可信续传 offset、上传幂等和唯一 Job 受理事务；默认仍关闭。
 - **当前范围**：只在 E1 合并后实现 HTTP 上传边界，不改 WS listener、proxy 或 SDK 默认行为。
+- **状态说明**：基础实现与续修已提交，仍待独立复核与验收；本项保持进行中，`merged_pr` 继续为 `null`。
 - **关键决策**：二进制请求体、Bearer capability、无隐式 retry/redirect/fallback；确认晚于文件与任务记录可靠提交。
 - **已知阻塞**：M1已合并，接口/依赖/资源契约已固定；本阶段开始受限上传与存储实现，真实模型runner属于M3。本条激活不代表HTTP已可用。
 - **推进前必须拿到的证据**：
