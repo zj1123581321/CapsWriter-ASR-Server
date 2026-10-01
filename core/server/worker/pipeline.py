@@ -6,9 +6,10 @@
 1. text (简单拼接): 基于文本重叠匹配，不依赖时间戳
 2. text_accu (精确拼接): 基于时间戳去重，用于字幕生成
 
-最终结果契约：tokens 与 timestamps 必须等长，且最终 ''.join(tokens) 必须等于
-text_accu。正常 final 与短尾/空 EOF 共用同一收尾，任何不自洽结果在 is_final
-置为 True 前失败。
+最终文件结果契约：file 任务 tokens 与 timestamps 必须等长，且最终
+''.join(tokens) 必须等于 text_accu。正常 final 与短尾/空 EOF 共用同一收尾，
+文件结果不自洽时在 is_final 置为 True 前失败。麦克风无真实 token 的均分回退
+保持去掉普通空格的旧口径，不套用文件正文拼接检查。
 """
 
 import re
@@ -159,7 +160,10 @@ class TaskPipeline:
             raise
 
     def _finish_final_result(self, task: Task, result: Result) -> Result:
-        """统一收尾正常 final 与已有 session 的短尾/空 EOF final。"""
+        """统一收尾正常 final 与已有 session 的短尾/空 EOF final。
+
+        最终正文拼接等式只约束 file 任务。
+        """
         raw_text = result.text
         result.text = self.formatter.format(result.text)
         result.text_accu = self.formatter.format(result.text_accu)
@@ -181,7 +185,7 @@ class TaskPipeline:
                     f"文件任务没有真实时间戳: task={task.task_id}, 文本长度={len(result.text)}"
                 )
             result.text_accu = result.text
-            chars = list(result.text_accu)
+            chars = list(result.text_accu.replace(' ', ''))
             if chars and result.duration > 0:
                 t_per_char = result.duration / len(chars)
                 result.tokens, result.timestamps = chars, [
@@ -194,7 +198,7 @@ class TaskPipeline:
                 f"task={task.task_id}, tokens={len(result.tokens)}, "
                 f"timestamps={len(result.timestamps)}"
             )
-        if "".join(result.tokens) != result.text_accu:
+        if task.type == 'file' and "".join(result.tokens) != result.text_accu:
             raise RuntimeError(
                 "最终结果 tokens 拼接与 text_accu 不一致: "
                 f"task={task.task_id}, token_text={''.join(result.tokens)!r}, "
