@@ -96,6 +96,33 @@ def test_http_task_has_explicit_owner_kind():
     )
 
 
+def test_legacy_task_and_result_default_to_ws():
+    task = Task(
+        type="mic",
+        data=b"pcm",
+        offset=0.0,
+        overlap=0.0,
+        task_id="legacy-task",
+        socket_id="socket-1",
+        is_final=False,
+        time_start=0.0,
+        time_submit=0.0,
+    )
+    result = Result(
+        task_id="legacy-task",
+        socket_id="socket-1",
+        type="mic",
+    )
+
+    assert task.owner_kind == "ws"
+    assert result.owner_kind == "ws"
+    assert make_task_key(task.owner_kind, task.task_id, task.socket_id) == (
+        "ws",
+        "socket-1",
+        "legacy-task",
+    )
+
+
 def test_http_registration_precedes_task_lifecycle():
     state = ServerState(
         queue_in=queue.Queue(),
