@@ -51,3 +51,21 @@
 
 ### 下一步唯一动作
 在裸消费环境依次运行卡面两条全量测试命令，记录每档完整结果，再核对 diff、远端 PR 与最终 SHA。
+
+## 里程碑：全量验证完成
+
+### 当前阶段
+实现、文档和两档全量离线验证完成，准备推送最终 head 并交付报告。
+
+### 本段结论
+- 固定 `websockets==15.0.1`：286 passed、3 skipped、91 warnings，106.34s。
+- 当前 `websockets`：286 passed、3 skipped、91 warnings，103.02s。
+- 两档均在清除 `PI_LEAD_SESSION` 与 `DELEGATE_*` 的裸消费环境执行，未安装主仓虚拟环境，未使用真实模型。
+- 基线到最终 head 的净差异为 691 行，低于 850 行目标，也低于 1600 行硬上限。
+
+### 关键决策与已否决
+- 只声明 fake engine、TaskPipeline、WS 发布边界已验证；不把测试结果表述为真实模型声学精度或完整 HTTP 生产端到端验证。
+- draft PR 不擅自标 ready、合并或部署；检查结论按 SUCCESS、SKIPPED、未完成分别记录。
+
+### 下一步唯一动作
+提交本进度记录，推送最终 head，读取远端 PR head/body/checks 和工作树状态，写入完整执行报告。
