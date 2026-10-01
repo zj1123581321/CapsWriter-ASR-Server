@@ -24,6 +24,8 @@ from capswriter_asr import AsrError, resume_file_http, submit_file_http  # noqa:
 from capswriter_asr import http_client as sdk_http  # noqa: E402
 
 from core.server.http_server import HttpServer  # noqa: E402
+# HTTP listener 默认关闭，aiohttp 只在显式启用时安装：缺它就跳过，不假装通过
+pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 入口默认关闭")
 
 
 class _StubApp:

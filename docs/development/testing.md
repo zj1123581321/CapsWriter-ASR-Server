@@ -28,4 +28,4 @@ SDK 安装和 CLI 用法见 [`sdk/README.md`](../../sdk/README.md)。
 - `tests/test_http_config.py`：在无 PI/DELEGATE 身份的裸环境子进程里真实解析 `CW_HTTP_PORT`/`CW_HTTP_DATA_DIR`。
 - `tests/test_http_supervision.py`：真实子进程的启用可见性（默认关闭、坏数据目录/端口冲突/同目录第二实例非零退出、SIGTERM 零退出并释放端口）。
 
-运行这些用例需要 `aiohttp==3.14.3` 与 `httpx==0.28.1`；CI 的依赖安装行已包含两者。
+运行这些用例需要 `aiohttp==3.14.3` 与 `httpx==0.28.1`；CI 的依赖安装行已包含两者。缺 `aiohttp` 时 listener 相关模块整体 skip 并写明原因（HTTP 入口默认关闭，旧 WS 部署不因它升级解释器），store 与配置用例仍照常运行。

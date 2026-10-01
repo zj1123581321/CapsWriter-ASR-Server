@@ -19,6 +19,9 @@ from pathlib import Path
 
 import pytest
 
+# HTTP listener 默认关闭，aiohttp 只在显式启用时安装：缺它就跳过，不假装通过
+pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 入口默认关闭")
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 PROBE = '''\
