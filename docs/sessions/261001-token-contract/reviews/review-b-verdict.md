@@ -41,7 +41,7 @@ H1 当前代码满足本卡文件最终结果契约：raw token/time 长度不�
 ## 测试与旧基线红验证据
 
 - 在无会话身份的 Python 3.12、`websockets==15.0.1` 和任务卡列出的依赖下运行四个指定文件：`35 passed, 6 warnings in 0.56s`。完整原始输出：`/tmp/capswriter-token-contract-review-b-261001-tests.log`。六条 warning 是 multiprocessing fork 对多线程进程的弃用提示。
-- 按要求通过 `scripts/git/scratch-worktree.sh` 在 base `c1e8808377cf205094711832076f51aebc77ff33` 建临时树，仅复制两个测试文件，不复制生产代码。实际树为 `/home/zlx/scratchpad/vt-tVBVch/worktree`；导入来源确认是该树的 `core/server/worker/pipeline.py` 与 `core/tools/token_sync.py`。测试结果为 3 个目标失败：1599 短尾未格式化，实际 `text='一二'` 而断言期望 `一二。`；两种 raw 长度不等输入都未抛出预期 `ValueError`。这些是目标断言失败，不是导入错误。完整原始输出：`/tmp/capswriter-token-contract-review-b-261001-base-red.log`；scratch 树已自动清理。
+- 按要求通过 `scripts/git/scratch-worktree.sh` 在 base `c1e8808377cf205094711832076f51aebc77ff33` 建临时树，仅复制两个测试文件，不复制生产代码。实际树为该脚本创建的独立 scratch 工作树；`core.server.worker.pipeline` 与 `core.tools.token_sync` 的 import 都解析到此树内的相应文件。完整实际路径和来源记录在私有执行报告及原始日志中。测试结果为 3 个目标失败：1599 短尾未格式化，实际 `text='一二'` 而断言期望 `一二。`；两种 raw 长度不等输入都未抛出预期 `ValueError`。这些是目标断言失败，不是导入错误。完整原始输出：`/tmp/capswriter-token-contract-review-b-261001-base-red.log`；scratch 树已自动清理。
 - 任务卡记录 H1 两项 CI 为实际 `SUCCESS`；本地测试仍独立执行。派发时主干基线不可用（`gh api request failed`），因此继承红与新红无法区分，继承红状态为未能判定。
 - OCR 范围：任务卡记录已有 `c1e8808..6ed4f15` 扫描，状态 `reviewed_fallback`（主腿超时、deepseek 备腿成功）。它只覆盖旧范围；本轮未调用 OCR，也不宣称 H1 全量已扫。
 
