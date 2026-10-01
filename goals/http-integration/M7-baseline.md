@@ -1,16 +1,16 @@
 ---
 lane: http-integration
-id: E7
+id: M7
 slug: baseline
 status: 未开始
 owner: pi协调
 order: 2
 priority: 中
-depends_on: [http-integration/E6]
+depends_on: [http-integration/M6]
 merged_pr: null
 ---
 
-# 里程碑进度：<!-- http-integration/E7：部署、协议与质量基线 -->
+# 里程碑进度：http-integration/M7：部署、协议与质量基线
 
 - **预期产出**：HTTP/WS 协议、部署、数据流、运维说明和真实字节/质量/资源基线。
 - **当前范围**：记录同源样本、应用层字节、弱网重发、归一化结果、耗时、CPU/RSS 与未知项；不宣称未经测量的节省或生产上线。

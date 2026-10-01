@@ -1,16 +1,16 @@
 ---
 lane: http-core
-id: E3
+id: M3
 slug: runner
 status: 未开始
 owner: pi协调
 order: 3
 priority: 高
-depends_on: [http-core/E2]
+depends_on: [http-core/M2]
 merged_pr: null
 ---
 
-# 里程碑进度：<!-- http-core/E3：HTTP 文件 runner 与结果分派 -->
+# 里程碑进度：http-core/M3：HTTP 文件 runner 与结果分派
 
 - **预期产出**：原文件解码、Job runner、异常监督和持久 Result sink；受理后脱离连接继续识别。
 - **当前范围**：复用 E1 PCM/worker 链，不传完整文件给 worker，不改模型算法或 WS 结果协议。
