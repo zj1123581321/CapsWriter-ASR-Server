@@ -46,3 +46,16 @@ Paraformer、SenseVoice、proxy 不需要 llama.cpp 库。`qwen_asr`、`fun_asr_
 解压后，当前平台的 `ggml`、`ggml-base` 和 `llama` 三个核心动态库应直接位于 `b10621/` 子目录。Linux GPU 部署需要针对具体发行版、驱动和后端单独验证；本页不提供通用 CUDA/Vulkan 配方。不同平台和后端的资产不能混放进同一版本目录。
 
 保留旧版本库目录，以便回滚到要求旧版本的代码。首次从旧版代码升级时，先按目标提交的 `LLAMA_BUILD` 准备新目录，再重启服务。
+
+## 可选：启用 HTTP 文件任务入口
+
+默认不启用。要启用必须同时提供 `CW_HTTP_PORT` 与稳定绝对路径 `CW_HTTP_DATA_DIR`：
+
+```sh
+export CW_HTTP_PORT=6116
+export CW_HTTP_DATA_DIR=/var/lib/capswriter/http
+```
+
+约束：`CW_HTTP_PORT` 不得与 `CW_PORT` 相同，不自动推算邻近端口；`CW_HTTP_DATA_DIR` 必须是绝对路径，且同一时刻只允许一个 server 实例持有（OS 独占锁，进程退出后自动释放，不做网络盘与多实例共写承诺）。任一条件不满足或数据目录不可用时，服务端直接启动失败并以非零退出，不会退回关闭状态。服务端依赖里已声明 `aiohttp==3.14.3`（Python ≥ 3.10），仅在启用时导入。
+
+当前该入口只交付上传与查询底座：文件识别协调者装配前，`commit` 明确返回 `503 inference_unavailable`，已上传字节与恢复凭据都保留，可在该入口可用后显式继续。

@@ -129,3 +129,22 @@ proxy 对带 `encoding` 的 v2 任务只选择协议版本不低于 2 且支持�
 ## Python SDK
 
 SDK 默认编码为 `flac`，因此服务端也必须在 PATH 中安装 `ffmpeg` 且健康检查需列出 `flac`。首次部署可选 `s16le` 避免服务端压缩解码依赖；SDK 客户端本机始终需要 `ffmpeg` 和 `ffprobe`。SDK 每个任务前检查 `/health`，并发上传和接收；默认总体截止时间为 `max(120 秒, 音频时长 + 60 秒)`，`idle_timeout` 默认 300 秒。超过截止时间、上传发送时限或结果空闲时限时会抛出 `AsrError`。它不自动重试。完整安装与调用示例见 [SDK 文档](../../sdk/README.md)。
+
+## HTTP 文件任务（默认关闭，M3 补齐推理）
+
+HTTP 文件任务是与 WebSocket 并列的独立入口，只有在同时显式提供 `CW_HTTP_PORT` 和稳定绝对路径 `CW_HTTP_DATA_DIR` 时才启用；两者必须成对出现，HTTP 端口不得与 WebSocket 端口相同，监听地址沿用 `CW_ADDR`。端口非法、数据目录不可用、数据目录被另一个 server 实例独占等情况一律启动失败并非零退出，不自动选端口、不退回关闭状态。运行时依赖 `aiohttp==3.14.3`（Python ≥ 3.10），仅在显式启用时按需导入；未启用的旧服务不因新增依赖被迫升级解释器。
+
+该入口当前只提供上传与查询底座：外部 `commit` 在真实文件推理协调者装配之前（M3 之前）明确返回 `503 inference_unavailable`，不会受理后永远排队；已存在的 Job 重复 `commit` 仍返回同一 `job_id`。
+
+| 方法/route | 成功 | 失败 |
+|---|---|---|
+| `POST /v1/uploads` | 小 JSON（≤16 KiB）：`size_bytes>0`、`sha256`（64 hex）、`options`；`Idempotency-Key` + Bearer。首次 201；相同 key+token+同身份参数返回 200 同一 `upload_id` | 400 参数、409 同 key 不同内容、411 未声明长度、413 体积、415 编码/媒体类型、429 会话数、507 容量 |
+| `GET /v1/uploads/{id}` | 200：`upload_id`/`state`/`size_bytes`/`sha256`/`confirmed_offset`/`expires_at`（UTC ISO）/`job_id?` | 404 未知或错 token、410 过期、503 存储不可读 |
+| `PATCH /v1/uploads/{id}` | 原字节、确定 `Content-Length`、`Upload-Offset`；仅在字节 fsync 与 offset 事务成功后 204 + 新 `Upload-Offset` | 409 旧/超前 offset 或非 UPLOADING 并带可信 `confirmed_offset`、413 超块或超长、415 编码/媒体类型 |
+| `POST /v1/uploads/{id}/commit` | offset=size 且实际长度与 hash 相同后同一事务建立唯一 Job，首次 202；重复 200 同一 `job_id` | 409 未写完、410 过期、422 完整性错、429/507 准入满、503 `inference_unavailable` |
+| `GET /v1/jobs/{id}` | 200：`job_id`/`state`（`QUEUED`/`RUNNING`/`DONE`/`FAILED`）/`error_code`/`result_available`/`source_available`/`time_start`/`time_submit`/`time_complete` | 404 未知/无权、503 查询不可用 |
+| `GET /v1/jobs/{id}/result` | DONE 时 200 完整识别结果 | 409 `result_not_ready` / `job_failed` |
+
+上传状态为 `UPLOADING`/`COMMITTED`（过期对外表现为 410），任务状态为 `QUEUED`→`RUNNING`→`DONE`/`FAILED`。令牌只存指纹（SHA-256 + 常量时间比较），任务编号仅用于查找与排错、不赋权；未知资源与错误令牌同为 404，不区分泄露。错误体为 `{"code", "message", "request_id"}`，offset 冲突额外带 `confirmed_offset`。请求体不接受 Base64/JSON 包装或任何额外 `Content-Encoding`。
+
+服务端持久化语义：单目录 OS 独占锁、SQLite（WAL + `synchronous=FULL` + `foreign_keys=ON` + `busy_timeout=0`）、提交顺序固定为「字节 → fsync → offset 记录 → ACK」，SQLite busy 不重试也不假装 ACK。重启只把旧 `QUEUED`/`RUNNING` 标为 `FAILED`（`server_restarted`），已确认前缀与已完成结果不动。资源起点（1 GiB/file、1 MiB/PATCH、64 KiB/read、16 KiB JSON、16 handler、2 同时 body、32 未完成上传、8 个 QUEUED+RUNNING、64 MiB 结果、16 GiB source 声明预留、2 GiB DB/WAL 整体 guard、2 GiB 剩余磁盘余量、32 I/O mailbox）见设计文档。
