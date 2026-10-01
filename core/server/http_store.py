@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from core.server.segmenter import validate_segment_params
+
 
 # ---- R7 资源起点（启用 HTTP 后的起始 guard，不是实测吞吐）----
 MAX_FILE_BYTES = 1 * 1024 * 1024 * 1024          # 1 GiB / file
@@ -691,6 +693,12 @@ def normalize_options(options: dict) -> dict:
         if value != value or value in (float("inf"), float("-inf")) or value < 0:
             raise HttpStoreError("invalid_options", f"{field} 必须是非负有限数字")
         normalized[field] = float(value)
+    # 受理前接入与 WS 共用的唯一无状态规则（时长下限/重叠半开/引擎与 snap 预算）；
+    # 只翻译该规则的 ValueError，其他异常原样上抛
+    try:
+        validate_segment_params(normalized["seg_duration"], normalized["seg_overlap"])
+    except ValueError as exc:
+        raise HttpStoreError("invalid_options", str(exc)) from exc
     return normalized
 
 

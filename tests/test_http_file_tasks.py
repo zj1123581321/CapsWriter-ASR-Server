@@ -55,10 +55,6 @@ async def _async_chunks(*chunks: bytes):
         yield chunk
 
 
-def _confirmed_total(data_dir: Path) -> int:
-    rows = _read_db(data_dir, "SELECT COALESCE(SUM(confirmed_offset),0) AS total FROM uploads")
-    return rows[0]["total"]
-
 @asynccontextmanager
 async def running_server(tmp_path: Path, inference: bool = False, pause_hook=None):
     """在 port 0 上起真实 aiohttp listener，退出时收尾。"""
@@ -522,15 +518,8 @@ async def test_handler_cancellation_and_io_completion_orders_preserve_confirmed_
             for order in ("cancel-first", "io-first"):
                 for trial in range(5):
                     source = bytes((65 + trial, 75 + trial, 85 + trial, 95 + trial))
-                    create = await client.post(
-                        base_url + "/v1/uploads",
-                        headers={"Authorization": f"Bearer {token}",
-                                 "Idempotency-Key": f"{order}-{trial}"},
-                        json={"size_bytes": len(source), "sha256": sha256(source).hexdigest(),
-                              "options": {}},
-                    )
-                    assert create.status_code == 201
-                    upload_id = create.json()["upload_id"]
+                    created = await _create_upload_json(client, base_url, token, source, f"{order}-{trial}")
+                    upload_id = created["upload_id"]
                     route_path = f"/v1/uploads/{upload_id}"
                     patch_headers = {"Authorization": f"Bearer {token}",
                                      "Content-Length": "2", "Upload-Offset": "0",
@@ -699,9 +688,16 @@ async def test_options_missing_and_none_default_but_falsy_wrong_types_are_reject
             assert written.status_code == 204
             old_bytes = (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes()
             old_row = dict(_read_db(server.data_dir,
-                                    "SELECT confirmed_offset, options_json FROM uploads WHERE upload_id=?",
-                                    (upload_id,))[0])
-            for index, wrong_type in enumerate(([], "", 0)):
+                                    "SELECT confirmed_offset, options_json, updated_at, expires_at"
+                                    " FROM uploads WHERE upload_id=?", (upload_id,))[0])
+            # 与 WS 共用 segmenter.validate_segment_params 的原始 R3 范围：时长下限、重叠半开、引擎/snap 预算
+            range_bad = (
+                {"seg_duration": 0}, {"seg_duration": 4},
+                {"seg_duration": 5, "seg_overlap": 2.5},
+                {"seg_duration": 100},
+                {"seg_duration": 74, "seg_overlap": 1.5},
+            )
+            for index, wrong_type in enumerate(([], "", 0) + range_bad):
                 rejected_existing = await client.post(
                     base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": "missing"},
                     json={"size_bytes": len(source), "sha256": digest, "options": wrong_type},
@@ -710,13 +706,29 @@ async def test_options_missing_and_none_default_but_falsy_wrong_types_are_reject
                     base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": f"bad-{index}"},
                     json={"size_bytes": len(source), "sha256": digest, "options": wrong_type},
                 )
-                assert rejected_existing.status_code == 400
-                assert rejected_new.status_code == 400
+                assert rejected_existing.status_code == 400, rejected_existing.text
+                assert rejected_new.status_code == 400, rejected_new.text
+                body = rejected_new.json()
+                assert body["code"] == "invalid_options"
+                assert body["request_id"]
             assert (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes() == old_bytes
             assert dict(_read_db(server.data_dir,
-                                 "SELECT confirmed_offset, options_json FROM uploads WHERE upload_id=?",
-                                 (upload_id,))[0]) == old_row
-            assert _read_db(server.data_dir, "SELECT COUNT(*) AS n FROM uploads")[0]["n"] == 2
+                                 "SELECT confirmed_offset, options_json, updated_at, expires_at"
+                                 " FROM uploads WHERE upload_id=?", (upload_id,))[0]) == old_row
+            legal = ({"seg_duration": 5, "seg_overlap": 0},
+                     {"seg_duration": 7.5, "seg_overlap": 1.25},
+                     {"seg_duration": 74, "seg_overlap": 1})
+            for index, good in enumerate(legal):
+                accepted = await client.post(
+                    base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": f"legal-{index}"},
+                    json={"size_bytes": len(source), "sha256": digest, "options": good},
+                )
+                assert accepted.status_code == 201, accepted.text
+            assert _read_db(server.data_dir, "SELECT COUNT(*) AS n FROM uploads")[0]["n"] == 2 + len(legal)
+            assert _read_db(server.data_dir, "SELECT COUNT(*) AS n FROM jobs")[0]["n"] == 0
+            assert {p.name for p in (server.data_dir / "sources").iterdir()} == {
+                f"{row['upload_id']}.bin" for row in _read_db(server.data_dir, "SELECT upload_id FROM uploads")
+            }
             assert old_row["options_json"] == _read_db(
                 server.data_dir,
                 "SELECT options_json FROM uploads WHERE create_key='none'",
