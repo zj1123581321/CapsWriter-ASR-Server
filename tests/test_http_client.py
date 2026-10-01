@@ -469,3 +469,96 @@ async def test_cli_submit_subprocess_emits_real_http_requests_and_no_token(tmp_p
     assert str(resume_path) in stdout.decode()
     assert b"Bearer" not in stdout + stderr
     assert [request.method for request in server.requests] == ["POST", "PATCH", "PATCH", "POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_at", ["post", "patch", "commit"])
+async def test_lost_confirmation_requires_explicit_resume_without_restarting_prefix(
+    tmp_path, lost_at
+):
+    source = tmp_path / "source.mp3"
+    source.write_bytes(b"abcdef")
+    resume_path = tmp_path / f"{lost_at}.json"
+    state = {"lost": False, "confirmed": 0, "committed": False}
+
+    async def handler(request: TcpRequest):
+        if request.method == "POST" and request.target == "/v1/uploads":
+            if lost_at == "post" and not state["lost"]:
+                state["lost"] = True
+                return None
+            return response(
+                201 if not state["lost"] else 200,
+                {
+                    "upload_id": "upload-recover",
+                    "state": "UPLOADING",
+                    "size_bytes": 6,
+                    "confirmed_offset": state["confirmed"],
+                    "expires_at": "2026-10-08T00:00:00Z",
+                },
+            )
+        if request.method == "GET" and request.target == "/v1/uploads/upload-recover":
+            if state["committed"]:
+                return response(
+                    200,
+                    {
+                        "upload_id": "upload-recover",
+                        "state": "COMMITTED",
+                        "size_bytes": 6,
+                        "sha256": sha256(source.read_bytes()).hexdigest(),
+                        "confirmed_offset": 6,
+                        "expires_at": "2026-10-08T00:00:00Z",
+                        "job_id": "job-recover",
+                    },
+                )
+            return response(
+                200,
+                {
+                    "upload_id": "upload-recover",
+                    "state": "UPLOADING",
+                    "size_bytes": 6,
+                    "sha256": sha256(source.read_bytes()).hexdigest(),
+                    "confirmed_offset": state["confirmed"],
+                    "expires_at": "2026-10-08T00:00:00Z",
+                },
+            )
+        if request.method == "PATCH":
+            offset = int(request.headers["upload-offset"])
+            assert request.body == source.read_bytes()[offset : offset + len(request.body)]
+            state["confirmed"] = offset + len(request.body)
+            if lost_at == "patch" and not state["lost"]:
+                state["lost"] = True
+                return None
+            return 204, {
+                "Upload-Offset": str(state["confirmed"]),
+                "Content-Length": "0",
+            }, b""
+        if request.method == "POST" and request.target.endswith("/commit"):
+            if lost_at == "commit" and not state["lost"]:
+                state["lost"] = True
+                state["committed"] = True
+                return None
+            state["committed"] = True
+            return response(202, {"job_id": "job-recover", "state": "QUEUED"})
+        raise AssertionError((request.method, request.target))
+
+    async with TcpCapture(handler) as server:
+        with pytest.raises(AsrError) as caught:
+            await submit_file_http(
+                source,
+                server.url,
+                resume_path=resume_path,
+                chunk_bytes=3,
+            )
+        assert caught.value.code == "connection_lost"
+        before_resume = len(server.requests)
+        handle = await resume_file_http(source, server.url, resume_path=resume_path)
+
+    assert handle.job_id == "job-recover"
+    after = server.requests[before_resume:]
+    if lost_at == "post":
+        assert [request.method for request in after] == ["POST", "PATCH", "POST"]
+    elif lost_at == "patch":
+        assert [request.method for request in after] == ["GET", "PATCH", "POST"]
+        assert after[1].body == b"def"
+    else:
+        assert [request.method for request in after] == ["GET"]
