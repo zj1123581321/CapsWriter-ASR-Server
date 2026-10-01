@@ -33,15 +33,6 @@ class _StubApp:
         self.loop = loop
 
 
-class _RunnerServer(HttpServer):
-    """测试用：可注入真实推理协调者是否可用。"""
-
-    inference = False
-
-    def _inference_ready(self) -> bool:
-        return self.inference
-
-
 
 def _read_db(data_dir: Path, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
     """独立只读连接读真实落盘的 SQLite 文件（WAL 提交即见），不借用服务端连接。"""
@@ -67,8 +58,9 @@ def _confirmed_total(data_dir: Path) -> int:
 async def running_server(tmp_path: Path, inference: bool = False, pause_hook=None):
     """在 port 0 上起真实 aiohttp listener，退出时收尾。"""
     loop = asyncio.get_running_loop()
-    server = _RunnerServer(_StubApp(loop), "127.0.0.1", 0, tmp_path / "httpdata")
-    server.inference = inference
+    server = HttpServer(_StubApp(loop), "127.0.0.1", 0, tmp_path / "httpdata")
+    # 只切换「协调者是否已装配」这一个开关，不替换被测实现
+    server.inference_available = inference
     server.prepare()
     if pause_hook is not None:
         original = server._store.append_bytes

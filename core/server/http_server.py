@@ -122,6 +122,8 @@ class HttpServer:
         self._handler_slots = asyncio.Semaphore(MAX_HANDLERS)
         self._body_slots = asyncio.Semaphore(MAX_BODY_CONCURRENCY)
         self.fatal: Optional[BaseException] = None
+        # 真实推理协调者是否已装配（M3 注入实现）；默认 False → commit 明确 503
+        self.inference_available = False
         self._bound_port: Optional[int] = None
 
     # ---------------- 装配 ----------------
@@ -153,7 +155,7 @@ class HttpServer:
         本增量没有真实文件 runner（属于 E3），因此恒为 False：外部 commit 明确
         503 inference_unavailable，而不是受理后永远排队。E3 注入真实实现即可。
         """
-        return False
+        return bool(self.inference_available)
 
     def _add_routes(self, application) -> None:
         web = self._web
