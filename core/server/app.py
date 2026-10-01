@@ -11,10 +11,11 @@ import sys
 import signal
 import asyncio
 from pathlib import Path
-from config_server import ServerConfig as Config, __version__
+from config_server import ServerConfig as Config, __version__, resolve_http_settings
 from .state import ServerState, console
 from .worker.process_manager import ProcessManager
 from .connection.server_manager import SocketManager
+from .http_server import HttpServer
 from . import logger
 
 class CapsWriterServer:
@@ -38,6 +39,9 @@ class CapsWriterServer:
         # 基本配置与组件实例化
         self.process_manager = ProcessManager(self)
         self.socket_manager = SocketManager(self)
+        # HTTP 文件任务默认关闭；仅在显式提供 CW_HTTP_PORT + CW_HTTP_DATA_DIR 时装配
+        self.http_server = None
+        self.exit_code = 0
 
         self.version = __version__
         self.is_alive = False
@@ -71,8 +75,12 @@ class CapsWriterServer:
         # 2. 终止识别子进程
         self.process_manager.stop()
 
-        # 3. 最后停止协程（需在其他资源释放之后）
-        self.loop.stop()
+        # 3. 收尾 HTTP 文件任务（等在途 I/O 结束后再停 loop）
+        if self.http_server is not None:
+            future = asyncio.ensure_future(self.http_server.stop())
+            future.add_done_callback(lambda _f: self.loop.stop())
+        else:
+            self.loop.stop()
 
         logger.info("服务端资源清理完成")
         console.print('[green4]再见！')
@@ -119,9 +127,42 @@ class CapsWriterServer:
 
         # 拉起识别子进程
         self.process_manager.start()
-        
+
+        # 装配 HTTP listener：显式启用后任何初始化错误都 fail fast 非零退出，不退回 disabled
+        http_settings = resolve_http_settings()
+        if http_settings is not None:
+            self.http_server = HttpServer(self, *http_settings).prepare()
+
         # 开启网络服务监听 (接管当前线程直至退出)
         try:
-            self.loop.run_until_complete(self.socket_manager.start()) 
+            self.loop.run_until_complete(self._serve_all())
         except RuntimeError:
-            pass
+            # 只容忍事件循环被 stop() 主动打断；HTTP 启动/监督失败不得被本宽 catch 吞掉
+            if self.exit_code:
+                raise SystemExit(self.exit_code)
+        if self.exit_code:
+            raise SystemExit(self.exit_code)
+
+    async def _serve_all(self):
+        """WS 与 HTTP 两条监听并行；任一真实失败让进程以非零退出。"""
+        ws_task = asyncio.ensure_future(self.socket_manager.start())
+        tasks = {ws_task}
+        http_task = None
+        if self.http_server is not None:
+            http_task = asyncio.ensure_future(self.http_server.serve())
+            tasks.add(http_task)
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        error = None
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                error = exc
+                if http_task is not None and task is http_task:
+                    self.exit_code = 1
+                break
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=5)
+        if error is not None:
+            raise error
