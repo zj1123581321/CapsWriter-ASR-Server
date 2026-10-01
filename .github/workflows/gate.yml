@@ -1,0 +1,31 @@
+# 本仓模型门禁 caller（Required Gate v2）。可复用工作流本体在 zlxlabs/gate，
+# 这里只做最小调用声明；门禁逻辑、豁免白名单、通知全部由 callee 决定，本文件不复制。
+#
+# 前提（未满足时门禁 fail-loud，不静默降级）：
+#   - 本公开仓必须自行配置 repository secrets SILO_ACCESS_KEY / SILO_SECRET_KEY
+#     （gate-v2 的 S3 产物读写凭据）。组织级同名私钥不适用于公开仓，需单独申请。
+#   - runner: self 依赖 org 的 ci runner 组（self-hosted + tailnet 访问 Silo）。
+name: gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+
+# gate-v2 需要读历史评审产物、写 PR-size 与门禁回执评论。
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    uses: zlxlabs/gate/.github/workflows/gate-v2.yml@v2
+    with:
+      tier: internal
+      runner: self          # hosted 会让 primary 整个 job skip，等于没有门禁
+      has_ui: false
+      design_doc: ""
+    secrets:
+      # 公开仓 fork PR 读不到 secrets，故走 repo secret（不写 secrets: inherit）。
+      FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
+      SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
+      SILO_SECRET_KEY: ${{ secrets.SILO_SECRET_KEY }}
