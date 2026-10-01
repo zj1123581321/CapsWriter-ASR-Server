@@ -6,10 +6,10 @@
 
 唯一下一步：主脑接手 draft PR #36，按服务端 E1–E4 完成后的集成依赖继续审查与验收。
 
-阶段：repairing
+阶段：done
 
 结论：原卡未锁结果 task_id 与请求 job_id 一致、is_final 必须是布尔 true、GET upload 不得换绑、COMMITTED 必须 offset=size 且 job_id 合法；本轮仅对已有字段补比较/类型 guard 并用真实 TCP 负态回归锁死。未修文件名 http 与畸形 URL，未新增状态或重试。
 
 锁定及否决：锁定原 HTTP_SCHEMA、无自动 retry、原文件二进制、独立 Bearer、首请求前保存恢复、旧 WS 兼容；否决用 P2/未上线豁免原验收、否决新增机制/DTO/fallback。
 
-唯一下一步：全量 Verify-Command 与五次网络负态回归后 push 原 PR36，供主脑做 H0 到 H1 增量审。
+唯一下一步：主脑对 PR36 新 head 做 H0 到 H1 专项增量审与新证据全量终审，不把 draft skip 当完整 gate。
