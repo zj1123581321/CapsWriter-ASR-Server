@@ -1,16 +1,16 @@
 ---
 lane: http-integration
-id: E6
+id: M6
 slug: qa
 status: 未开始
 owner: pi协调
 order: 1
 priority: 高
-depends_on: [http-core/E4, http-sdk/E5]
+depends_on: [http-core/M4, http-sdk/M5]
 merged_pr: null
 ---
 
-# 里程碑进度：<!-- http-integration/E6：HTTP 边界 QA -->
+# 里程碑进度：http-integration/M6：HTTP 边界 QA
 
 - **预期产出**：12 组 producer、重启、并发、错误和旧 WS 验收，含至少五次并发回归。
 - **当前范围**：只验证隔离服务与真实客户端/文件/进程边界，不访问生产端口、模型或录音。
