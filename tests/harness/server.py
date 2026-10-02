@@ -262,6 +262,7 @@ def run_managed_http_server(
     import os
     import signal
     import sys
+    import time
     import traceback
 
     for key, value in dict(env or {}).items():
@@ -286,6 +287,9 @@ def run_managed_http_server(
         state.queue_in = _FaultyPutQueue(queue_in)
 
     app = SimpleNamespace(state=state)
+    # 镜像生产 Application（core/server/app.py 的 ServerState(app=self)）：
+    # fail_active_tasks 等终态收尾从 state.app 取真实 runner
+    state.app = app
     worker = multiprocessing.Process(
         target=run_recording_worker,
         args=(queue_in, queue_out, state.sockets_id, state.active_http_jobs,
@@ -307,6 +311,23 @@ def run_managed_http_server(
     state.http_result_sink = runner.result_sink
     # 与生产 Application 同一形状：进程管理器从这里拿到真实 runner
     app.http_file_runner = runner
+    # R4 探针：按环境变量把 FAILED 持久写卡在真实 I/O 入口上，父进程用标记文件
+    # 控制卡点与放行（跨进程等价于 in-process 探针的 asyncio.Event）
+    block_marker = os.environ.get("CW_TEST_PERSIST_BLOCK_MARKER")
+    if block_marker:
+        marker = Path(block_marker)
+        entered = Path(os.environ["CW_TEST_PERSIST_BLOCK_ENTERED"])
+        block_wait = float(os.environ.get("CW_TEST_PERSIST_BLOCK_WAIT", "30"))
+        real_fail_job = http_server.fail_job
+
+        async def blocked_fail_job(job_id, error_code):
+            entered.write_text("1")
+            deadline = time.monotonic() + block_wait
+            while not marker.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            return await real_fail_job(job_id, error_code)
+
+        http_server.fail_job = blocked_fail_job
 
     async def shutdown():
         state.queue_out.put(None)
