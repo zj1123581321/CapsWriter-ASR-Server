@@ -10,7 +10,7 @@ failure-visibility: p1-found
 - P1，同一不变式在 worker 进程崩溃路径也不成立：`fail_active_tasks` 对无 WebSocket 的 HTTP key 只做内存 `transition_terminal`，不调用持久 sink。真实 worker `os._exit(17)` 探针在主进程非零退出前读库仍为 `RUNNING/error_code=null`。P1 两问：真实路径会触发吗？会，已实测；后果可接受吗？不可接受，失败事实只能等重启才被改写为 `server_restarted`。应将 HTTP 进程失败纳入同一“先持久 FAILED、后释放”路径；写失败仍保持非零退出并保留明确可见错误。
 - P2-2：通过。`mark_running` 是 `WHERE state=QUEUED` 的条件更新且 `started_at=COALESCE(...)`；36 项 E3 测试包含另一连接观察 RUNNING、终态不回退和重复 commit 不重投。
 - P2-3：通过。`record_result` 的 `''.join(tokens)==text_accu` 拒绝不一致结果；变异探针输出当前 `invalid_result`，移除断言后同 payload 被接受为 DONE，断言有约束力。
-- P2-1：正常段超时先落库探针通过，FAILED/error_code 在服务退出前可见；写入异常探针确认服务非零退出且原始日志含“持久失败事实未落库”。但其释放顺序仍由上述 P1 覆盖，不能判 clean。
+- P2-1：正常段超时先落库探针通过，FAILED/error_code 在服务退出前可见；写入异常探针外层断言因 Rich 换行判据退出 1，不能记作测试通过，但原始日志独立检索命中 2 次相关错误，服务仍非零退出且读库为 `RUNNING/error_code=null`。其释放顺序仍由上述 P1 覆盖，不能判 clean。
 
 ## Full-domain review
 
