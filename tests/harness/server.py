@@ -252,7 +252,7 @@ def _apply_fault(fault):
 
 def run_managed_http_server(
     info_queue, options, calls, received, queue_in, queue_out, data_dir,
-    fault=None, ffmpeg_shim=None,
+    fault=None, ffmpeg_shim=None, env=None,
 ):
     """独立主进程：真 HTTP listener + 真文件 runner + 真 ws_send + 真识别子进程。
 
@@ -263,6 +263,9 @@ def run_managed_http_server(
     import signal
     import sys
     import traceback
+
+    for key, value in dict(env or {}).items():
+        os.environ[key] = str(value)
 
     if ffmpeg_shim is not None:
         os.environ["PATH"] = f"{ffmpeg_shim}{os.pathsep}{os.environ.get('PATH', '')}"
@@ -302,6 +305,8 @@ def run_managed_http_server(
     runner = HttpFileRunner(state, http_server)
     http_server.attach_runner(runner)
     state.http_result_sink = runner.result_sink
+    # 与生产 Application 同一形状：进程管理器从这里拿到真实 runner
+    app.http_file_runner = runner
 
     async def shutdown():
         state.queue_out.put(None)
@@ -383,7 +388,7 @@ class ManagedHttpServerHarness:
 
     @classmethod
     async def start(cls, *, data_dir, options=None, fault=None, ffmpeg_shim=None,
-                    stderr_path=None):
+                    stderr_path=None, env=None):
         self = cls()
         self.manager = multiprocessing.Manager()
         self.calls = self.manager.list()
@@ -401,6 +406,7 @@ class ManagedHttpServerHarness:
                 (
                     self.info_queue, options or {}, self.calls, self.received,
                     self.queue_in, self.queue_out, Path(data_dir), fault, ffmpeg_shim,
+                    dict(env or {}),
                 ),
                 self._stderr_handle.fileno(),
             ),

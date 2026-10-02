@@ -162,6 +162,8 @@ class ProcessManager:
                     transition_terminal(
                         state, key, 'FAILED', code='inference_timeout'
                     )
+                    if key[0] == 'http':
+                        await self._fail_http_job_before_exit(key[2], now - submitted_at)
                 from ..connection.ws_send import fail_active_tasks
                 await fail_active_tasks(
                     state,
@@ -170,6 +172,29 @@ class ProcessManager:
                     skip_key=key,
                 )
                 raise SystemExit(1)
+
+    async def _fail_http_job_before_exit(self, job_id: str, waited: float) -> None:
+        """推理段超时：先把 HTTP Job 可靠写成 FAILED 再让进程退出。
+
+        段超时发生在父进程监控协程里，不经过 runner 的失败路径；如果不落库，
+        真实错因会在重启后被收敛成 server_restarted 而丢失。落库失败仍非零退出，
+        但必须显式记录“持久失败事实未落库”，不允许静默。
+        """
+        runner = getattr(self.app, 'http_file_runner', None)
+        message = f"推理段超时，最早提交时间距今 {waited:.3f}s"
+        if runner is None:
+            logger.error(
+                f"HTTP 文件任务推理段超时但未装配 runner：job={job_id} "
+                f"持久失败事实未落库：{message}"
+            )
+            return
+        try:
+            await runner.fail_job(job_id, 'inference_timeout', message)
+        except BaseException as exc:
+            logger.error(
+                f"HTTP 文件任务 {job_id} 推理段超时且 FAILED 落库失败，"
+                f"持久失败事实未落库：{exc!r}"
+            )
 
     def stop(self):
         """停止子进程"""

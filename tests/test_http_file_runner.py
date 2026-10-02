@@ -811,6 +811,49 @@ async def test_crash_window_restart_keeps_failed_server_restarted(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_segment_timeout_persists_failed_before_exit(tmp_path):
+    """推理段超时：进程退出前 Job 已可靠落库 FAILED[inference_timeout]，错因不丢。"""
+    from tests.harness.server import ManagedHttpServerHarness
+
+    stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=60.0)
+    harness = await ManagedHttpServerHarness.start(
+        data_dir=tmp_path / "httpdata", options=stalled,
+        env={"CW_SEGMENT_TIMEOUT": "5"},
+    )
+    try:
+        source = make_container(tmp_path, "speech.mp3")
+        recovery = tmp_path / "resume.json"
+        handle = await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
+        job_id = handle.job_id
+        assert (await wait_state(harness, recovery, "RUNNING")).state == "RUNNING"
+        # 边轮询真实库边等进程退出：FAILED 必须发生在进程还活着的时候，
+        # 不能只靠重启后的 server_restarted 反推
+        observations = []
+        while harness.process.is_alive():
+            rows = harness.read_db(
+                "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
+            )
+            if rows:
+                observations.append((rows[0]["state"], rows[0]["error_code"]))
+            await asyncio.sleep(0.02)
+        await harness.wait_for_exit(30)
+    finally:
+        await harness.cleanup()
+
+    assert harness.exitcode != 0, "推理段超时仍必须非零退出"
+    failed_before_exit = [item for item in observations if item[0] == "FAILED" and item[1]]
+    assert failed_before_exit, (
+        f"进程退出前未观察到已落库的 FAILED（error_code 为空）：{observations[-6:]}"
+    )
+    assert {item[1] for item in failed_before_exit} == {"inference_timeout"}
+    row = harness.read_db(
+        "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
+    )[0]
+    assert row["state"] == "FAILED" and row["error_code"] == "inference_timeout"
+    assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["pcm_chunks", "enqueue"])
 async def test_unknown_background_exception_fails_job_and_exits_nonzero(tmp_path, fault):
     """runner 后台未知异常：先可靠 FAILED，再上抛到监督链让进程非零退出。"""
