@@ -25,3 +25,5 @@ merged_pr: null
   - [x] 结果超限、worker 失败、ffmpeg 非零退出、SIGTERM 与崩溃窗口均有真实进程证据；未知后台异常让进程非零退出。
   - [x] 重启收敛为 FAILED[server_restarted] 且不自动重跑。
   - [x] 两个 websockets 版本全量绿。
+  - [x] 冷审查四项修复：全局运行闸门（P1-2）、QUEUED→RUNNING 持久转移（P2-2）、
+    `record_result` 校验 tokens 拼接与 text_accu 一致（P2-3）、推理段超时先落库再退出（P2-1）。
