@@ -7,6 +7,7 @@ import functools
 import multiprocessing
 import os
 import queue
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -242,8 +243,11 @@ def _apply_fault(fault):
             yield b""  # pragma: no cover - 只为保持 async generator 形态
 
         FileSourceDecoder.pcm_chunks = faulty_pcm_chunks
+    elif fault == "enqueue":
+        return _FaultyPutQueue
     elif fault is not None:
         raise ValueError(f"未知故障注入类型: {fault!r}")
+    return None
 
 
 def run_managed_http_server(
@@ -354,13 +358,15 @@ def run_managed_http_server(
 
 
 def _child_with_stderr(args, stderr_fd):
-    """子进程先把 fd 2 与 sys.stderr 指到测试提供的日志文件，再进入真实服务主体。
+    """子进程先独立成组并把 fd 2/sys.stderr 指到测试日志文件，再进入真实服务主体。
 
-    两处都要改：pytest 之类的捕获器可能已经把 sys.stderr 换成指向临时文件的对象，
-    只 dup2 不足以让 rich/print/traceback 落到本文件。
+    两处都要处理：pytest 之类的捕获器可能已经把 sys.stderr 换成指向临时文件的对象，
+    只 dup2 不足以让 rich/print/traceback 落到本文件；独立成组则让父进程能用
+    killpg 一次收掉它自己 fork 出去的 Manager 与识别子进程，避免 SIGKILL 后遗留孤儿。
     """
     import sys as _sys
 
+    os.setsid()
     os.dup2(stderr_fd, 2)
     _sys.stderr = open(2, "w", buffering=1, errors="replace", closefd=False)
     run_managed_http_server(*args)
@@ -386,6 +392,7 @@ class ManagedHttpServerHarness:
         self.queue_in = self.manager.Queue()
         self.queue_out = self.manager.Queue()
         self.stderr_path = stderr_path or (Path(data_dir).parent / "server-stderr.log")
+        self.data_dir = Path(data_dir)
         self.stderr_path.parent.mkdir(parents=True, exist_ok=True)
         self._stderr_handle = open(self.stderr_path, "wb")
         self.process = multiprocessing.Process(
@@ -430,14 +437,14 @@ class ManagedHttpServerHarness:
         return self.exitcode
 
     async def terminate(self, signum, timeout: float = 20) -> int:
+        # 只给服务主进程发信号：它自己按生产顺序收尾子进程，
+        # 整组广播会让 Manager/识别子进程被抢先杀掉而把正常 SIGTERM 变成非零退出
         os.kill(self.process.pid, signum)
         return await self.wait_for_exit(timeout)
 
     async def stop(self, timeout: float = 20) -> int:
         if self.process.is_alive():
-            import signal as signal_module
-
-            return await self.terminate(signal_module.SIGTERM, timeout)
+            return await self.terminate(signal.SIGTERM, timeout)
         return self.process.exitcode
 
     def stderr_tail(self, limit: int = 4000) -> str:
@@ -446,8 +453,18 @@ class ManagedHttpServerHarness:
         return self.stderr_path.read_text(encoding="utf-8", errors="replace")[-limit:]
 
     async def cleanup(self) -> None:
-        if self.process is not None and self.process.is_alive():
-            self.process.kill()
+        if self.process is not None:
+            # 子进程 setsid 后自成组：主进程被 SIGKILL 时，它 fork 出去的 Manager 与
+            # 识别子进程不会自动退出，必须按组号收掉，否则每次运行都漏孤儿。
+            # 必须在回收主进程之前拿组号，reap 之后 getpgid 会查不到。
+            pgid = self.process.pid
+            if self.process.is_alive():
+                self.process.kill()
+            await asyncio.to_thread(self.process.join, 5)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             await asyncio.to_thread(self.process.join, 5)
         self.exitcode = self.process.exitcode if self.process is not None else None
         if self._stderr_handle is not None:

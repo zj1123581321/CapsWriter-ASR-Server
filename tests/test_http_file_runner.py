@@ -282,6 +282,18 @@ async def raw_get(harness: RunnerHarness, recovery: Path, suffix: str = "") -> h
         )
 
 
+async def raw_job(harness, recovery: Path) -> dict:
+    """重启后端口会变（SDK 恢复文件绑定 base_url），因此直接用裸 HTTP 连接读任务状态。"""
+    payload = json.loads(recovery.read_text(encoding="utf-8"))
+    async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+        response = await client.get(
+            f"{harness.base_url}/v1/jobs/{payload['job_id']}",
+            headers={"Authorization": f"Bearer {payload['token']}"},
+        )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 # ---------------------------------------------------------------- 跨边界主路径
 
 
@@ -582,12 +594,12 @@ async def test_sigterm_exits_zero_and_restart_marks_server_restarted(tmp_path):
     # 重启：同一数据目录，旧 Job 被收敛为 server_restarted，不自动重跑
     restarted = await ManagedHttpServerHarness.start(data_dir=data_dir, options=stalled)
     try:
-        status = await get_file_job_http(restarted.base_url, resume_path=recovery)
-        assert status.state == "FAILED"
-        assert status.error_code == "server_restarted"
-        assert status.result_available is False
+        status = await raw_job(restarted, recovery)
+        assert status["state"] == "FAILED"
+        assert status["error_code"] == "server_restarted"
+        assert status["result_available"] is False
         await asyncio.sleep(0.3)
-        assert restarted.received == [], "重启后不得自动重跑推理"
+        assert list(restarted.received) == [], f"重启后不得自动重跑推理: {list(restarted.received)!r}"
     finally:
         await restarted.stop()
         await restarted.cleanup()
@@ -612,12 +624,12 @@ async def test_crash_window_restart_keeps_failed_server_restarted(tmp_path):
 
     restarted = await ManagedHttpServerHarness.start(data_dir=data_dir, options=stalled)
     try:
-        status = await get_file_job_http(restarted.base_url, resume_path=recovery)
-        assert status.state == "FAILED"
-        assert status.error_code == "server_restarted"
+        status = await raw_job(restarted, recovery)
+        assert status["state"] == "FAILED"
+        assert status["error_code"] == "server_restarted"
         assert handle.job_id
         await asyncio.sleep(0.3)
-        assert restarted.received == []
+        assert list(restarted.received) == [], f"重启后不得自动重跑推理: {list(restarted.received)!r}"
         row = restarted.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"]
         assert row == 0
     finally:
