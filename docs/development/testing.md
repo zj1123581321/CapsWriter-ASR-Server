@@ -26,12 +26,3 @@ uv run --no-project --python 3.12 --with numpy --with rich --with websockets --w
 - MLX 设备验证脚本见 `scripts/_verify_mlx_asr.py` 和 `scripts/_smoke_mlx_subprocess.py`。
 
 SDK 安装和 CLI 用法见 [`sdk/README.md`](../../sdk/README.md)。
-
-## HTTP 文件任务测试
-
-- `tests/test_http_store.py`：真实 SQLite 与真实文件字节，锁定「字节 → fsync → offset 事务 → ACK」、未确认尾按数据库 offset 截断、真实 SQLite busy 不 ACK、OS 独占锁的第二进程竞争、重启收敛与坏 schema fail fast。
-- `tests/test_http_file_tasks.py`：在 port 0 上起真实 aiohttp listener，消费者是已合入的 SDK（`sdk/capswriter_asr`），断言真实请求体落盘字节、恢复文件内容与库内 offset 一致；覆盖六个 route、幂等创建、断点续传、限额 429、I/O mailbox 32 名额，真实 server handler 被取消后两种 I/O 完成顺序各五次，以及 create/PATCH/commit 共用 reader 的每次无输入空闲 408、两半开名额释放和间隔小于 idle 的慢传成功（各五次）。
-- `tests/test_http_config.py`：在无 PI/DELEGATE 身份的裸环境子进程里真实解析 `CW_HTTP_PORT`/`CW_HTTP_DATA_DIR`，并断言既有 `CW_UPLOAD_IDLE_SECONDS` 默认 300、有值会传给 HTTP reader。
-- `tests/test_http_supervision.py`：真实子进程的启用可见性与监督（默认关闭、坏数据目录/端口冲突/同目录第二实例非零退出、未知 HTTP/I/O 与 WS RuntimeError 非零退出、SIGTERM 零退出并释放端口）；另覆盖真实进程崩溃窗口重开上传、offset commit 前后恢复、结果 producer 输出经新进程 HTTP 读回，以及正式进程消费小 idle 后半开 body 408 非 fatal。
-
-完整验证命令显式安装 `aiohttp==3.14.3` 与 `httpx==0.28.1`，与 CI 消费依赖一致，因此 HTTP listener 测试不能以缺依赖 skip 冒充完整通过。HTTP 默认关闭的旧服务启动不要求安装 aiohttp；若在旧环境只验证 WS，应将其单独标为子集验证。
