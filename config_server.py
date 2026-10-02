@@ -22,6 +22,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 #   CW_DRAIN_BATCH            Worker 每轮从队列取入任务上限：16(默认)
 #   CW_UPLOAD_IDLE_SECONDS    上传空闲超时秒数：300(默认)
 #   CW_SEGMENT_TIMEOUT        单段推理看门狗秒数：600(默认)
+#   --- HTTP 文件任务（默认禁用，需成对提供）---
+#   CW_HTTP_PORT              HTTP listener 端口：默认不设置（禁用）
+#   CW_HTTP_DATA_DIR          HTTP 持久数据目录（稳定绝对路径）：默认不设置
 #   --- GPU/后端加速 ---
 #   CW_ONNX_PROVIDER          ONNX 后端：CPU(默认)/CUDA/DML/TRT   —— SenseVoice/FunASR/Qwen
 #   CW_LLM_USE_GPU            GGUF LLM 是否用 GPU：0(默认)/1       —— FunASR/Qwen
@@ -89,6 +92,36 @@ class ServerConfig:
     # os.environ["GGML_VK_DISABLE_F16"] = "1"       # 集成显卡解码有误，强制熔断时尝试
 
 
+
+
+class HttpConfigError(Exception):
+    """显式启用 HTTP 但配置不满足契约：必须 fail fast，不得自动选端口或退回 disabled。"""
+
+
+def resolve_http_settings() -> 'tuple[str, int, Path] | None':
+    """解析 HTTP listener 的 (addr, port, data_dir)；默认禁用。
+
+    CW_HTTP_PORT 与 CW_HTTP_DATA_DIR 必须成对出现；HTTP 端口不得与 WS 相同；
+    数据目录必须是稳定绝对路径；监听地址沿用当前 ASR 监听地址。
+    """
+    raw_port = _env_str('CW_HTTP_PORT', '')
+    raw_dir = _env_str('CW_HTTP_DATA_DIR', '')
+    if not raw_port and not raw_dir:
+        return None  # 默认禁用：旧 WS 部署完全不受影响
+    if not raw_port or not raw_dir:
+        raise HttpConfigError('CW_HTTP_PORT 与 CW_HTTP_DATA_DIR 必须同时提供')
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise HttpConfigError(f'CW_HTTP_PORT 不是有效端口：{raw_port}') from exc
+    if not 1 <= port <= 65535:
+        raise HttpConfigError(f'CW_HTTP_PORT 超出合法范围：{port}')
+    if port == int(ServerConfig.port):
+        raise HttpConfigError('CW_HTTP_PORT 不得与 WebSocket 端口相同')
+    data_dir = Path(raw_dir)
+    if not data_dir.is_absolute():
+        raise HttpConfigError('CW_HTTP_DATA_DIR 必须是稳定绝对路径')
+    return ServerConfig.addr, port, data_dir
 
 
 class ModelDownloadLinks:
