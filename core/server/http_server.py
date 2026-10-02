@@ -20,7 +20,6 @@ import asyncio
 import functools
 import json
 import logging
-import os
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -113,7 +112,6 @@ class HttpServer:
     """aiohttp listener + I/O worker + 监督。"""
 
     def __init__(self, app, addr: str, port: int, data_dir: Path):
-        self.app = app
         self.addr = addr
         self.port = port
         self.data_dir = Path(data_dir)
@@ -268,6 +266,10 @@ class HttpServer:
         token = header[len("Bearer "):].strip()
         if not token:
             raise HttpStoreError("unauthorized", "缺少 Bearer 凭据", status=401)
+        try:
+            token.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise HttpStoreError("unauthorized", "Bearer 凭据必须可被 UTF-8 表示", status=401) from exc
         return token
 
     @staticmethod
@@ -327,6 +329,10 @@ class HttpServer:
         create_key = request.headers.get("Idempotency-Key", "")
         if not create_key:
             raise HttpStoreError("idempotency_key_required", "缺少 Idempotency-Key", status=400)
+        try:
+            create_key.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise HttpStoreError("invalid_request", "Idempotency-Key 必须可被 UTF-8 表示", status=400) from exc
         content_type = (request.headers.get("Content-Type") or "application/json").split(";")[0].strip()
         if content_type != "application/json":
             raise HttpStoreError("unsupported_media_type", "创建上传只接受 application/json", status=415)

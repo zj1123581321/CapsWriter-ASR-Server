@@ -681,6 +681,10 @@ def normalize_options(options: dict) -> dict:
         if value is None:
             normalized[field] = None
         elif isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise HttpStoreError("invalid_options", f"{field} 必须可被 UTF-8 表示") from exc
             normalized[field] = value
         else:
             raise HttpStoreError("invalid_options", f"{field} 必须是字符串")

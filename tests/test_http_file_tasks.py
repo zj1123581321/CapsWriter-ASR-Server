@@ -713,6 +713,17 @@ async def test_options_missing_and_none_default_but_falsy_wrong_types_are_reject
                 body = rejected_new.json()
                 assert body["code"] == "invalid_options"
                 assert body["request_id"]
+            # JSON 转义 lone surrogate 过了 str 类型检查但不可 UTF-8 表示：受理边界必须局部 400
+            for index, field in enumerate(("model", "language", "context")):
+                rejected = await client.post(
+                    base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": f"surrogate-{index}"},
+                    content=b'{"size_bytes":4,"sha256":"' + digest.encode()
+                            + b'","options":{"' + field.encode() + b'":"\\ud800"}}',
+                )
+                assert rejected.status_code == 400, rejected.text
+                body = rejected.json()
+                assert body["code"] == "invalid_options"
+                assert body["request_id"]
             assert (server.data_dir / "sources" / f"{upload_id}.bin").read_bytes() == old_bytes
             assert dict(_read_db(server.data_dir,
                                  "SELECT confirmed_offset, options_json, updated_at, expires_at"
@@ -739,6 +750,46 @@ async def test_options_missing_and_none_default_but_falsy_wrong_types_are_reject
                 "model": None, "language": None, "context": None,
                 "seg_duration": 15.0, "seg_overlap": 2.0,
             }
+        assert server.fatal is None
+
+
+@pytest.mark.asyncio
+async def test_non_utf8_header_bytes_are_local_4xx_not_fatal(tmp_path):
+    """Authorization/Idempotency-Key 原始非法字节经 surrogateescape 直达服务端：局部 4xx，不 fatal。
+
+    路径侧实测相反：原始非 ASCII 字节被 aiohttp 解析器 400 拒绝，百分号编码被替换为
+    可编码字符后 404，均到不了 SQL，所以防御只加在两个实测可触发的 header 上。
+    """
+    digest = sha256(b"keep").hexdigest()
+    async with running_server(tmp_path) as (server, base_url):
+        host, port = "127.0.0.1", int(base_url.rsplit(":", 1)[1])
+        body = b'{"size_bytes":4,"sha256":"' + digest.encode() + b'","options":{}}'
+
+        async def post_raw(extra_headers: bytes):
+            reader, writer = await asyncio.open_connection(host, port)
+            writer.write(b"POST /v1/uploads HTTP/1.1\r\nHost: x\r\n"
+                         b"Content-Type: application/json\r\nContent-Length: "
+                         + str(len(body)).encode() + b"\r\n" + extra_headers + b"\r\n\r\n" + body)
+            await writer.drain()
+            status, resp_body = await _read_raw_http_response(reader, 5)
+            writer.close()
+            return status, json.loads(resp_body)
+
+        status, resp = await post_raw(b"Authorization: Bearer t\xffk\r\nIdempotency-Key: h1")
+        assert status.startswith("HTTP/1.1 401"), status
+        assert resp["code"] == "unauthorized"
+        assert resp["request_id"]
+        status, resp = await post_raw(b"Authorization: Bearer ok\r\nIdempotency-Key: k\xff1")
+        assert status.startswith("HTTP/1.1 400"), status
+        assert resp["code"] == "invalid_request"
+        assert resp["request_id"]
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            good = await client.post(
+                base_url + "/v1/uploads",
+                headers={"Authorization": "Bearer ok", "Idempotency-Key": "h-ok"},
+                json={"size_bytes": 4, "sha256": digest},
+            )
+            assert good.status_code == 201, good.text
         assert server.fatal is None
 
 
