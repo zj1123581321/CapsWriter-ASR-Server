@@ -1143,13 +1143,18 @@ async def test_worker_crash_persists_failed(tmp_path):
         job_id = handle.job_id
         assert (await wait_state(harness, recovery, "RUNNING")).state == "RUNNING"
         observations = []
-        while harness.process.is_alive():
+        while True:
+            # 先采样、后判活：FAILED 的提交严格先于进程死亡，最后一份样本
+            # 必然落在提交之后（若先判活，死亡检测的毫秒级延迟会漏掉
+            # 「提交 → 死亡」之间的窄窗口，把真绿误判成红）
             rows = harness.read_db(
                 "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
             )
             if rows:
                 observations.append((rows[0]["state"], rows[0]["error_code"]))
-            await asyncio.sleep(0.02)
+            if not harness.process.is_alive():
+                break
+            await asyncio.sleep(0.01)
         await harness.wait_for_exit(30)
         # Manager 代理在 cleanup 之后不可访问，崩溃证据必须在 cleanup 前取出
         crash_call_count = len(harness.calls)

@@ -79,13 +79,22 @@ async def queue_error_and_close(
 
 
 async def fail_active_tasks(state, code: str, message: str, *, skip_key=None) -> None:
-    """给全部活动任务排 error 并等待各连接冲刷/关闭。"""
+    """给全部活动任务排 error 并等待各连接冲刷/关闭。
+
+    HTTP 任务没有连接可刷：必须先经 finalize_http_job 可靠落库 FAILED，
+    落库成功后才释放 owner/唤醒等待者；落库超时或失败不释放 owner，
+    由调用方按原语义非零退出，重启收敛兜底。
+    """
     ensure_server_runtime(state)
+    from ..http_file_runner import finalize_http_job
     closing = []
     for key, record in list(state.tasks.items()):
         if key == skip_key or record.status in {'DONE', 'FAILED'}:
             continue
-        websocket = state.sockets.get(key[1]) if key[0] == 'ws' else None
+        if key[0] == 'http':
+            await finalize_http_job(state, key, 'FAILED', code, message)
+            continue
+        websocket = state.sockets.get(key[1])
         if websocket is None:
             transition_terminal(state, key, 'FAILED')
             continue

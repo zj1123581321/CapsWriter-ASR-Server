@@ -16,7 +16,9 @@ HTTP 文件任务 runner（E3）
 
 失败语义：任一段解码/提交/结果失败即整 Job FAILED（先可靠提交，再停后续段）；
 迟到结果不覆盖已终态 Job；未知后台异常先可靠提交 FAILED 再上抛到 listener 监督链
-（fail-loud），绝不被吞掉。正常收尾只取消并回收解码进程，不把任务改写成 FAILED ——
+（fail-loud），绝不被吞掉。runner 之外的 HTTP 终态收尾（worker 崩溃、段超时）
+一律经 finalize_http_job：先条件持久化 FAILED，成功后才释放 owner/唤醒等待者。
+正常收尾只取消并回收解码进程，不把任务改写成 FAILED ——
 重启时 QUEUED/RUNNING 由存储收敛为 FAILED[server_restarted]，不做自动重跑。
 """
 
@@ -57,6 +59,9 @@ MAX_TASK_SECONDS = float(os.environ.get("CW_MAX_TASK_SECONDS", "14400"))
 DECODER_CLOSE_TIMEOUT = 10.0
 # runner 收尾（取消所有在跑 Job）的有界期限
 RUNNER_STOP_TIMEOUT = 20.0
+# HTTP 终态持久化的有界期限：本地 SQLite 终态写通常亚毫秒级，5s 已覆盖最坏
+# 在途排队；超限必须放弃等待——「错因没写进去」绝不能升级成「进程永久挂住」。
+HTTP_FINALIZE_TIMEOUT = 5.0
 # ffmpeg stderr 只保留末尾若干字节用于失败诊断
 STDERR_TAIL_BYTES = 500
 
@@ -268,6 +273,48 @@ def _check_samples_limit(job_id: str, samples: int) -> None:
             "audio_too_long",
             f"任务 {job_id} 解码样本数 {samples} 超过时长上限 {MAX_TASK_SECONDS:g}s",
         )
+
+
+async def finalize_http_job(
+    state, key: TaskKey, status: str, code: str, message: str
+) -> bool:
+    """HTTP 终态唯一收尾入口：先可靠持久化 FAILED，成功之后才释放 owner/唤醒等待者。
+
+    只接受 HTTP key 的 FAILED 终态（DONE 由结果 sink 走 record_result 路径）。
+    机制复用 runner.fail_job 的既有正确形态（条件更新落库 → transition_terminal），
+    不发明第二套释放逻辑；持久写用 wait_for 卡住上限，超时或失败时**不释放
+    owner**、记显式错误日志（「持久失败事实未落库」）、返回 False 交由调用方
+    按原语义非零退出，重启收敛兜底——绝不静默吞掉。
+    """
+    if key[0] != "http":
+        raise ValueError(f"finalize_http_job 只接受 http key: {key!r}")
+    if status != "FAILED":
+        raise ValueError(f"finalize_http_job 只收尾 FAILED 终态: {status!r}")
+    if not code:
+        raise ValueError("finalize_http_job 必须携带非空错误码")
+    app = getattr(state, "app", None)
+    runner = getattr(app, "http_file_runner", None)
+    job_id = key[2]
+    if runner is None:
+        logger.error(
+            f"HTTP 文件任务 {job_id} 需要收尾 FAILED[{code}]，但 runner 未装配："
+            f"持久失败事实未落库，owner 不释放，交由重启收敛兜底"
+        )
+        return False
+    try:
+        return await asyncio.wait_for(
+            runner.fail_job(job_id, code, message),
+            timeout=HTTP_FINALIZE_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            f"HTTP 文件任务 {job_id} 终态持久化超时或失败"
+            f"（{type(exc).__name__}: {exc}）：持久失败事实未落库，"
+            f"owner 不释放，交由重启收敛兜底"
+        )
+        return False
 
 
 class HttpFileRunner:
@@ -531,5 +578,6 @@ __all__ = [
     "JobFailure",
     "RunnerUnavailable",
     "ffmpeg_path",
+    "finalize_http_job",
     "http_result_payload",
 ]
