@@ -358,8 +358,9 @@ async def test_persisted_done_result_is_served_after_reopen(tmp_path):
         "time_complete": 3.0,
         "text": "你好世界",
         "text_accu": "你好世界",
-        "tokens": ["你", "好"],
-        "timestamps": [0.1, 0.5],
+        # 文件任务的 tokens 拼接必须与 text_accu 一致（storage 与 pipeline 同一约定）
+        "tokens": ["你", "好", "世", "界"],
+        "timestamps": [0.1, 0.5, 0.9, 1.3],
         "is_final": True,
     }
     async with running_server(tmp_path, inference=True) as (server, base_url):
@@ -383,8 +384,8 @@ async def test_persisted_done_result_is_served_after_reopen(tmp_path):
             assert fetched.status_code == 200
             payload = fetched.json()
             assert payload["text"] == "你好世界"
-            assert payload["tokens"] == ["你", "好"]
-            assert payload["timestamps"] == [0.1, 0.5]
+            assert payload["tokens"] == ["你", "好", "世", "界"]
+            assert payload["timestamps"] == [0.1, 0.5, 0.9, 1.3]
             assert payload["task_id"] == handle.job_id
             assert payload["is_final"] is True
         status = await sdk_http.get_file_job_http(base_url2, resume_path=recovery)
