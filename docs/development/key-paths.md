@@ -5,6 +5,8 @@
 - [服务端配置](../../config_server.py) — 网络、模型、并发、分段和 GPU 参数。
 - [Proxy 配置](../../config_proxy.py) — 后端地址、权重与监听参数。
 - [服务端核心](../../core/server/) — WebSocket、任务处理、worker 与引擎管理。
+- [HTTP 文件 runner](../../core/server/http_file_runner.py) — 原容器解码、Job 调度与结果持久 sink。
+- [HTTP 持久存储](../../core/server/http_store.py) — 上传/Job/结果的唯一持久真源。
 - [Proxy 核心](../../core/proxy/) — 后端连接、健康状态与任务路由。
 - [SDK](../../sdk/) — Python 文件转录 API 和命令行。
 - [模型支持](../reference/models.md) — 引擎与辅助模型列表。
