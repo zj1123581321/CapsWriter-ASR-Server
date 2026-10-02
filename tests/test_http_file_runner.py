@@ -830,15 +830,19 @@ async def test_segment_timeout_persists_failed_before_exit(tmp_path):
         job_id = handle.job_id
         assert (await wait_state(harness, recovery, "RUNNING")).state == "RUNNING"
         # 边轮询真实库边等进程退出：FAILED 必须发生在进程还活着的时候，
-        # 不能只靠重启后的 server_restarted 反推
+        # 不能只靠重启后的 server_restarted 反推。先采样、后判活：提交严格
+        # 先于死亡，最后一份样本必然落在提交之后（先判活会被死亡检测的毫秒级
+        # 延迟漏掉「提交 → 死亡」之间的窄窗口）
         observations = []
-        while harness.process.is_alive():
+        while True:
             rows = harness.read_db(
                 "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
             )
             if rows:
                 observations.append((rows[0]["state"], rows[0]["error_code"]))
-            await asyncio.sleep(0.02)
+            if not harness.process.is_alive():
+                break
+            await asyncio.sleep(0.01)
         await harness.wait_for_exit(30)
     finally:
         await harness.cleanup()
