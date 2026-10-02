@@ -264,6 +264,21 @@ async def wait_terminal(harness: RunnerHarness, recovery: Path, timeout: float =
     raise AssertionError(f"任务未在 {timeout}s 内到达终态，最后状态={status}")
 
 
+async def wait_state(harness: RunnerHarness, recovery: Path, expected: str, timeout: float = 30.0):
+    """另一连接轮询到指定状态（识别进行中观察 RUNNING 用）。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    status = None
+    while loop.time() < deadline:
+        status = await get_file_job_http(harness.base_url, resume_path=recovery)
+        if status.state == expected:
+            return status
+        if status.state in {"DONE", "FAILED"}:
+            raise AssertionError(f"任务先到达终态 {status.state}，未观察到 {expected}")
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"任务未在 {timeout}s 内到达 {expected}，最后状态={status}")
+
+
 async def submit(harness: RunnerHarness, source: Path, recovery: Path, **options):
     """真实 SDK 客户端：上传完整容器并 commit，返回后上传客户端已关闭。"""
     return await submit_file_http(
@@ -415,15 +430,22 @@ async def test_real_container_upload_then_other_connection_takes_done_result(
 
 
 @pytest.mark.asyncio
-async def test_queued_job_result_is_not_ready_and_exposes_nothing(tmp_path):
-    """识别尚未完成时 GET result 是 409 result_not_ready，且不泄露半成品。"""
-    stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=60.0)
+async def test_running_job_result_is_not_ready_and_exposes_nothing(tmp_path):
+    """识别进行中：GET job 是持久化的 RUNNING，GET result 是 409 result_not_ready。"""
+    stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=3.0)
     source = make_container(tmp_path, "speech.mp3", seconds=20.0)
     recovery = tmp_path / "resume.json"
     async with running_runner_server(tmp_path, options=stalled) as harness:
         handle = await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
-        status = await get_file_job_http(harness.base_url, resume_path=recovery)
-        assert status.state == "QUEUED"
+        # 识别进行中从另一连接观察：RUNNING 必须来自 SQLite（唯一真源），
+        # 而不是 route 里的内存态或推断
+        status = await wait_state(harness, recovery, "RUNNING")
+        assert status.result_available is False
+        row = harness.read_db(
+            "SELECT state, started_at FROM jobs WHERE job_id=?", (handle.job_id,)
+        )[0]
+        assert row["state"] == "RUNNING"
+        assert row["started_at"] is not None, "RUNNING 必须带 started_at"
         response = await raw_get(harness, recovery, "/result")
         assert response.status_code == 409
         body = response.json()
@@ -433,7 +455,12 @@ async def test_queued_job_result_is_not_ready_and_exposes_nothing(tmp_path):
             await get_file_result_http(harness.base_url, resume_path=recovery)
         assert info.value.code == "result_not_ready"
         assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 0
-        assert handle.job_id
+        # 终态后 RUNNING 不回退：真实收尾后才允许离开运行态
+        assert (await wait_terminal(harness, recovery)).state == "DONE"
+        final = harness.read_db(
+            "SELECT state, error_code FROM jobs WHERE job_id=?", (handle.job_id,)
+        )[0]
+        assert final["state"] == "DONE" and final["error_code"] is None
 
 
 @pytest.mark.asyncio
@@ -639,8 +666,8 @@ async def test_sigterm_exits_zero_and_restart_marks_server_restarted(tmp_path):
         recovery = tmp_path / "resume.json"
         handle = await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
         job_id = handle.job_id
-        status = await get_file_job_http(harness.base_url, resume_path=recovery)
-        assert status.state == "QUEUED"
+        # 识别确实已经开始（RUNNING）才发信号：重启收敛要覆盖真实在跑的 Job
+        assert (await wait_state(harness, recovery, "RUNNING")).state == "RUNNING"
         await harness.terminate(signal.SIGTERM, timeout=20)
     finally:
         await harness.cleanup()
@@ -673,6 +700,7 @@ async def test_crash_window_restart_keeps_failed_server_restarted(tmp_path):
         source = make_container(tmp_path, "speech.mp3")
         recovery = tmp_path / "resume.json"
         handle = await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
+        assert (await wait_state(harness, recovery, "RUNNING")).state == "RUNNING"
         await harness.terminate(signal.SIGKILL, timeout=20)
     finally:
         await harness.cleanup()

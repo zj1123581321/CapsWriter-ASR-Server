@@ -381,6 +381,11 @@ class HttpFileRunner:
         nominal, overlap = self._validate_options(options)
         time_start = float(descriptor["time_submit"])
         key = make_task_key("http", job_id)
+        # 取得运行资格后先把 QUEUED 持久化成 RUNNING：识别期间从另一连接查到的
+        # 必须来自 SQLite，而不是内存态；已终态的 Job 不再解码。
+        if not await self.http.mark_running(job_id):
+            logger.info(f"HTTP 文件任务已终态，不再开始解码 job={job_id}")
+            return
         # 先可靠登记活跃 owner，再投第一段：worker 侧才不会把段当无主丢弃
         register_http_job(state, job_id)
         begin_task(state, key, Config.max_inflight_segments)

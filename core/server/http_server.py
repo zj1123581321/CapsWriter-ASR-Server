@@ -188,6 +188,10 @@ class HttpServer:
     async def record_result(self, job_id: str, payload: dict) -> None:
         await self._worker.run(self._store.record_result, job_id, payload)
 
+    async def mark_running(self, job_id: str) -> bool:
+        # 开始解码前的 QUEUED -> RUNNING 转移；已在运行或已终态返回 False
+        return await self._worker.run(self._store.mark_running, job_id)
+
     async def fail_job(self, job_id: str, error_code: str) -> bool:
         return await self._worker.run(self._store.fail_job, job_id, error_code)
 

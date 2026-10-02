@@ -629,6 +629,20 @@ class HttpStore:
             "time_submit": row["time_submit"],
         }
 
+    def mark_running(self, job_id: str) -> bool:
+        """QUEUED -> RUNNING 的条件更新（SQLite 是唯一真源）。
+
+        只在仍是 QUEUED 时转移，因此已 DONE/FAILED 不会被改回运行态；
+        已经在运行的 Job 返回 False，不会重置 started_at。
+        """
+        now = time.time()
+        cursor = self.conn.execute(
+            "UPDATE jobs SET state=?, started_at=COALESCE(started_at, ?)"
+            " WHERE job_id=? AND state=?",
+            (JOB_RUNNING, now, job_id, JOB_QUEUED),
+        )
+        return cursor.rowcount == 1
+
     def fail_job(self, job_id: str, error_code: str) -> bool:
         """可靠提交 FAILED；已是终态时不覆盖（迟到失败不推翻 DONE/FAILED）。"""
         if not isinstance(error_code, str) or not error_code:
