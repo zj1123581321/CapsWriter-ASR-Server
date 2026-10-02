@@ -514,6 +514,62 @@ async def test_result_over_limit_fails_job_while_normal_limit_succeeds(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_record_result_rejects_tokens_text_accu_mismatch(tmp_path):
+    """tokens 拼接与 text_accu 不一致必须被拒（invalid_result），且不留半成品。
+
+    正对照先证明同样形状的 payload 在一致时真的能被接受，避免这条断言因为别的
+    字段不合规而“顺带变红”。
+    """
+    from core.server.http_file_runner import http_result_payload
+    from core.server.http_store import HttpStoreError
+    from core.server.schema import Result
+
+    stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=3.0)
+    source = make_container(tmp_path, "speech.mp3")
+    async with running_runner_server(tmp_path, options=stalled) as harness:
+        ok_recovery = tmp_path / "resume_ok.json"
+        bad_recovery = tmp_path / "resume_bad.json"
+        ok_handle = await submit(
+            harness, source, ok_recovery, seg_duration=5.0, seg_overlap=1.0
+        )
+        bad_handle = await submit(
+            harness, source, bad_recovery, seg_duration=5.0, seg_overlap=1.0
+        )
+
+        def payload_for(job_id: str, text_accu: str) -> dict:
+            # 用真实 producer 函数构造 payload，只改 text_accu 这一个字段
+            return http_result_payload(Result(
+                task_id=job_id, socket_id="", type="file", owner_kind="http",
+                duration=20.0, time_start=1.0, time_submit=2.0, time_complete=3.0,
+                text="正文", text_accu=text_accu,
+                tokens=["正", "文"], timestamps=[0.1, 0.2], is_final=True,
+            ))
+
+        await harness.http_server.record_result(
+            ok_handle.job_id, payload_for(ok_handle.job_id, "正文")
+        )
+        accepted = harness.read_db(
+            "SELECT state FROM jobs WHERE job_id=?", (ok_handle.job_id,)
+        )[0]
+        assert accepted["state"] == "DONE", "拼接一致的 payload 必须能被接受，否则反例无效"
+
+        with pytest.raises(HttpStoreError) as info:
+            await harness.http_server.record_result(
+                bad_handle.job_id, payload_for(bad_handle.job_id, "正文不一致")
+            )
+        assert info.value.code == "invalid_result"
+        assert info.value.status == 422
+        rejected = harness.read_db(
+            "SELECT state, error_code FROM jobs WHERE job_id=?", (bad_handle.job_id,)
+        )[0]
+        assert rejected["state"] in {"QUEUED", "RUNNING"}
+        assert rejected["error_code"] is None
+        assert harness.read_db(
+            "SELECT COUNT(*) AS n FROM results WHERE job_id=?", (bad_handle.job_id,)
+        )[0]["n"] == 0
+
+
+@pytest.mark.asyncio
 async def test_repeated_commit_returns_same_job_without_resubmitting(tmp_path):
     """重复 commit 返回同一 Job 且不重投：段数不增加，也不新建 Job。"""
     source = make_container(tmp_path, "speech.mp3")

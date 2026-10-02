@@ -678,6 +678,9 @@ class HttpStore:
             or not all(isinstance(token, str) for token in tokens)
             or not valid_timestamps
             or len(tokens) != len(timestamps)
+            # tokens 拼接必须与 text_accu 完全一致：只比 text_accu，
+            # 不比语义独立的 text（pipeline 同样约定见 core/server/worker/pipeline.py）
+            or "".join(tokens) != result.get("text_accu")
             or not valid_numbers
         ):
             raise HttpStoreError("invalid_result", "识别结果字段与完整文件任务不匹配", status=422)
