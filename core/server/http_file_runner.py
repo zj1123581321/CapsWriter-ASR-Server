@@ -277,6 +277,9 @@ class HttpFileRunner:
         self.state = state
         self.http = http
         self._jobs: dict[str, asyncio.Task] = {}
+        # 单一全局运行闸门：HTTP 主动运行最多 1 个 Job，未拿到闸门的 Job 保持
+        # QUEUED，不解码、不占解码器与在途段；闸门在终态可靠落库之后才释放。
+        self._run_gate = asyncio.Semaphore(1)
         self._stopped = False
         if ffmpeg_path() is None:
             raise RunnerUnavailable(
@@ -375,6 +378,14 @@ class HttpFileRunner:
         return segmenter
 
     async def _execute(self, job_id: str) -> None:
+        # 先拿全局运行闸门：同一时刻只允许一个 HTTP Job 进入解码
+        await self._run_gate.acquire()
+        try:
+            await self._run_under_gate(job_id)
+        finally:
+            self._run_gate.release()
+
+    async def _run_under_gate(self, job_id: str) -> None:
         state = self.state
         descriptor = await self.http.job_source(job_id)
         options = descriptor["options"]

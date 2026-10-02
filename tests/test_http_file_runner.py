@@ -110,9 +110,10 @@ def decoded_sample_count(path: Path) -> int:
 
 
 def install_recording_ffmpeg(tmp_path: Path, monkeypatch) -> Path:
-    """把一个真 ffmpeg 包装脚本放到 PATH 首位，记录真实 argv/env 后 exec 真 ffmpeg。
+    """把一个真 ffmpeg 包装脚本放到 PATH 首位，记录真实 argv/env 后跑真 ffmpeg。
 
-    记录由真实子进程产生；包装脚本不在 PATH 首位时 runner 不会经过它，
+    记录由真实子进程产生：start 记 argv/env，end 记真实退出码，两者都是追加事件，
+    可用于算出真实并发解码数。包装脚本不在 PATH 首位时 runner 不会经过它，
     记录文件为空会让断言变红，因此该证据不会被绕过。
     """
     bindir = tmp_path / "ffmpeg-shim"
@@ -121,17 +122,21 @@ def install_recording_ffmpeg(tmp_path: Path, monkeypatch) -> Path:
     script = bindir / "ffmpeg"
     script.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, os, sys\n"
+        "import json, os, subprocess, sys\n"
         f"RECORD = {str(log)!r}\n"
         f"REAL = {FFMPEG!r}\n"
         "entry = {\n"
+        "    'event': 'start',\n"
         "    'argv': list(sys.argv),\n"
         "    'env_marker': os.environ.get('CW_TEST_ENV_MARKER'),\n"
         "    'path_head': (os.environ.get('PATH') or '').split(os.pathsep)[0],\n"
         "}\n"
         "with open(RECORD, 'a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps(entry, ensure_ascii=False) + '\\n')\n"
-        "os.execv(REAL, sys.argv)\n",
+        "proc = subprocess.run([REAL] + sys.argv[1:])\n"
+        "with open(RECORD, 'a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps({'event': 'end', 'rc': proc.returncode}) + '\\n')\n"
+        "raise SystemExit(proc.returncode)\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -144,6 +149,22 @@ def read_ffmpeg_invocations(log: Path) -> list[dict]:
     if not log.exists():
         return []
     return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
+
+
+def read_ffmpeg_starts(log: Path) -> list[dict]:
+    return [entry for entry in read_ffmpeg_invocations(log) if entry.get("event") == "start"]
+
+
+def ffmpeg_peak_concurrency(log: Path) -> int:
+    """从真实子进程追加的 start/end 事件算同时活跃的解码进程数。"""
+    current = peak = 0
+    for entry in read_ffmpeg_invocations(log):
+        if entry.get("event") == "start":
+            current += 1
+            peak = max(peak, current)
+        elif entry.get("event") == "end":
+            current -= 1
+    return peak
 
 
 # ---------------------------------------------------------------- 服务端骨架
@@ -395,7 +416,7 @@ async def test_real_container_upload_then_other_connection_takes_done_result(
         assert submitted[-1]["samples"] <= 16000 * 7
 
         # 4. 真实 ffmpeg argv：固定 exec、无 shell、只读服务端自己的源文件
-        invocations = read_ffmpeg_invocations(ffmpeg_log)
+        invocations = read_ffmpeg_starts(ffmpeg_log)
         assert invocations, "ffmpeg 包装脚本没有被执行，argv 证据缺失"
         entry = invocations[-1]
         assert entry["path_head"] == str(tmp_path / "ffmpeg-shim")
@@ -621,6 +642,74 @@ async def test_repeated_commit_returns_same_job_without_resubmitting(tmp_path):
         assert len(harness.tasks(handle.job_id)) == before
         assert harness.read_db("SELECT COUNT(*) AS n FROM jobs")[0]["n"] == 1
         assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_global_gate_runs_one_http_job_at_a_time(tmp_path, monkeypatch):
+    """任一时刻最多 1 个 HTTP Job 在解码，其余保持 QUEUED 直到前一个落终态。
+
+    闸门被持有的证据来自真实子进程：把第一个 Job 的终态写入（真实受监督 I/O 入口）
+    卡在闸门释放之前，此时其余 Job 必须是 QUEUED 且只有一个 ffmpeg 在跑。
+    """
+    ffmpeg_log = install_recording_ffmpeg(tmp_path, monkeypatch)
+    sources = [make_container(tmp_path, f"gate{index}.mp3") for index in range(3)]
+    async with running_runner_server(tmp_path) as harness:
+        entered = asyncio.Event()
+        release_terminal = asyncio.Event()
+        real_record_result = harness.http_server.record_result
+
+        async def blocked_record_result(job_id, payload):
+            # 真实终态写入之前卡住：此时 Job 未落库，闸门必须仍被持有
+            entered.set()
+            await release_terminal.wait()
+            return await real_record_result(job_id, payload)
+
+        monkeypatch.setattr(
+            harness.http_server, "record_result", blocked_record_result
+        )
+        recoveries = [tmp_path / f"gate_resume{index}.json" for index in range(3)]
+        handles = [
+            await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
+            for source, recovery in zip(sources, recoveries)
+        ]
+        assert await asyncio.wait_for(entered.wait(), 60), "没有任何 Job 走到终态写入"
+
+        states = {
+            handle.job_id: (await get_file_job_http(harness.base_url, resume_path=recovery)).state
+            for handle, recovery in zip(handles, recoveries)
+        }
+        running = [job_id for job_id, state in states.items() if state == "RUNNING"]
+        assert len(running) == 1, states
+        assert all(
+            state == "QUEUED" for job_id, state in states.items() if job_id != running[0]
+        ), states
+        # 真实解码进程数：闸门持有期间只应有 1 个 ffmpeg 在跑
+        assert ffmpeg_peak_concurrency(ffmpeg_log) == 1, read_ffmpeg_invocations(ffmpeg_log)
+        assert not harness.http_server.fatal
+
+        # 重复 commit 不会让同一 Job 多占一个闸门位（也不会多解码一次）
+        payload = json.loads(recoveries[0].read_text(encoding="utf-8"))
+        headers = {"Authorization": f"Bearer {payload['token']}", "Content-Length": "0"}
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            repeat = await client.post(
+                f"{harness.base_url}/v1/uploads/{payload['upload_id']}/commit", headers=headers
+            )
+        assert repeat.status_code == 200
+        assert repeat.json()["job_id"] == running[0]
+
+        release_terminal.set()
+        for handle, recovery in zip(handles, recoveries):
+            status = await wait_terminal(harness, recovery, timeout=120)
+            assert status.state == "DONE", (handle.job_id, status)
+
+        starts = read_ffmpeg_starts(ffmpeg_log)
+        assert len(starts) == 3, f"每个 Job 只应解码一次：{len(starts)}"
+        assert ffmpeg_peak_concurrency(ffmpeg_log) == 1, read_ffmpeg_invocations(ffmpeg_log)
+        # 闸门在终态可靠落库之后才释放：三个 Job 各自都留下完整结果
+        assert harness.read_db("SELECT COUNT(*) AS n FROM jobs WHERE state='DONE'")[0]["n"] == 3
+        assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 3
+        assert list(harness.state.active_http_jobs) == []
+        assert harness.state.tasks == {}
 
 
 @pytest.mark.asyncio
