@@ -336,7 +336,9 @@ class HttpServer:
         raw = await self._read_body(request, MAX_JSON_BYTES, length)
         try:
             payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (ValueError, RecursionError) as exc:
+            # 有界输入下 json.loads 表达式本身的已知输入错误（解码/语法/整数字面量位数/纯 Python
+            # 扫描器嵌套深度）；其余未知异常仍走 _wrap 的 fail-fast，不扩大捕获范围
             raise HttpStoreError("invalid_json", "请求体不是有效 JSON", status=400) from exc
         if not isinstance(payload, dict):
             raise HttpStoreError("invalid_json", "请求体必须是 JSON 对象", status=400)

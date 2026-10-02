@@ -690,9 +690,13 @@ def normalize_options(options: dict) -> dict:
             value = default
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise HttpStoreError("invalid_options", f"{field} 必须是有限数字")
-        if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        try:
+            value = float(value)
+        except OverflowError as exc:  # 不可信输入的可预期表示域错误：局部 400，不进 I/O 监督 fatal
+            raise HttpStoreError("invalid_options", f"{field} 必须是有限数字") from exc
+        if not math.isfinite(value) or value < 0:
             raise HttpStoreError("invalid_options", f"{field} 必须是非负有限数字")
-        normalized[field] = float(value)
+        normalized[field] = value
     # 受理前接入与 WS 共用的唯一无状态规则（时长下限/重叠半开/引擎与 snap 预算）；
     # 只翻译该规则的 ValueError，其他异常原样上抛
     try:

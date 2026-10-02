@@ -697,7 +697,9 @@ async def test_options_missing_and_none_default_but_falsy_wrong_types_are_reject
                 {"seg_duration": 100},
                 {"seg_duration": 74, "seg_overlap": 1.5},
             )
-            for index, wrong_type in enumerate(([], "", 0) + range_bad):
+            # 不可信输入的可预期表示域错误：正巨大整数转 float 抛 OverflowError，同样局部 400
+            overflow_bad = ({"seg_duration": 10 ** 400}, {"seg_overlap": 10 ** 400})
+            for index, wrong_type in enumerate(([], "", 0) + range_bad + overflow_bad):
                 rejected_existing = await client.post(
                     base_url + "/v1/uploads", headers={**auth, "Idempotency-Key": "missing"},
                     json={"size_bytes": len(source), "sha256": digest, "options": wrong_type},
@@ -737,6 +739,39 @@ async def test_options_missing_and_none_default_but_falsy_wrong_types_are_reject
                 "model": None, "language": None, "context": None,
                 "seg_duration": 15.0, "seg_overlap": 2.0,
             }
+        assert server.fatal is None
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_int_literal_over_digit_limit_as_invalid_json(tmp_path):
+    """16 KiB 内有界 raw JSON：整数字面量超解释器位数上限是预期 ValueError，局部 400 不 fatal。
+
+    与坏语法/坏 UTF-8 同属 json.loads 表达式已知输入错误（ValueError 家族）；
+    不触发任何文件/SQL 写入，后续合法请求仍受理，listener 无 fatal。
+    """
+    async with running_server(tmp_path) as (server, base_url):
+        auth = {"Authorization": "Bearer json-token"}
+        oversized_int = b'{"size_bytes":' + b"1" * 4301 + b"}"
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            rejected = await client.post(
+                base_url + "/v1/uploads",
+                headers={**auth, "Idempotency-Key": "json-digits"},
+                content=oversized_int,
+            )
+            assert rejected.status_code == 400, rejected.text
+            body = rejected.json()
+            assert body["code"] == "invalid_json"
+            assert body["request_id"]
+            assert _read_db(server.data_dir, "SELECT COUNT(*) AS n FROM uploads")[0]["n"] == 0
+            assert _read_db(server.data_dir, "SELECT COUNT(*) AS n FROM jobs")[0]["n"] == 0
+            assert list((server.data_dir / "sources").iterdir()) == []
+            good = await client.post(
+                base_url + "/v1/uploads",
+                headers={**auth, "Idempotency-Key": "json-good"},
+                json={"size_bytes": 4, "sha256": sha256(b"keep").hexdigest()},
+            )
+            assert good.status_code == 201, good.text
+        assert server.fatal is None
 
 
 def _short_idle(monkeypatch, seconds: float = 0.4) -> float:
