@@ -1,0 +1,38 @@
+# 门禁误报/延期处置的官方签发入口（Required Gate v2）。可复用工作流本体在 zlxlabs/gate，
+# 这里只做最小调用声明；处置判定、回执写入、证据校验全部由 callee 决定，本文件不复制。
+#
+# 与 gate.yml 的分工：gate.yml 负责对 PR 跑门禁并产出客观回执；本文件负责把
+# 「某条 finding 是误报或已延期」通过正式 workflow 签发，不允许直接改评论走旁路。
+#
+# 前提（未满足时 callee fail-loud，不静默降级）：本仓需自行配置 repository secrets
+# SILO_ACCESS_KEY / SILO_SECRET_KEY（gate-v2 的 S3 产物读写凭据），与 gate.yml 同一对。
+name: gate-disposition
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number: { description: "pull request number", required: true, type: string }
+      primary_run_id: { description: "canonical primary run id", required: true, type: string }
+      primary_run_attempt: { description: "canonical primary run attempt", required: true, type: string }
+      finding_id: { description: "exact current-audit finding id", required: true, type: string }
+      reason: { description: "reason for the false-positive disposition", required: true, type: string }
+      disposition: { description: "false-positive or deferred", required: false, type: string }
+      counterevidence_json: { description: "JSON with command/output/result=refuted/pointer", required: false, type: string }
+      tracking_issue: { description: "same-repository issue number (#N) or issues URL", required: false, type: string }
+
+# 写处置回执需要 actions: write；读本仓内容与 PR 元信息只需 read。
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  disposition:
+    uses: zlxlabs/gate/.github/workflows/gate-v2-disposition.yml@v2
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    secrets:
+      # 公开仓 fork PR 读不到 secrets，故走 repo secret（不写 secrets: inherit）。
+      SILO_ACCESS_KEY: ${{ secrets.SILO_ACCESS_KEY }}
+      SILO_SECRET_KEY: ${{ secrets.SILO_SECRET_KEY }}
