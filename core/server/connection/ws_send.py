@@ -134,13 +134,11 @@ async def ws_send(app):
         key = task_key_from_result(result)
         record = state.tasks.get(key)
         if record is None:
-            if result.owner_kind == 'http':
-                raise RuntimeError(
-                    f"HTTP 结果没有对应活动任务: task={result.task_id}"
-                )
+            # HTTP 任务在结果持久化（或可靠 FAILED）之后就会释放运行态记录，
+            # 因此无记录的 HTTP 结果按契约属于迟到结果：记账丢弃，不覆盖终态。
             logger.debug(
                 f"丢弃终态或无主迟到结果 task={result.task_id} "
-                f"socket={result.socket_id}"
+                f"socket={result.socket_id} owner_kind={result.owner_kind}"
             )
             continue
         if record.status in {'DONE', 'FAILED'}:

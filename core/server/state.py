@@ -299,3 +299,17 @@ def acknowledge_segment_result(state, key: TaskKey) -> None:
             record.segment_slots.release()
         if not pending:
             state.pending_segments.pop(key, None)
+
+
+def release_terminal_task(state, key: TaskKey) -> None:
+    """终态后释放 HTTP 任务的运行态记录。
+
+    只有已终态的任务可以释放：非终态记录一旦被清掉，runner 就会误以为该任务
+    已结束并停止提交后续段。结果 sink 与 runner 共用这一个出口，保证
+    「持久化或可靠 FAILED 之后才释放」这条不变式只有一处实现。
+    """
+    record = state.tasks.get(key)
+    if record is not None and record.status in {'DONE', 'FAILED'}:
+        state.tasks.pop(key, None)
+        from . import logger
+        logger.debug(f"已释放终态 HTTP 任务运行态记录 task={key[2]}")

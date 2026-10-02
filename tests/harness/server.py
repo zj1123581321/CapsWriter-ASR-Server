@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import multiprocessing
+import os
 import queue
 from pathlib import Path
 from types import SimpleNamespace
@@ -352,6 +353,19 @@ def run_managed_http_server(
     asyncio.run(serve())
 
 
+def _child_with_stderr(args, stderr_fd):
+    """子进程先把 fd 2 与 sys.stderr 指到测试提供的日志文件，再进入真实服务主体。
+
+    两处都要改：pytest 之类的捕获器可能已经把 sys.stderr 换成指向临时文件的对象，
+    只 dup2 不足以让 rich/print/traceback 落到本文件。
+    """
+    import sys as _sys
+
+    os.dup2(stderr_fd, 2)
+    _sys.stderr = open(2, "w", buffering=1, errors="replace", closefd=False)
+    run_managed_http_server(*args)
+
+
 class ManagedHttpServerHarness:
     """跨进程 HTTP 文件任务服务端句柄（信号、崩溃与非零退出验收用）。"""
 
@@ -375,10 +389,13 @@ class ManagedHttpServerHarness:
         self.stderr_path.parent.mkdir(parents=True, exist_ok=True)
         self._stderr_handle = open(self.stderr_path, "wb")
         self.process = multiprocessing.Process(
-            target=run_managed_http_server,
+            target=_child_with_stderr,
             args=(
-                self.info_queue, options or {}, self.calls, self.received,
-                self.queue_in, self.queue_out, Path(data_dir), fault, ffmpeg_shim,
+                (
+                    self.info_queue, options or {}, self.calls, self.received,
+                    self.queue_in, self.queue_out, Path(data_dir), fault, ffmpeg_shim,
+                ),
+                self._stderr_handle.fileno(),
             ),
         )
         self.process.start()
@@ -413,7 +430,7 @@ class ManagedHttpServerHarness:
         return self.exitcode
 
     async def terminate(self, signum, timeout: float = 20) -> int:
-        self.process.send_signal(signum)
+        os.kill(self.process.pid, signum)
         return await self.wait_for_exit(timeout)
 
     async def stop(self, timeout: float = 20) -> int:

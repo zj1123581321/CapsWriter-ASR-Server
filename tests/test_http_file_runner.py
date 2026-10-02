@@ -351,12 +351,19 @@ async def test_real_container_upload_then_other_connection_takes_done_result(
         assert submitted[-1]["is_final"] is True
         assert sum(1 for item in submitted if item["is_final"]) == 1
         assert all(item["samplerate"] == 16000 for item in submitted)
-        # 末段样本数 + 各段（去掉重叠）必须正好覆盖解码出的真实样本数
-        covered = 0
-        for index, item in enumerate(submitted):
-            if index:
-                covered += round(submitted[index - 1]["overlap"] * 16000)
-            covered += item["samples"]
+        # 末段样本数 + 各段（去掉重叠）必须正好覆盖解码出的真实样本数；
+        # 后一段的 offset 已含上一段重叠，因此不再重复加重叠
+        covered = submitted[-1]["samples"]
+        for index in range(1, len(submitted)):
+            previous = submitted[index - 1]
+            item = submitted[index]
+            # 段尾带 overlap，所以后一段的 offset = 前段 offset + (前段样本 - 前段重叠)
+            expected_offset = (
+                previous["offset"]
+                + (previous["samples"] - round(previous["overlap"] * 16000)) / 16000
+            )
+            assert item["offset"] == pytest.approx(expected_offset, abs=1e-6)
+            covered += previous["samples"] - round(previous["overlap"] * 16000)
         assert covered == expected_samples, (covered, expected_samples)
         assert submitted[-1]["samples"] <= 16000 * 7
 
@@ -557,7 +564,7 @@ async def test_sigterm_exits_zero_and_restart_marks_server_restarted(tmp_path):
     data_dir = tmp_path / "httpdata"
     stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=60.0)
     harness = await ManagedHttpServerHarness.start(
-        data_dir=data_dir, options=stalled, ffmpeg_shim=tmp_path / "shim"
+        data_dir=data_dir, options=stalled
     )
     try:
         source = make_container(tmp_path, "speech.mp3")
@@ -659,6 +666,7 @@ async def test_http_data_dir_has_no_temporary_pcm_after_completion(tmp_path):
     async with running_runner_server(tmp_path) as harness:
         await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
         assert (await wait_terminal(harness, recovery)).state == "DONE"
+        payload = json.loads(recovery.read_text(encoding="utf-8"))
         files = sorted(str(path.relative_to(harness.data_dir)) for path in
                         harness.data_dir.rglob("*") if path.is_file())
         assert all(
