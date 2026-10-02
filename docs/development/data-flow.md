@@ -59,6 +59,11 @@ HTTP 客户端 -> 受限落盘/续传确认 -> commit 受理出唯一 Job
 HTTP 同时只运行 1 个 Job，未拿到闸门的保持 QUEUED，不解码也不占在途段。
 推理段超时发生在父进程监控协程时，会先可靠写入 `FAILED[inference_timeout]` 再让进程非零退出；
 落库本身失败时仍然非零退出，但会显式记录“持久失败事实未落库”。
+worker 崩溃、收尾排错等 runner 之外的 HTTP 终态一律经 `finalize_http_job`
+唯一入口：先以条件更新（不覆盖已有终态）持久化 FAILED，成功之后才
+`transition_terminal` 释放 owner/唤醒等待者；持久写有 `wait_for` 超时上限，
+超时或失败时不释放 owner。释放路径的位置表与顺序由
+`tests/test_http_release_invariant.py` 的 AST 机械检查钉住。
 服务重启后 QUEUED/RUNNING 收敛为 FAILED[server_restarted]，不做自动重跑。
 
 WS 仍沿用连接生命周期；它与 HTTP 只共享 PCM 段、offset、overlap、段长上限和有限提交，不共享连接取消或持久确认。两条路径通过 `(owner_kind, derived_owner_id, task_id)` 隔离：WS owner 从 `socket_id` 派生，HTTP owner 从稳定 `task_id` 派生。HTTP 任务必须存在于跨进程 `active_http_jobs` 集合，否则 worker 不继续推理；该登记发生在首段入队之前，释放发生在结果持久化或 FAILED 可靠提交之后。
