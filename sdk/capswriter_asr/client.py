@@ -146,11 +146,16 @@ async def _count_decoded_samples(audio: bytes, encoding: str) -> int:
         raise AsrError("decode_failed", f"无法启动 ffmpeg: {exc}") from exc
 
     async def feed_input() -> None:
-        for offset in range(0, len(audio), _CHUNK_BYTES):
-            process.stdin.write(audio[offset:offset + _CHUNK_BYTES])
-            await process.stdin.drain()
-        process.stdin.close()
-        await process.stdin.wait_closed()
+        try:
+            for offset in range(0, len(audio), _CHUNK_BYTES):
+                process.stdin.write(audio[offset:offset + _CHUNK_BYTES])
+                await process.stdin.drain()
+            process.stdin.close()
+            await process.stdin.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            # 解码进程已退出并关闭管道（flac/ogg 流长度已知时 ffmpeg 不必读到 EOF），
+            # 属正常管道生命周期；成败由下方退出码与输出字节数裁决。
+            pass
 
     async def count_output() -> int:
         byte_count = 0

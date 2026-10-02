@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "sdk"))
 
 import capswriter_asr.client as sdk_client
 from capswriter_asr import AsrError, Transcript, transcribe_file
+from capswriter_asr.client import _count_decoded_samples as _real_count_decoded_samples
 from capswriter_asr.client import _transcode
 from capswriter_asr.outputs import _fmt_timestamp, write_srt
 
@@ -435,6 +436,27 @@ def test_legacy_srt_segmentation_and_timestamp_rounding(tmp_path):
         "00:01:00,000",
         "00:00:00,123",
     ]
+
+
+@pytest.mark.asyncio
+async def test_count_decoded_samples_allows_decoder_exit_before_stdin_close(
+    tmp_path, monkeypatch
+):
+    """回归锁死：解码子进程不读 stdin 即退出 0 时，样本计数不得误报 decode_failed。
+
+    经真实 asyncio 子进程路径复现 CI 偶发「无法读取 ffmpeg 解码输出:
+    Connection lost」：输入大于管道缓冲，feed 的 drain 必然在子进程退出后返回，
+    修复前稳定红。
+    """
+    tool_dir = tmp_path / "decoder-exit-tools"
+    tool_dir.mkdir()
+    ffmpeg = tool_dir / "ffmpeg"
+    ffmpeg.write_text("#!/bin/sh\nprintf 'synthetic-flac-stream0'\n", encoding="utf-8")
+    ffmpeg.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tool_dir}{os.pathsep}{os.environ['PATH']}")
+    large_audio = b"synthetic-flac-stream0" * (1024 * 1024 // 22 + 1)
+    samples = await _real_count_decoded_samples(large_audio, "flac")
+    assert samples == 11
 
 
 @pytest.mark.asyncio
