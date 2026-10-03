@@ -26,12 +26,15 @@
 from __future__ import annotations
 
 import ast
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 
-SERVER_DIR = Path(__file__).resolve().parents[1] / "core" / "server"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SERVER_DIR = REPO_ROOT / "core" / "server"
+SESSION_DIR = REPO_ROOT / "docs" / "sessions" / "261001-http-files"
 
 # 位置表：每个文件里各函数允许出现的 transition_terminal 调用数（修复后基线）。
 # 新增释放路径 = 清单失配 = CI 红；改之前必须先把该行写进主脑位置表并补对应
@@ -172,8 +175,8 @@ def _is_owner_kind_check(test: ast.expr, kind: str) -> bool:
 def test_admission_callers_share_one_primitive():
     """两个准入判定必须经过 count_active_tasks，禁止就地内联求和。
 
-    同一形态已第三次出现：HTTP 先只数自己的表、上一卡只数 WS。根因是
-    「活动任务总量」在 ws_recv 与 _commit_upload 各写一遍。本约束让下次
+    同一形态已第四次出现：HTTP 先只数自己的表、再只数内存、上一卡只数 WS。
+    根因是「活动任务总量」在 ws_recv 与 _commit_upload 各写一遍。本约束让下次
     有人想在调用方改算式时，CI 在行为测试变红之前就先红。
     """
     state_funcs = _functions(_load("state.py"))
@@ -181,6 +184,9 @@ def test_admission_callers_share_one_primitive():
         "活动任务总量必须在 core/server/state.py 提供唯一原语 count_active_tasks"
     )
     primitive = state_funcs["count_active_tasks"]
+    assert isinstance(primitive, ast.AsyncFunctionDef), (
+        "count_active_tasks 必须能 await DB 侧计数来源（SQLite 连接绑定 I/O 线程）"
+    )
     ws_filters = [
         node
         for node in ast.walk(primitive)
@@ -188,6 +194,13 @@ def test_admission_callers_share_one_primitive():
     ]
     assert not ws_filters, (
         "count_active_tasks 不得只数 WS；HTTP 与 WS 必须一并计入"
+    )
+    # 跨存储去重：必须显式从 DB 集合里扣除已在内存登记的 HTTP job_id
+    assert "http_active_job_counter" in ast.unparse(primitive), (
+        "count_active_tasks 必须读 state.http_active_job_counter（DB 侧 QUEUED+RUNNING）"
+    )
+    assert "registered_http" in ast.unparse(primitive), (
+        "count_active_tasks 必须按 job_id 去重：已在内存登记的 HTTP 不得在 DB 侧重复计数"
     )
 
     ws_recv = _functions(_load("connection/ws_recv.py"))["ws_recv"]
@@ -207,6 +220,47 @@ def test_admission_callers_share_one_primitive():
         assert not inline_sums, (
             f"{label} 不得就地内联求和；活动任务总量必须走 count_active_tasks"
         )
+
+
+def test_r7_spec_single_reading():
+    """R7 规格必须只有一种读法：跨两个存储的总量 + WS 预留名额 + 错误码口径。
+
+    历史根因：design 的前半句「最多 8 个 QUEUED+RUNNING」可读成「HTTP 自己 8 个」，
+    后半句「与 WS 共用 max_tasks=8」可读成「与 WS 共用 8 个」，两次历史修复各对上
+    其中一句。本测试把逐句要素钉在文档里，规格退回到歧义写法时直接变红。
+    """
+    design = (
+        SESSION_DIR / "design.md"
+    ).read_text(encoding="utf-8")
+    row = next(
+        line for line in design.splitlines() if line.startswith("| HTTP Job 准入 / 运行 |")
+    )
+    for required in ("state.tasks", "jobs", "QUEUED", "RUNNING", "max_tasks", "too_many_jobs",
+                     "overloaded"):
+        assert required in row, f"R7 design 行缺少要素 {required!r}：{row}"
+    assert "只数一次" in row, f"R7 design 行必须写明同一 Job 的去重口径：{row}"
+    # 预留名额必须是可核对的数字，而不是「预留几个」这种无约束措辞
+    assert "预留 2 个名额" in row, f"R7 design 行必须写明 WS 预留名额数：{row}"
+    assert "共享准入锁" in row and "登记动作不得在锁外" in row, (
+        f"R7 design 行必须写明两条准入路径共用准入锁且登记在锁内：{row}"
+    )
+    assert "CounterUnavailable" not in row, (
+        "design 行只写语义（显式失败、不退化），实现细节留代码注释"
+    )
+    for required in ("停机时先在锁内", "退化为只数内存", "幂等重放先于预算判定"):
+        assert required in row, f"R7 design 行缺少要素 {required!r}：{row}"
+    # 旧的歧义写法不得复活
+    assert "最多 8 个 QUEUED+RUNNING" not in row, f"R7 design 行退回歧义写法：{row}"
+
+    qa = (SESSION_DIR / "qa.md").read_text(encoding="utf-8")
+    assert "共享活动总量 8" in qa, "qa.md 必须与 design 同源：共享活动总量 8"
+    assert "全局活动 8" not in qa, "qa.md 退回与 design 不同源的「全局活动 8」"
+    assert "登记不得在锁外" in qa, "qa.md 必须与 design 同源写明登记在准入锁内"
+    for required in ("退化为只数内存", "幂等重放不受预算误拒"):
+        assert required in qa, f"qa.md 必须与 design 同源写明 {required!r}"
+    assert "too_many_jobs" in qa and "overloaded" in qa, (
+        "qa.md 必须写明两侧超限时的错误码口径"
+    )
 
 
 def test_release_position_table_is_exact():
@@ -579,3 +633,197 @@ async def test_http_double_terminal_eliminated(tmp_path, monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover - 手动调试入口
     pytest.main([__file__, "-q"])
+
+
+def _admission_lock_blocks(node: ast.AST) -> list:
+    """函数体内 ``async with <...>.admission_lock:`` 的 AsyncWith 节点。"""
+    return [
+        item
+        for item in ast.walk(node)
+        if isinstance(item, ast.AsyncWith)
+        and any(
+            ast.unparse(entry.context_expr).endswith("admission_lock")
+            for entry in item.items
+        )
+    ]
+
+
+def _calls_in(block: ast.AST, name: str) -> list:
+    """块内名字为 name 的登记点：Call（ws 的 begin_task(...)) 或 Attribute
+    （http 传进 worker 线程的 self._store.commit_upload，它是方法引用不是调用）。"""
+    found = [
+        item
+        for item in ast.walk(block)
+        if (isinstance(item, ast.Call) and _call_name(item.func) == name)
+        or (isinstance(item, ast.Attribute) and item.attr == name)
+    ]
+    return sorted(found, key=lambda item: item.lineno)
+
+
+def test_admission_registration_inside_lock():
+    """登记（WS begin_task / HTTP Job 落库）必须与计数同在共享准入锁的临界区内。
+
+    只锁计数不锁登记等于没锁：两个协程可以都读到未达上限的计数、各自通过判定，
+    再先后登记，静默越过 max_tasks。本轮门禁 finding
+    ``correctness-nonatomic-shared-admission`` 就是这个形状。
+
+    判据只钉**准入那一次**登记：ws_recv 里另有 2 处 begin_task（坏请求、任务冲突）
+    是终态失败记账，本来就不占名额，不该被算进准入临界区。
+    """
+    cases = [
+        ("connection/ws_recv.py", "ws_recv", "begin_task"),
+        ("http_server.py", "_commit_upload", "commit_upload"),
+    ]
+    for relpath, func_name, registration in cases:
+        node = _functions(_load(relpath))[func_name]
+        blocks = _admission_lock_blocks(node)
+        assert len(blocks) == 1, (
+            f"{func_name} 必须恰好有一处 async with state.admission_lock，实际 {len(blocks)}"
+        )
+        block = blocks[0]
+        counts = _calls_in(block, "count_active_tasks")
+        registrations = _calls_in(block, registration)
+        assert len(counts) == 1, (
+            f"{func_name} 的临界区内应有且仅有一处 count_active_tasks，实际 {len(counts)}"
+        )
+        assert len(registrations) == 1, (
+            f"{func_name} 的临界区内应有且仅有一处 {registration}（登记动作），"
+            f"实际 {len(registrations)}——登记必须在锁内，锁外那次等于没锁"
+        )
+        assert registrations[0].lineno > counts[0].lineno, (
+            f"{func_name} 临界区内必须先计数后登记"
+        )
+
+
+def test_all_callers_awaited_repo_wide():
+    """全仓扫描：对 ``count_active_tasks`` 的每一个调用都必须被 ``Await`` 包裹。
+
+    背景：门禁两次报了 ``compatibility-async-counter-callers``（崩溃），主脑两次核实
+    为**不成立**（无未迁移的同步调用方）。但主审两次都合理地指出：新 AST 测试只检查
+    ws_recv.py 与 http_server.py 两个文件，不能证明「全仓没有别的调用方」。
+
+    这条把「不存在未迁移调用方」从一次性 grep 变成 CI 常驻断言：扫描仓库内**全部**
+    ``.py`` 文件，任何一处未 await 的调用即失败。
+
+    两个下界断言是判据自检：若 rglob/os.walk 的范围写坏导致扫不到文件，测试会空转
+    通过，因此必须证明「确实扫到了足够多的文件与调用点」。
+    """
+    skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache",
+                 ".mypy_cache", "site-packages", ".ruff_cache"}
+    scanned_files = 0
+    scanned_calls = 0
+    offenders = []
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            path = Path(dirpath) / filename
+            rel = path.relative_to(REPO_ROOT)
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            except SyntaxError as exc:
+                offenders.append(f"{rel}: 无法解析（{exc}）")
+                continue
+            scanned_files += 1
+            awaited = {
+                id(item.value)
+                for item in ast.walk(tree)
+                if isinstance(item, ast.Await) and isinstance(item.value, ast.Call)
+            }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and _call_name(node.func) == "count_active_tasks":
+                    scanned_calls += 1
+                    if id(node) not in awaited:
+                        offenders.append(f"{rel}:{node.lineno} 调用未被 await 包裹")
+
+    # 判据自检：先证明扫描范围本身有效，再谈「没有违规」
+    assert scanned_files >= 60, f"只扫到 {scanned_files} 个 .py 文件，扫描范围写坏了"
+    assert scanned_calls >= 8, f"只找到 {scanned_calls} 个 count_active_tasks 调用点，扫描范围写坏了"
+    assert not offenders, "存在未 await 的 count_active_tasks 调用：\n" + "\n".join(offenders)
+
+
+def test_counter_calls_are_awaited():
+    """两个准入点对 count_active_tasks 的调用必须被 Await 包裹。
+
+    背景：门禁曾报 ``compatibility-async-counter-callers``（崩溃），主脑核实为
+    **不成立**——全仓只有 2 个生产调用方（ws_recv.py、http_server.py），均已 await。
+    但原结构测试只断言「调用恰好一次」，没有断言「被 await」，也就是没有对住主审
+    担心的那个机制。本测试把证据固化进 CI：将来有人把调用改成同步（例如把原语退回
+    纯内存口径、不再 await DB 计数）时，这里直接失败，而不是等一个缺 REPO FACTS
+    的评审来猜。
+    """
+    for relpath, func_name in (
+        ("connection/ws_recv.py", "ws_recv"),
+        ("http_server.py", "_commit_upload"),
+    ):
+        node = _functions(_load(relpath))[func_name]
+        calls = [
+            item
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call) and _call_name(item.func) == "count_active_tasks"
+        ]
+        assert len(calls) == 1, f"{func_name} 应恰好调用 count_active_tasks 一次，实际 {len(calls)}"
+        awaited = {
+            id(item.value)
+            for item in ast.walk(node)
+            if isinstance(item, ast.Await) and isinstance(item.value, ast.Call)
+        }
+        assert id(calls[0]) in awaited, (
+            f"{func_name} 的 count_active_tasks 调用没有被 await 包裹——"
+            f"原语是 async 的，同步调用会拿到协程对象而非计数"
+        )
+
+    # 原语自身必须是 async（同步定义会让上面的 await 直接类型错误）
+    primitive = _functions(_load("state.py"))["count_active_tasks"]
+    assert isinstance(primitive, ast.AsyncFunctionDef), "count_active_tasks 必须是 async def"
+
+
+def test_exclude_key_removed():
+    """count_active_tasks 不得再带 exclude_key 参数。
+
+    该参数全仓零调用方（主脑实测），按本仓「不新增没有第二消费者的抽象」的约定，
+    正确处置是删掉而不是为它补去重逻辑。留着它等于留一条没人走、也没人验证的路。
+    """
+    primitive = _functions(_load("state.py"))["count_active_tasks"]
+    names = [arg.arg for arg in primitive.args.args]
+    assert names == ["state"], f"count_active_tasks 的参数应只剩 state，实际 {names}"
+    assert primitive.args.kwonlyargs == [] and primitive.args.vararg is None, (
+        "count_active_tasks 不得带额外参数"
+    )
+    # 只看函数体代码（docstring 是说明文字，允许提及这个名字）
+    body = primitive.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    code = "\n".join(ast.unparse(statement) for statement in body)
+    assert "exclude_key" not in code, f"count_active_tasks 函数体里残留 exclude_key：{code}"
+
+
+def test_store_idempotency_before_budget_backstop():
+    """commit_upload 里幂等重放识别必须排在事务内预算兜底之前。
+
+    门禁 #3 要求「store 事务内兜底同理」。核实结论是 store 侧原本就是对的：
+    ``_check_job_admission`` 在 ``commit_upload`` 里位于幂等分支之后，只对
+    「要新建 Job」的提交生效。本测试把这个顺序钉住，免得后人把两段挪反——挪反之后，
+    预算满时重试一个已受理的 upload 就会在事务内被误拒成 too_many_jobs。
+    """
+    store = _functions(_load("http_store.py"))["commit_upload"]
+    backstop = [
+        item for item in ast.walk(store)
+        if isinstance(item, ast.Call) and _call_name(item.func) == "_check_job_admission"
+    ]
+    replay = sorted(
+        (
+            item for item in ast.walk(store)
+            if isinstance(item, ast.Call) and _call_name(item.func) == "job_record"
+        ),
+        key=lambda item: item.lineno,
+    )
+    assert len(backstop) == 1, f"commit_upload 应恰好有一处 _check_job_admission，实际 {len(backstop)}"
+    # commit_upload 里 job_record 出现两次：幂等分支那次与建完事务后返回那次；
+    # 要比顺序的是**幂等分支**那次（最早的一处）。
+    assert len(replay) >= 1, "commit_upload 里找不到幂等分支的 job_record 调用"
+    assert replay[0].lineno < backstop[0].lineno, (
+        f"幂等重放识别（行 {replay[0].lineno}）必须排在预算兜底（行 {backstop[0].lineno}）"
+        f"之前——重放不消耗新名额，不能被「名额已满」误拒"
+    )

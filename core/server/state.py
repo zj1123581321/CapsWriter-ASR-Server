@@ -23,6 +23,32 @@ from core.tools.build_info import get_git_sha
 
 OWNER_KINDS = frozenset({'ws', 'http'})
 TaskKey = tuple[str, str, str]
+TERMINAL_STATUSES = frozenset({'DONE', 'FAILED'})
+
+# R7：共享上限里固定留给 WS 的名额。HTTP 文件任务是可选功能，不得挤掉既有默认的
+# 实时语音入口（design.md 保留清单含「mic 优先不变」），因此 max_tasks 中恒定
+# 预留 WS_RESERVED_SLOTS 个名额只给 WS；HTTP 准入最多把共享总量用到
+# max_tasks - WS_RESERVED_SLOTS。默认 max_tasks=8 → HTTP 最多同时占 6 个名额。
+WS_RESERVED_SLOTS = 2
+
+
+class CounterUnavailable(RuntimeError):
+    """共享预算的 DB 侧计数来源已失效（HTTP listener 正在停机）。
+
+    与「HTTP 从未启用」（``state.http_active_job_counter is None``，压根没有 SQLite
+    可数）是两回事。那种情况下退化为纯内存口径是正确的；本异常表示**曾经有** SQLite
+    存储、此刻正在拆，因此绝不能按内存口径放行——那会漏掉仍在 ``jobs`` 表里排队的
+    Job，把共享上限静默突破。停机窗口内的准入必须显式失败。
+    """
+
+
+def http_job_budget(max_tasks: int) -> int:
+    """共享上限里 HTTP 可占的名额：max_tasks - WS_RESERVED_SLOTS。
+
+    单一来源：HttpServer 的准入判定与 HttpStore 事务内的 DB 兜底都调它，
+    两处因此不会各自漂移出两个不同的数字（历史上正是 8 与 6 两个数并存）。
+    """
+    return max_tasks - WS_RESERVED_SLOTS
 
 
 def derive_owner_id(owner_kind: str, task_id: str, socket_id: str = '') -> str:
@@ -57,17 +83,52 @@ def task_key_from_result(result: Result) -> TaskKey:
     return make_task_key(result.owner_kind, result.task_id, result.socket_id)
 
 
-def count_active_tasks(state, exclude_key: TaskKey | None = None) -> int:
-    """活动任务总量：state.tasks 中非终态记录，HTTP 与 WS 一并计入。
+async def count_active_tasks(state) -> int:
+    """共享活动任务总量：WS 与 HTTP 准入判定的唯一原语。
 
-    准入判定的唯一原语。exclude_key 供调用方排除自身已占位的 key。
+    总量 = 内存 ``state.tasks`` 中的非终态记录（WS 与已登记的运行中 HTTP）
+    **加上** SQLite ``jobs`` 表中 QUEUED+RUNNING 的 HTTP Job。这两处的并集才是
+    「服务端此刻真正在忙的任务数」：排队中的 HTTP Job 只存在于 SQLite（运行闸门
+    未放行，``begin_task`` 尚未执行），已放行的运行中 HTTP Job 两处都有。
+
+    去重规则（必须显式，不可省）：一个 HTTP Job 在其被 ``mark_running`` 置为
+    RUNNING 之后、转入终态之前，**同时**存在于内存 ``state.tasks`` 与 DB 的
+    QUEUED+RUNNING 集合中——这不是瞬态，而是整个识别期间的常态。因此以内存记录
+    为准，从 DB 集合里扣除已在内存登记的 job_id，只数一次。反向的窗口不存在：
+    ``begin_task`` 在 ``mark_running`` 之后同步执行（其间无 await），DB 转 RUNNING
+    到内存登记之间不可能被别的协程观测到。
+
+    DB 计数来源是 ``state.http_active_job_counter``（零参协程），由 HttpServer 注入
+    并强制走受监督的单 I/O worker 线程——SQLite 连接绑定该线程，跨线程直接用会抛
+    ``sqlite3.ProgrammingError``。
+
+    两种「拿不到 DB 计数」必须区分开，不得混为一谈：
+
+    * ``http_active_job_counter is None`` —— **HTTP 从未启用**，根本没有 SQLite 存储，
+      此时总量退化为纯内存口径是正确的。
+    * 计数来源在停机期间被换成会抛 ``CounterUnavailable`` 的桩 —— **正在停机**，
+      此时必须 fail-loud 上抛，绝不退化为内存口径（否则漏数排队 Job、静默放行）。
+
+    exclude_key 已删除：全仓零调用方，按「不新增没有第二消费者的抽象」直接删掉，
+    而不是为它补一套排除逻辑。
+
+    调用方必须在 ``state.admission_lock`` 内调用，并把「登记」（WS 的 ``begin_task``、
+    HTTP 的 Job 落库）放进**同一个**临界区。只锁计数不锁登记等于没锁：两个协程可以
+    都读到未达上限的计数、各自通过判定，再先后登记，静默越过 max_tasks。
     """
     ensure_server_runtime(state)
-    return sum(
-        1
+    memory_keys = [
+        key
         for key, record in state.tasks.items()
-        if key != exclude_key and record.status not in {"DONE", "FAILED"}
-    )
+        if record.status not in TERMINAL_STATUSES
+    ]
+    counter = state.http_active_job_counter
+    # None 只表示「HTTP 从未启用」；停机中的失效会由桩协程抛 CounterUnavailable 上抛，
+    # 不在这里捕获——静默退化成内存口径就是漏数排队 Job、静默放行。
+    db_job_ids = set(await counter()) if counter is not None else set()
+    # 已登记的运行中 HTTP 由内存侧计入，DB 侧不再重复计数
+    registered_http = {key[2] for key in memory_keys if key[0] == 'http'}
+    return len(memory_keys) + len(db_job_ids - registered_http)
 
 
 @dataclass
@@ -134,6 +195,12 @@ class ServerState:
     active_http_jobs: Optional[ListProxy] = None
     # E3 注入持久结果消费者；E1 不实现其存储语义。
     http_result_sink: object = None
+    # R7：共享预算的 DB 侧计数来源（零参协程，返回 QUEUED+RUNNING 的 job_id 集合）。
+    # 由 HttpServer 注入，内部走受监督的单 I/O worker 线程；未启用 HTTP 时为 None。
+    http_active_job_counter: object = None
+    # R7：共享准入锁。WS 首帧与 HTTP commit 两条准入路径共用它，把「计数 → 判定 →
+    # 登记」变成互斥的临界区。由 ensure_server_runtime 初始化。
+    admission_lock: Optional[asyncio.Lock] = None
 
 
 
@@ -211,10 +278,16 @@ def ensure_server_runtime(state) -> None:
         'pending_segments': {},
         'active_http_jobs': None,
         'http_result_sink': None,
+        'http_active_job_counter': None,
     }
     for name, value in defaults.items():
         if not hasattr(state, name):
             setattr(state, name, value)
+    # R7：admission_lock 是 dataclass 字段，默认值就是 None，因此不能靠上面的
+    # hasattr 分支填。asyncio.Lock 构造不绑定事件循环（3.10+ 惰性取 loop），
+    # 在同步装配期创建是安全的。
+    if getattr(state, 'admission_lock', None) is None:
+        state.admission_lock = asyncio.Lock()
 
 
 def begin_task(state, key: TaskKey, max_inflight_segments: int = 4) -> None:

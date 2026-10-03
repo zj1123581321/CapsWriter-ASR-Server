@@ -28,7 +28,13 @@ from typing import Callable, Optional
 
 from config_server import ServerConfig
 from core.server.http_file_runner import RunnerUnavailable
-from core.server.state import count_active_tasks
+from core.server.state import (
+    CounterUnavailable,
+    WS_RESERVED_SLOTS,
+    count_active_tasks,
+    ensure_server_runtime,
+    http_job_budget,
+)
 from core.server.http_store import (
     IO_MAILBOX,
     MAX_BODY_CONCURRENCY,
@@ -46,6 +52,19 @@ logger = logging.getLogger("server")
 
 class HttpServerError(Exception):
     """HTTP 装配/监督失败：调用方必须以非零退出，不得吞掉。"""
+
+
+async def _counter_during_shutdown() -> set:
+    """停机期间挂在 state 上的计数来源桩：一律显式失败，绝不按内存口径放行。
+
+    与 ``None``（HTTP 从未启用、确实没有 SQLite 可数）是两种语义，不能混用同一个
+    空值：混用会让停机窗口内的准入静默退化为只数内存，漏掉仍在 ``jobs`` 表里排队的
+    Job，把共享上限静默突破。
+    """
+    raise CounterUnavailable(
+        "HTTP 文件任务 listener 正在停机，共享预算的 DB 侧计数已失效；"
+        "本次准入按未决拒绝，绝不退化为纯内存口径"
+    )
 
 
 def _import_aiohttp():
@@ -154,6 +173,11 @@ class HttpServer:
         except (OSError, RuntimeError) as exc:
             self._worker.close()
             raise HttpServerError(f"HTTP 存储初始化失败：{exc}") from exc
+        # R7：把共享预算的 DB 侧计数来源注入共享 state，使 ws_recv 与本 listener
+        # 走同一个跨存储计数原语。计数必须经受监督的单 I/O worker 线程取：
+        # SQLite 连接绑定该线程，跨线程直接用会抛 sqlite3.ProgrammingError。
+        ensure_server_runtime(self._app.state)
+        self._app.state.http_active_job_counter = self.active_http_job_ids
         application = self._web.Application()
         self._add_routes(application)
         # 半开 body 超时后必须能写完 408 再结束连接：lingering drain 会把未完成
@@ -162,7 +186,13 @@ class HttpServer:
         return self
 
     def _open_store(self) -> HttpStore:
-        return HttpStore(self.data_dir, inference_ready=self._inference_ready).open()
+        # 存储侧的 DB 兜底与本 listener 的准入判定用同一个 http_job_budget，
+        # 两处不会各自漂移出两个数字。
+        return HttpStore(
+            self.data_dir,
+            inference_ready=self._inference_ready,
+            http_budget=http_job_budget(ServerConfig.max_tasks),
+        ).open()
 
     def attach_runner(self, runner) -> None:
         """装配真实文件 runner：此后 commit 才受理并立即调度。"""
@@ -198,6 +228,13 @@ class HttpServer:
 
     async def fail_job(self, job_id: str, error_code: str) -> bool:
         return await self._worker.run(self._store.fail_job, job_id, error_code)
+
+    async def active_http_job_ids(self) -> set:
+        """QUEUED+RUNNING 的 HTTP Job id：共享预算的 DB 侧计数来源。
+
+        排队中的 Job（未拿到运行闸门、内存里尚无记录）只在这里可见。
+        """
+        return await self._worker.run(self._store.active_job_ids)
 
     def _add_routes(self, application) -> None:
         web = self._web
@@ -240,12 +277,34 @@ class HttpServer:
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
+
+        # R7 停机协调（第 1 步）：在准入锁内把 DB 侧计数来源换成会显式失败的桩。
+        #
+        # 为什么这一步必须在锁内：count_active_tasks 只在临界区内读
+        # state.http_active_job_counter。持锁就等于「先把在途临界区排空」——
+        # 能拿到锁，说明此刻没有任何请求正在临界区里，也就没有任何人持有旧的
+        # self.active_http_job_ids 绑定方法。释放锁之后的所有读都只会看到桩。
+        # 于是「取到将死的 worker 引用」与「读到 None 后静默退化为只数内存」
+        # 两个窗口都不存在。
+        #
+        # 为什么不会与排空互相等待：临界区内没有 await，取锁只是等在途请求把
+        # 自己那一步做完（它们此刻 await 的 I/O worker 仍然活着，拆解在后面），
+        # 拿到锁后的换源只是一次属性赋值。因此 stop 不需要 worker 存活就能排空，
+        # 「先失效后拆」与「先排空后拆」不构成循环。
+        ensure_server_runtime(self._app.state)
+        async with self._app.state.admission_lock:
+            self._app.state.http_active_job_counter = _counter_during_shutdown
+
+        # R7 停机协调（第 2 步）：临界区已排空，现在拆 worker 与存储是安全的。
+        # 此后若有准入发起，会在计数处显式失败，而不是打到已关闭的 worker 上。
         if self._worker is not None and self._store is not None:
             self._worker.run_sync(self._store.close)
         if self._worker is not None:
             self._worker.close()
             self._worker = None
         self._store = None
+        # 刻意不把 http_active_job_counter 置回 None：None 的含义是「HTTP 从未启用」，
+        # 置回 None 会让停机窗口内的准入静默退化为纯内存口径。桩保持到进程退出。
         logger.info("HTTP 文件任务 listener 已停止")
 
     # ---------------- 请求基础设施 ----------------
@@ -445,25 +504,42 @@ class HttpServer:
     async def _commit_upload(self, request):
         token = self._token(request)
         self._reject_encoding(request)
-        # R7：HTTP 准入与 WS 共用 max_tasks 的总量预算。计数走唯一原语
-        # count_active_tasks（活动 = state.tasks 非终态，HTTP 与 WS 一并计入）；
-        # HTTP 自己的表内计数由 store._check_job_admission 在事务里兜底。
-        # 与 WS 判定同为内存侧建议性计数（TOCTOU 窗口相同），不发明新错误码。
-        if count_active_tasks(self._app.state) >= ServerConfig.max_tasks:
-            raise HttpStoreError(
-                "too_many_jobs",
-                f"服务端活动任务已达共享上限 {ServerConfig.max_tasks}",
-                status=429,
-            )
         length = self._content_length(request)
+        # body 读不占准入锁：它只走 aiohttp 网络 I/O，不碰 I/O worker 线程，
+        # 把它放进临界区只会让所有准入排在一个慢客户端后面。
         await self._read_body(request, MAX_CHUNK_BYTES, length)
-        existed = await self._worker.run(
-            lambda: self._store.conn.execute(
-                "SELECT state FROM uploads WHERE upload_id=?", (request.match_info["upload_id"],)
-            ).fetchone()
-        )
-        job = await self._worker.run(self._store.commit_upload, request.match_info["upload_id"], token)
-        already_committed = existed is not None and existed["state"] == "COMMITTED"
+        state = self._app.state
+        upload_id = request.match_info["upload_id"]
+        # R7：HTTP 与 WS 共用 max_tasks 的共享总量预算，且 WS 恒定预留
+        # WS_RESERVED_SLOTS 个名额。总量走唯一原语 count_active_tasks（内存
+        # state.tasks 非终态 + DB 里 QUEUED+RUNNING 的 HTTP Job，按 job_id 去重），
+        # 排队中的 HTTP Job 也在其中。不发明新错误码。
+        #
+        # 「计数 → 判定 → 登记」全在同一把共享准入锁内。登记（Job 落库）必须在锁内：
+        # 否则 N 个并发 commit 会同时读到未达上限的计数、全部通过判定，再依次落库，
+        # 静默越过 HTTP 名额上限。临界区内 await 的两处都只落在受监督的单 I/O
+        # worker 线程上（DB 计数与 commit_upload），而 worker 只跑同步 SQLite/文件代码，
+        # 不会回头拿这把 asyncio 锁，故不存在锁序反转或 worker 等锁的死锁。
+        #
+        # 顺序：**先识别重放，再判预算**。已受理 upload 的幂等重试（响应丢失后的
+        # 显式重试路径）必须原样拿回同一个 Job，不看当前预算——它不消耗新名额，
+        # 若先判预算，预算满时重放会拿到 429，破坏 commit_upload 声明的幂等。
+        ensure_server_runtime(state)
+        async with state.admission_lock:
+            replayed = await self._worker.run(self._store.committed_job, upload_id, token)
+            already_committed = replayed is not None
+            if not already_committed:
+                if await count_active_tasks(state) >= http_job_budget(ServerConfig.max_tasks):
+                    raise HttpStoreError(
+                        "too_many_jobs",
+                        f"HTTP 可用名额已满（共享上限 {ServerConfig.max_tasks} 扣除为 WS 预留 "
+                        f"{WS_RESERVED_SLOTS} 个名额后，HTTP 最多 "
+                        f"{http_job_budget(ServerConfig.max_tasks)} 个）",
+                        status=429,
+                    )
+                job = await self._worker.run(self._store.commit_upload, upload_id, token)
+            else:
+                job = replayed
         if self.file_runner is not None and not already_committed:
             # 只在首次受理时调度：重复 commit 返回同一 Job，不重投、不自动重跑
             try:

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from core.server.segmenter import validate_segment_params
+from core.server.state import http_job_budget
 
 
 # ---- R7 资源起点（启用 HTTP 后的起始 guard，不是实测吞吐）----
@@ -40,7 +41,6 @@ MAX_JSON_BYTES = 16 * 1024                        # 16 KiB 小 JSON
 MAX_HANDLERS = 16                                 # 16 并发 handler
 MAX_BODY_CONCURRENCY = 2                          # 同时 body 操作 2
 MAX_OPEN_UPLOADS = 32                             # 32 个未完成上传会话
-MAX_HTTP_JOBS = 8                                 # 最多 8 个 QUEUED+RUNNING
 IO_MAILBOX = 32                                   # I/O mailbox 32 有界操作
 SOURCE_RESERVE_BYTES = 16 * 1024 * 1024 * 1024   # 16 GiB source 声明长度总预留
 DB_GUARD_BYTES = 2 * 1024 * 1024 * 1024           # 2 GiB DB+WAL+SHM/结果整体 guard
@@ -187,8 +187,22 @@ def _acquire_exclusive_lock(lock_path: Path):
 class HttpStore:
     """上传/Job/结果的唯一持久真源。所有方法都是同步的，只能在 I/O worker 里调用。"""
 
-    def __init__(self, data_dir: Path, inference_ready: Optional[Callable[[], bool]] = None):
+    def __init__(
+        self,
+        data_dir: Path,
+        inference_ready: Optional[Callable[[], bool]] = None,
+        http_budget: Optional[int] = None,
+    ):
         self.data_dir = Path(data_dir)
+        # 事务内 DB 兜底的准入上限。与 HttpServer 的共享预算判定同源：两边都调
+        # core.server.state.http_job_budget，不会各自漂移出两个数字。
+        # 生产路径由 HttpServer 显式注入；直接构造存储（存储层单测）时按服务端
+        # 默认 max_tasks 算，避免在本模块再写死一个常量。
+        if http_budget is None:
+            from config_server import ServerConfig
+
+            http_budget = http_job_budget(ServerConfig.max_tasks)
+        self.http_budget = http_budget
         self.sources_dir = self.data_dir / "sources"
         self.db_path = self.data_dir / "http.sqlite3"
         self.lock_path = self.data_dir / "http.lock"
@@ -405,11 +419,33 @@ class HttpStore:
         if self._free_bytes() < FREE_SPACE_MARGIN_BYTES:
             raise HttpStoreError("disk_guard_full", "实际剩余文件系统低于安全余量", status=507)
 
+    def active_job_ids(self) -> set:
+        """QUEUED+RUNNING 的 Job id 集合：共享预算的 DB 侧计数来源。
+
+        必须在受监督的单 I/O worker 线程里调用（SQLite 连接绑定该线程）。
+        """
+        rows = self.conn.execute(
+            "SELECT job_id FROM jobs WHERE state IN (?, ?)", (JOB_QUEUED, JOB_RUNNING)
+        ).fetchall()
+        return {row["job_id"] for row in rows}
+
+    def committed_job(self, upload_id: str, token: str) -> Optional[JobRecord]:
+        """已受理 upload 的幂等重放：返回同一个 Job；尚未受理则返回 None。
+
+        预算判定必须先问它一句：重放不消耗新名额，因此不该被「HTTP 名额已满」误拒。
+        走 ``_row_for_token``，所以 token 校验、404/410 语义与新提交完全一致，
+        不会因为提前判定而泄露 upload 是否存在。
+        """
+        row = self._row_for_token(upload_id, token)
+        if row["state"] == UPLOAD_COMMITTED and row["job_id"]:
+            return self.job_record(row["job_id"], token)
+        return None
+
     def _check_job_admission(self) -> None:
-        active = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE state IN (?, ?)", (JOB_QUEUED, JOB_RUNNING)
-        ).fetchone()["n"]
-        if active >= MAX_HTTP_JOBS:
+        # 事务内的 DB 侧兜底，数字与共享预算同源（见 __init__ 的 http_budget）。
+        # 权威判定在 core/server/state.py 的 count_active_tasks（跨内存+DB、且在
+        # 共享准入锁内与登记互斥）；这里只兜住绕过内存路径的写入，两者不会打架。
+        if len(self.active_job_ids()) >= self.http_budget:
             raise HttpStoreError("too_many_jobs", "HTTP 任务准入已满", status=429)
 
     # ---------------- 对外操作 ----------------
@@ -539,15 +575,22 @@ class HttpStore:
             raise HttpStoreError("integrity_mismatch", "源文件 SHA-256 与声明不一致", status=422)
 
     def commit_upload(self, upload_id: str, token: str) -> JobRecord:
-        """核对完整 hash/length 后，在唯一事务里建立唯一 Job 并置 COMMITTED。"""
+        """核对完整 hash/length 后，在唯一事务里建立唯一 Job 并置 COMMITTED。
+
+        顺序要求：**幂等重放识别必须在预算兜底之前**。重放不新建 Job、不消耗新名额，
+        因此不能被 ``_check_job_admission`` 以「名额已满」拒掉——否则响应丢失后的
+        显式重试拿不回同一个 Job。
+        """
         row = self._row_for_token(upload_id, token)
         if row["state"] == UPLOAD_COMMITTED and row["job_id"]:
-            # 已经存在的 Job 重复 commit 必须仍返回同一 Job，不因推理协调者不可用另造
+            # 已经存在的 Job 重复 commit 必须仍返回同一 Job，不因推理协调者不可用另造，
+            # 也不因当前预算已满而另造或误拒
             return self.job_record(row["job_id"], token)
         if row["confirmed_offset"] != row["size_bytes"]:
             raise HttpStoreError("upload_incomplete", "上传尚未达到声明长度", status=409,
                                  confirmed_offset=row["confirmed_offset"])
         self._verify_source(row)
+        # 只有走到这里才是「要新建 Job」，此时才谈得上预算兜底
         self._check_job_admission()
         if not self._inference_ready():
             # 没有真实推理协调者就不受理，绝不受理后永远排队
