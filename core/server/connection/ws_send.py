@@ -163,9 +163,10 @@ async def ws_send(app):
                 raise RuntimeError('HTTP 结果持久消费者未注入')
             # HTTP 终态唯一收尾人是结果 sink（落库→转换→释放一体完成）；
             # 本分支只做段确认，不得再做任何终态转换——重复转换与
-            # 两套终态责任并存的旧形态由结构约束钉死。
-            await sink(result)
+            # 两套终态责任并存的旧形态由结构约束钉死。段确认在 sink 之前：
+            # 与 WS 分支语义一致，终态释放后 pending/段名额已被清，事后确认无事可做。
             acknowledge_segment_result(state, key)
+            await sink(result)
             logger.debug(f"已提交 HTTP 识别结果 task={result.task_id}")
             continue
 

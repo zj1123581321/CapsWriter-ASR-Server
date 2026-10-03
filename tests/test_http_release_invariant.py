@@ -187,22 +187,38 @@ def test_release_position_table_is_exact():
     )
 
 
-def test_finalize_entry_persists_before_release_with_bounded_wait():
-    """约束 3a：finalize_http_job 只经 wait_for 包裹的 runner.fail_job 收尾。
+def test_finalize_entry_delegates_to_bounded_fail_job():
+    """约束 3a：finalize_http_job 直接委托 runner.fail_job，不包第二层 wait_for。
 
-    机制只有一份：finalize 内不得直接调用 transition_terminal（释放动作在
-    runner.fail_job 内部完成，其先落库后释放的顺序由
-    test_runner_fail_job_persists_before_release 钉住——两处断言合起来把
-    「先落库、后释放、wait_for 有上限」的完整链条锁死）。
+    机制只有一份：finalize 内不得直接调用 transition_terminal，也不得再包一层
+    wait_for（同值双层超时竞争会把 fail_job 抛出的 SystemExit 困在子 task 里
+    被外层转成普通超时返回）——「先落库、后释放、wait_for 有上限」由
+    test_runner_fail_job_persists_before_release 在 fail_job 内部钉死。
     """
     finalize = _functions(_load("http_file_runner.py"))["finalize_http_job"]
     assert _terminal_calls(finalize) == [], (
         "finalize_http_job 不得直接调用 transition_terminal；释放必须经由 "
         "runner.fail_job 的既有正确形态"
     )
-    persists = [
+    delegates = _awaits_of(finalize, "fail_job")
+    assert len(delegates) == 1, "finalize_http_job 必须只有一处对 runner.fail_job 的委托"
+    assert not [
         item
         for item in ast.walk(finalize)
+        if isinstance(item, ast.Await)
+        and isinstance(item.value, ast.Call)
+        and _call_name(item.value.func) == "wait_for"
+    ], "finalize_http_job 不得再包第二层 wait_for；有界期限只在 fail_job 内部一处"
+
+
+def test_runner_fail_job_persists_before_release():
+    """约束 3b：runner.fail_job（唯一机制）先落库（wait_for 有界）后释放。"""
+    fail_job = _functions(_load("http_file_runner.py"))["fail_job"]
+    terminals = _terminal_calls(fail_job)
+    assert len(terminals) == 1
+    persists = [
+        item
+        for item in ast.walk(fail_job)
         if isinstance(item, ast.Await)
         and isinstance(item.value, ast.Call)
         and _call_name(item.value.func) == "wait_for"
@@ -210,20 +226,11 @@ def test_finalize_entry_persists_before_release_with_bounded_wait():
         and isinstance(item.value.args[0], ast.Call)
         and _call_name(item.value.args[0].func) == "fail_job"
     ]
-    assert len(persists) == 1, "finalize_http_job 必须只有一处受监督的持久化写"
+    assert len(persists) == 1, "runner.fail_job 必须只有一处 wait_for 包裹的持久化写"
     wait_for_call = persists[0].value
     assert any(keyword.arg == "timeout" for keyword in wait_for_call.keywords), (
-        "持久化写必须用 wait_for 卡住超时上限，否则错因没写进去会升级成进程挂死"
+        "持久化写必须用 wait_for 卡住超时上限（F3），否则错因没写进去会升级成进程挂死"
     )
-
-
-def test_runner_fail_job_persists_before_release():
-    """约束 3b：runner.fail_job（正确样板）保持先落库后释放。"""
-    fail_job = _functions(_load("http_file_runner.py"))["fail_job"]
-    terminals = _terminal_calls(fail_job)
-    assert len(terminals) == 1
-    persists = _awaits_of(fail_job, "fail_job")
-    assert len(persists) == 1, "runner.fail_job 必须只有一处持久化写"
     assert persists[0].lineno < terminals[0].lineno
 
 

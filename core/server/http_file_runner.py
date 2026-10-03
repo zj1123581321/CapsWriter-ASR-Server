@@ -287,9 +287,9 @@ async def finalize_http_job(
 
     只接受 HTTP key 的 FAILED 终态（DONE 由结果 sink 走 record_result 路径）。
     机制复用 runner.fail_job 的既有正确形态（条件更新落库 → transition_terminal），
-    不发明第二套释放逻辑；持久写用 wait_for 卡住上限，超时或失败时**不释放
-    owner**、记显式错误日志（「持久失败事实未落库」）、返回 False 交由调用方
-    按原语义非零退出，重启收敛兜底——绝不静默吞掉。
+    不发明第二套释放逻辑。有界期限与「落库未成功不释放 owner、非零退出」的语义
+    都在 fail_job 内部统一实现（本层不再包第二层 wait_for，同值双层超时会竞争）；
+    失败时 fail_job 记「持久失败事实未落库」显式错误日志并抛 SystemExit，绝不静默。
     """
     if key[0] != "http":
         raise ValueError(f"finalize_http_job 只接受 http key: {key!r}")
@@ -306,20 +306,10 @@ async def finalize_http_job(
             f"持久失败事实未落库，owner 不释放，交由重启收敛兜底"
         )
         return False
-    try:
-        return await asyncio.wait_for(
-            runner.fail_job(job_id, code, message),
-            timeout=HTTP_FINALIZE_TIMEOUT,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.error(
-            f"HTTP 文件任务 {job_id} 终态持久化超时或失败"
-            f"（{type(exc).__name__}: {exc}）：持久失败事实未落库，"
-            f"owner 不释放，交由重启收敛兜底"
-        )
-        return False
+    # 有界期限与落库未成功的退出语义都由 runner.fail_job 内部统一保证
+    # （F3：所有调用方同一条机制）；这里不再包第二层 wait_for——同值双层的
+    # 超时竞争会把 SystemExit 困在子 task 里被外层转成普通超时返回。
+    return await runner.fail_job(job_id, code, message)
 
 
 class HttpFileRunner:
@@ -389,16 +379,36 @@ class HttpFileRunner:
             raise
 
     async def fail_job(self, job_id: str, code: str, message: str) -> bool:
-        """可靠提交整 Job FAILED，然后释放运行态；已是终态时不覆盖。"""
+        """可靠提交整 Job FAILED，然后释放运行态；已是终态时不覆盖。
+
+        落库用 wait_for 卡有界期限（HTTP_FINALIZE_TIMEOUT）：所有调用方（runner
+        自身、结果 sink、finalize_http_job）都得到同样的有界语义，而不是只有经
+        finalize 的那条有。落库未成功（超时/失败）时不释放 owner/运行闸门，
+        记「持久失败事实未落库」显式错误日志，并按与监控路径一致的非零退出语义
+        上抛 SystemExit，由重启收敛兜底——绝不让未落库的失败放行后续 Job。
+        """
         ensure_server_runtime(self.state)
         logger.error(f"HTTP 文件任务失败 job={job_id} code={code}：{message}")
-        committed = await self.http.fail_job(job_id, code)
         key = make_task_key("http", job_id)
-        if committed:
-            transition_terminal(self.state, key, "FAILED", code=code)
-        else:
-            logger.info(f"HTTP 文件任务已终态，未覆盖失败状态 job={job_id}")
+        try:
+            committed = await asyncio.wait_for(
+                self.http.fail_job(job_id, code), timeout=HTTP_FINALIZE_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"HTTP 文件任务 {job_id} 终态持久化超时或失败"
+                f"（{type(exc).__name__}: {exc}）：持久失败事实未落库，"
+                f"owner 与运行闸门不释放，交由重启收敛兜底"
+            )
+            raise SystemExit(1)
+        # 已终态不覆盖由存储层条件更新保证；内存侧按库中终态收敛：转换唤醒
+        # 等待者并释放 owner/闸门，迟到失败不翻转已提交的 DONE/FAILED。
+        transition_terminal(self.state, key, "FAILED", code=code)
         release_terminal_task(self.state, key)
+        if not committed:
+            logger.info(f"HTTP 文件任务已终态，未覆盖失败状态 job={job_id}")
         return committed
 
     def cancel(self, job_id: str) -> None:
