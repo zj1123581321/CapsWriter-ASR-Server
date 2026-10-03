@@ -1,4 +1,4 @@
-阶段：整份新增测试与竞态窄测完成，均通过；开始最小变异 AssertionError 红验。
-结论：指定隔离依赖下完整 `tests/test_http_cleanup.py` 为 5 passed（2.94s）；`test_upload_io_and_cleanup_share_one_worker_five_times` 作为独立窄测重复五轮，5/5 passed。仅代表新增单文件和该竞态样本。
-关键决策与否决：命令使用 uv --no-project、多项任务卡锁定依赖，未触碰主 `.venv`。真实 systemd/decoder/cleanup probe 结果与上个进度一致；OCR 状态仍是 skipped，不能算干净。
-唯一下一步：在临时 scratch worktree 仅把 cleanup active-job 保护 guard 改成失效形态，先 grep 核实注入，再运行锁定周期集成 case，要求以 AssertionError 转红；随后完成 verdict/report、提交和远端核验。
+阶段：独立证据完成，正在整理最终 verdict/report 并提交推送。
+结论：新增 `tests/test_http_cleanup.py` 全文件 5 passed；竞态窄测独立重复五轮为 5/5 passed。scratch 红验确认失效 `active` guard 后，指定周期集成 case 以原断言 `AssertionError: 周期清理在 decoder.close 释放前删除了仍被 runner 引用的源` 转红（1 failed），故断言能拦住已识别回归。真实 systemd probes 证实正常清理路径与本卡发现的运行时存储错误可见性/进程存活风险。
+关键决策与否决：红验只在固定 H0 的临时 scratch worktree 改动一行，注入前后已核对；scratch 已由 helper 清理，审查 worktree 未改源码。OCR 状态 skipped，不算通过；完整仓库测试与 C1 precheck 不在本卡范围。审查结论含一项 P1：cleanup unlink 的存储异常会令 HTTP/WS listener 关闭并可见记录错误，但短进程/worker 仍存活、systemd unit 仍 active，进程级监督未被触发。
+唯一下一步：写入逐不变式 verdict 与四问完整报告，按允许路径提交；push 固定分支后核实远端 tip 和 worktree clean。
