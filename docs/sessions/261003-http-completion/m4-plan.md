@@ -1,170 +1,122 @@
-# M4 补充设计：HTTP 资源边界与清理实施计划
+# M4 补充设计（修正版）：HTTP 资源边界与清理实施计划
 
-本文只规划，不含实现。基于 `e066930` 的只读代码核查（主脑运行时主干）。三态标注口径：
-**代码存在**＝生产代码里确有该逻辑；**测试覆盖**＝本仓有会因改坏它而红的测试；**缺证据**＝只有代码或只有测试名，无真实边界证据。
+基于 `e066930` 主干只读核查 + master CI run `37113170289` 实测数据。**本文替代上一版全部结论**；上一版在 commit `f11587d`，此处逐条更正。
 
-## 1. R7 逐项映射（生产入口 → 消费者 → 现存测试）
+## 0. 对上一版的更正（10 条）
 
-| R7 量 | 生产入口（文件:行） | 真实消费者 | 状态 |
+| # | 上一版错在哪 | 修正 |
+|---|---|---|
+| 1 | 断言「CI 未装 ffmpeg、解码证据整体 skip」 | **实错**。`ci.yml` 安装步骤有 `sudo apt-get update && sudo apt-get install -y ffmpeg`（我上次用 grep 只看 pip 行，滤掉了 apt 行）。master run `37113170289`（headSha=e066930）实测 **425 passed, 3 skipped in 228.99s**，ffmpeg 链在跑。所有「装 ffmpeg 前置卡」删除。 |
+| 2 | 断言三闸都该用 `>=` 拒收等值点 | **实错**。`_check_create_admission` 的 `declared + size_bytes > SOURCE_RESERVE_BYTES` 与 `free < FREE_SPACE_MARGIN_BYTES` 都让等值合法，与「最多 16 GiB」「至少留 2 GiB」契约一致。见 §2 精确量纲。 |
+| 3 | 把「删除源后释放 16 GiB 预留」列进已否决 | **实错**。长期服务会因永不释放的占额静默永久满。到期终态源安全删除后**必须**释放源预留，元数据/结果/外部身份不变。见 §3。 |
+| 4 | 把「partial 源文件是否删」列为待主脑拍板 | **已裁决**：保守不自动删 partial 物理文件；但 16 GiB 与物理容量口径**必须覆盖留在磁盘的 partial**，不得靠 `state != EXPIRED` 排除而漏记。终态源按 `jobs.terminal_at` 起算 7 天，不新增配置项。 |
+| 5 | 「Job 数 × 64 MiB」当完成 | 不成立——缺 R7 明写的 WAL 峰值，且只覆盖 result。另：capacity 只在 create 读一次 free，后续 PATCH 无预算。修正见 §4。 |
+| 6 | T7 写「FAILED 删源后结果仍 200」 | **实错**。`get_result` 对 FAILED 抛 409 `job_failed`（`http_store.py:646`）。DONE→200、FAILED→409+`error_code`，分别锁死。 |
+| 7 | T8 用纯 RUNNING 构造活跃引用窗口 | **恒真**。RUNNING 无 `terminal_at`，本就不是候选。真实窗口见 §5 T8。 |
+| 8 | 三态表「测试覆盖」隐含「改坏必红已验证」 | 改为「有行为断言」；除已保存的反向证据外不宣称改坏必红。64 KiB/read 等证据下沉到 M6。 |
+| 9 | 称 C1/C2「物理必串行」 | 修正：同文件不等于必须串行。并行仅限独立 worktree 内的读与规划；**实现合入按实际数据/接口依赖串行**（见 §6）。 |
+| 10 | 称 M7「环境完全不存在」 | 修正。模型/音频不在 git 是正常现实，来自用户本地设备目录。本轮不 SSH、不读录音，只把「已获授权的隔离验证环境与样本」列为待证前提。不新建三平台 CI runner，不为拿三个绿而生产部署。 |
+
+## 1. R7 逐项映射（代码存在 / 有行为断言 / 缺证据）
+
+「有行为断言」只说明仓内有对该行为的断言，**不等于**已保存反向注入的红验证据。
+
+| R7 量 | 生产入口 | 消费者 | 状态 |
 |---|---|---|---|
-| 1 GiB/file | `http_store.validate_identity` :824 → 413 | `POST /v1/uploads` → `http_server._create_upload` | 代码存在；测试覆盖（`test_upload_identity_and_limit_validation` L742，413）；1 GiB 真实字节未造 |
-| 1 MiB/PATCH | `http_store.append_bytes` :515 | `PATCH /v1/uploads/{id}` | 代码存在；测试覆盖（同上 + `test_negative_matrix_keeps_old_bytes` L504）；缺「恰好 1 MiB+1」边界断言 |
-| 64 KiB/read | `http_store.READ_CHUNK_BYTES` :39、`http_server._read_body` :411 | 两条 body 读取路径 | 代码存在；**缺证据**（无测试按 64 KiB 断言分块次数） |
-| 16 KiB 小 JSON | `http_server` 导入 :40 | `POST /v1/uploads` | 代码存在；测试覆盖（L764 413）；缺边界等值侧 |
-| 16 handler | `http_server._handler_slots` :147 | 全部 route 包装 `_wrap` :312 | 代码存在；测试覆盖（`test_body_and_handler_admission_rejects_without_waiting` L568，17 条真实 TCP） |
-| 同时 body 2 | `http_server._body_slots` :148 | `_read_body` | 代码存在；测试覆盖（L568、L1047 半开 body） |
-| mailbox 32 | `HttpIoWorker._mailbox` :90、`IO_MAILBOX` | 每个 store 调用 | 代码存在；测试覆盖（L169 第 33 个被拒） |
-| 32 未完成上传 | `_check_create_admission` :409 | `create_upload` | 代码存在；测试覆盖（`test_admission_refuses_new_upload_without_touching_old_data` L387） |
-| 共享总量/`max_tasks`、WS 预留 2 | `state.count_active_tasks` + `admission_lock` | WS 首帧 + HTTP commit 同一把锁 | 代码存在（M3 已合，`e066930`）；测试覆盖（L325/L1243/L1427/L1464/L1580） |
-| 每任务 4 在途段 | `begin_task(state, key, Config.max_inflight_segments)` :464 | `_submit` :508 | 代码存在；测试覆盖（`test_http_file_runner.py`）；缺「4 段在途屏障」独立用例 |
-| HTTP 解码器 1 | `HttpFileRunner._run_under_gate` :450 | `_execute` | 代码存在；测试覆盖（`ffmpeg_peak_concurrency`）；缺峰值=1 的反向红验 |
-| 300 s 空闲 | `_read_idle_seconds` :397 复用 `CW_UPLOAD_IDLE_SECONDS` | `_read_body` | 代码存在；测试覆盖（L951/L1109 真实屏障）；真实 300 s 时长未跑 |
-| 上传 TTL 7 天 | `UPLOAD_TTL_SECONDS` :49，创建 :483 / PATCH :552 续期 | `_row_for_token` 懒过期 :355 | 代码存在（**惰性**：只在请求路径触发）；测试覆盖（`test_expired_upload_is_410_and_metadata_kept` L362）；**无周期清理任务** |
-| source 16 GiB 预留 | `_check_create_admission` :414 | create/commit | 代码存在；**零测试**（`SOURCE_RESERVE_BYTES` 全仓无测试引用） |
-| DB+WAL+SHM 2 GiB | `_db_bytes` :344 + :417 | create | 代码存在；**零测试** |
-| result 64 MiB | `record_result` :745、runner `MAX_RESULT_BYTES` :217 | 结果 sink | 代码存在；测试覆盖（`test_http_file_runner.py` `result_too_large`） |
-| 待处理 result 预留峰值 | **不存在** | — | **缺证据**（R7 要求，未实现） |
-| physical free 2 GiB | `_free_bytes` :352 + :419 | create | 代码存在；**零测试** |
-| 源音频 7 天终态清理 | **不存在**（无周期任务、无 unlink 路径） | — | **缺证据**（M4 主体） |
-| `source_available` / 410 | `job_record` :625 / `_row_for_token` :378 | `GET /v1/jobs/{id}` | 代码存在；测试覆盖（L362）；删源后取值无覆盖 |
+| 1 GiB/file | `http_store.validate_identity`:824 | `POST /v1/uploads` | 代码存在；有行为断言（`test_http_file_tasks` L742/L541） |
+| 1 MiB/PATCH | `append_bytes`:515 | `PATCH` | 代码存在；有行为断言（L758） |
+| 64 KiB/read | `READ_CHUNK_BYTES`:39、`_read_body`:411 | 两条 body 路径 | 代码存在；**缺证据**（归 M6） |
+| 16 KiB JSON | `http_server`:40 | create | 代码存在；有行为断言（L764） |
+| 16 handler / body 2 / mailbox 32 | `_handler_slots`:147、`_body_slots`:148、`HttpIoWorker._mailbox`:90 | route 包装 / 每次 store 调用 | 代码存在；有行为断言（L568、L1047、L169） |
+| 32 未完成上传 | `_check_create_admission`:409 | create | 代码存在；有行为断言（`test_http_store` L387） |
+| 共享总量 + WS 预留 2 | `state.count_active_tasks` + `admission_lock` | WS 首帧 + HTTP commit 同锁 | 代码存在（M3 已合）；有行为断言（L325/L1243/L1427/L1464/L1580） |
+| 4 在途段 / 解码器 1 / idle 300s / `CW_MAX_TASK_SECONDS` | `begin_task`:464、`_run_under_gate`:450、`_read_idle_seconds`:397、`_check_samples_limit`:274 | runner / `_read_body` | 代码存在；有行为断言；**改坏必红未逐条验证**（归 M6） |
+| 上传 TTL 7 天 | `UPLOAD_TTL_SECONDS`:49、创建:483、PATCH 续期:552 | `_row_for_token`:355 惰性过期 | 代码存在（惰性）；有行为断言（L362）；**无周期任务** |
+| source 16 GiB | `_check_create_admission`:414 | create | 代码存在；**漏记**：口径 `state != EXPIRED` 排除了仍在磁盘的 partial（见 §3） |
+| DB+WAL+SHM 2 GiB | `_db_bytes`:344 + :417 | create | 代码存在；**缺证据**（零行为断言） |
+| result 64 MiB | `record_result`:745、runner:217 | 结果 sink | 代码存在；有行为断言（`result_too_large`） |
+| **待处理 result + WAL 预留** | **不存在** | — | **缺证据**（R7 明写，未实现） |
+| physical free 2 GiB | `_free_bytes`:352 + :419 | create | 代码存在；**缺证据**；且 PATCH/commit 路径不查（见 §4） |
+| 终态源 7 天清理 | **不存在** | — | **缺证据**（M4 主体） |
 
-**结论**：R7 的「请求侧限额」基本落地且有真实 HTTP 证据；缺口集中在三处——
-① 三个容量闸（16 GiB / DB 2 GiB / free 2 GiB）**零测试**；② **待处理 result 预留未实现**；
-③ **周期清理完全不存在**（上传 TTL 只有惰性过期，源音频零清理）。
+## 2. 精确量纲：等值侧按额度/余量/槽位三类分开
 
-## 2. 拆卡建议（每张 diff ≤ 3500 行，TDD）
+上一版把三类混成一条 `>=`，是错的。
 
-前置：C1 与 C2 都改 `core/server/http_store.py`，同仓一支笔，物理串行；C2 与 C4 无接口依赖。
+- **额度类**（允许用满，等值合法）：`已占 + 新增 > 上限` 才拒。→ source 16 GiB、DB guard 2 GiB（C1 加预留后仍是 `>`）。等值点**必须放行**。
+- **余量类**（至少保留，等值合法）：`可用 < 需留` 才拒。→ physical free 2 GiB，恰好 2 GiB 合法。
+- **槽位类**（占位即满，等值即拒）：`计数 >= 上限` 即拒。→ 32 未完成上传、16 handler、body 2、mailbox 32。
 
-### C1 · 容量三闸 + 待处理结果预留（store 层）
-- 生产：`core/server/http_store.py`（`_check_create_admission`、新增 `_pending_result_reservation`）；测试：`tests/test_http_store.py`。
-- 范围只做「判定」：把 DB guard 改为「已用 DB 字节 + 待处理 Job 数 × 单 Job 结果预留」不超 2 GiB；free 闸用真实 `shutil.disk_usage`（测试用真实 tmpfs/loop 挂载或 monkeypatch 到真实 `os.statvfs`）。
-- 不动 HTTP route、不动 runner。
-- 命令：`python -m pytest tests/test_http_store.py -q`。
-- 预计耗时来源：3 个阈值测试要造大文件（2 GiB 真实字节不现实 → 用「把库真实写到阈值附近」的 monkeypatch 记字节函数 + 1 个真实小规模 free 闸断言）；耗时主要在 ffmpeg/soundfile 无关的纯 SQLite 提交。精确耗时未知。
+`GET /v1/jobs` / `result` / 幂等重放**不分配新预算**，任何容量状态下都必须可用。
 
-### C2 · 周期清理任务 + 源音频终态清理（主路径）
-- 生产：`core/server/http_store.py`（`cleanup_due()`：返回候选并删源文件）、`core/server/http_server.py`（周期 asyncio 任务，进 `serve()`/`stop()` 监督链）、`core/server/app.py`（装配/停机顺序）；测试：`tests/test_http_file_tasks.py`、`tests/test_http_store.py`。
-- 消费方必须是**真实周期任务**（`http_server` 里注册的 loop task），不得只测 `cleanup_due()` 这个库函数。
-- 消费方活跃引用保护：清理时必须排除 `runner.active_jobs`（`http_file_runner.py:340`）与 `state.tasks` 非终态记录；这些是真消费方，不是同源计数。
-- 命令：`python -m pytest tests/test_http_file_tasks.py tests/test_http_store.py -q`。
+## 3. source-presence 口径（C1 与 C2 共用定义）
 
-### C3 · 清理与容量的端到端用户可见证据
-- 生产：无新增（只允许修 C1/C2 暴露的 bug）；测试：`tests/test_http_file_tasks.py`（新增）、`tests/test_e2e_sdk_server.py` / `tests/test_sdk_client.py`（复用 `sdk/capswriter_asr/http_client.py` 真客户端）。
-- 证明 `source_available` 由 true→false、过期 410、删源后 `GET /v1/jobs/{id}/result` 仍 200 完整结果、重启后期限不重置。
-- 命令：`python -m pytest tests/test_http_file_tasks.py tests/test_e2e_sdk_server.py -q`。
+- 预留口径 = `SUM(uploads.size_bytes) WHERE 源文件仍在`。当前 `WHERE state != 'EXPIRED'` 把留在磁盘的 EXPIRED partial 排除在外 → **静默漏记**，与「物理容量与 16 GiB 必须覆盖保留的 partial」冲突。
+- **释放条件**：到期终态源（`jobs.terminal_at + 7d < now`、job 为 DONE/FAILED、无活跃 runner 引用）被安全删除后，相应 `size_bytes` 必须退出预留；否则长期服务会永久满。
+- **记录方式由 C2 决定**（列标记 / 由终态时间与文件存在性联合判定），本设计不强制抽象；不新增资源表。
+- **崩溃一致顺序：先 unlink，后提交释放记录。** unlink 成功而记录未提交 → 仍计费（多计，保守方向）；反序（先记释放再 unlink）会漏记，禁止。测试须在两步骤之间注入崩溃，断言重启后**不多计也不漏计**，且外部身份（upload_id/job_id/token/结果）不变。
+- partial（UPLOADING→EXPIRED）本轮**不自动删物理文件**；周期任务可持久标 EXPIRED 并让入口返 410。
 
-### C4 · 剩余 R7 单位的反向红验与旧 WS 回归
-- 生产：无（或仅补 `http_file_runner.py` 的段数/解码器上限回读）；测试：`tests/test_http_file_runner.py`（每任务 4 在途段、解码器峰值=1、`CW_MAX_TASK_SECONDS` 实际采样数拒绝）、`tests/test_segmentation_contract.py`。
-- 命令：`python -m pytest tests/test_http_file_runner.py tests/test_segmentation_contract.py -q`。
+## 4. C1 容量与结果/WAL 预留（独立可部署增量）
 
-### 全量命令
-`python -m pytest tests/ -q`（与 `.github/workflows/ci.yml` L36 一致）。耗时来源：`test_http_file_runner.py` 真实 ffmpeg 编码四种容器 + 子进程 server 重启用例是主要成本；本机耗时未知，CI 上 ffpmeg 缺失时该文件整体 skip（见 §6）。
+生产 `core/server/http_store.py`；测试 `tests/test_http_store.py` + `tests/test_http_file_tasks.py`。**不改 route、不改 runner、不改 app.py。**
 
-## 3. 最小保护形态与不变式轴表
+1. **DB guard 补预留**：判定改为 `_db_bytes() + pending_reservation > DB_GUARD_BYTES`（等值放行）。`pending_reservation = 待处理 Job 数(QUEUED+RUNNING) × (MAX_RESULT_BYTES + WAL_HEADROOM)`。`WAL_HEADROOM` 取结果 payload 的 2 倍作为「checkpoint 前 WAL 同时持有旧页与新页」的保守上界，写成模块常量，**不新增配置项**。数据只来自既有 `jobs`/`results` 查询，不开第二本账。
+2. **真实字节对照证据**：用缩小后的模块常量（monkeypatch）造接近上限的多个真实结果，跑到真实 checkpoint，比对「真实 DB+WAL+SHM 字节」与「预留上界」，断言**预留 ≥ 真实字节**（上界不吃亏）。不真造 2 GiB。
+3. **source 预留改 source-presence 口径**（§3），去掉按状态排除。
+4. **PATCH 也查物理余量**：`append_bytes` 落盘前查 `disk_usage().free - (未写入尾 = size_bytes - confirmed_offset) - pending_reservation` 是否仍 ≥ 2 GiB（余量类，等值放行）；不足 → 507，**不写、不 ACK、offset 不变**。commit 的 source 校验前同样查一次。
+5. **不挡查询**：幂等重放、`job_record`、`get_result` 不加闸，容量满时仍 200/202 可用。
+6. **查不到≠有容量**：`disk_usage`/`os.stat`/SQLite 抛错必须显式失败（拒绝受理），禁止 `except` 吞成放行。
+7. 阈值三点测试（`额度-1 / 额度 / 额度+1`、余量 `<2GiB / ==2GiB / >2GiB`）必须**按 §2 的类分别写**，等值点断言放行。
 
-保护面只有三处：`uploads.state/expires_at`、`jobs.state/terminal_at`、`sources/<uuid>.bin`。不新建资源框架、不加新的资源表。
+命令：`python -m pytest tests/test_http_store.py tests/test_http_file_tasks.py -q`；全量 `python -m pytest tests/ -q`。
 
-**族 A 上传 TTL**（轴：起算来源 × 期限前后 × 活跃 I/O × 重启）
-| # | 组合 | 不变式 |
-|---|---|---|
-| A1 | 创建 → 未 PATCH → 未过期 | `expires_at = created_at + 7d`，源文件在 |
-| A2 | 成功 PATCH → 未过期 | `expires_at = patch 时刻 + 7d`（`http_store.py:552`） |
-| A3 | 仅 GET → 未过期 | `expires_at` **逐字节不变** |
-| A4 | 越过期限 | state→`EXPIRED`；GET/PATCH/commit 均 410 `upload_expired` |
-| A5 | 越过期限 **且有活跃 PATCH I/O** | 该次 PATCH 的 ACK/offset 语义不被清理撤销；清理不得删正在写的文件 |
-| A6 | 重启后再看 | `expires_at` 不被重置；重启不复活 `EXPIRED` |
-| A7 | 周期清理跑多次 | 幂等；第二次不报错、不重复 unlink |
+## 5. C2 周期终态源清理（独立可部署增量）
 
-**族 B 终态源音频**（轴：起算 × 活跃引用 × job 状态 × 重启）
-| # | 组合 | 不变式 |
-|---|---|---|
-| B1 | `DONE` + `terminal_at` 未满 7 天 | 源文件保留，`source_available=true` |
-| B2 | `DONE` + 满 7 天 + 无活跃 runner 引用 | 源文件删除；**jobs/results 行不动**；`source_available=false`；结果仍 200 |
-| B3 | `FAILED` + 满 7 天 + 无引用 | 同 B2（`error_code` 仍可读） |
-| B4 | 满 7 天 + **runner 仍持有该 job**（解码未结束） | 不删；本轮跳过，下轮再判 |
-| B5 | `QUEUED`/`RUNNING`（无 `terminal_at`） | **永不删**（重启后已被 `_converge_restart` 置 FAILED，故 B3 随后接管） |
-| B6 | 删源后重启 | `source_available` 仍 false，结果仍可领取；不复活文件 |
-| B7 | 未知/未登记的 `sources/` 残留文件 | **不删**（R7 明令） |
+生产 `core/server/http_store.py`（候选查询 + 释放记录）、`core/server/http_server.py`（周期任务）。**`app.py` 暂不改**：`HttpServer.serve()` 在 `_runner.setup()` 后起周期任务、`stop()` 里取消即可，主脑要求的「先证真实调用方」结论是：`app.py` 只调 `serve()`/`stop()`，现有链能消费，故不改。
 
-**族 C 容量**（轴：阈值前后 × 资源种类 × 并发）
-| # | 组合 | 不变式 |
-|---|---|---|
-| C1 | source reservation 恰好等于/超出 16 GiB | `>=` 即 507 `source_reserve_full`，不新建 upload 行、不建空文件 |
-| C2 | DB+WAL+SHM 字节跨 2 GiB | 507 `storage_guard_full`；DB guard 含 WAL/SHM 三件套真实 `st_size` |
-| C3 | 待处理 Job 结果预留跨 2 GiB | 507，且与 C2 同一口径（见 §5 歧义 4） |
-| C4 | `disk_usage().free` 低于 2 GiB | 507 `disk_guard_full` |
-| C5 | 并发 8 个 commit 同时越限 | 至少 1 个 507，其余正常；DB 中 Job 行数 == 返回 202 的数量（无凭 ACK 的 Job） |
-| C6 | 并发 PATCH 期间跑清理 | 清理不删 A5 保护的文件；ACK 与磁盘字节、DB offset 三者一致 |
-| C7 | 清理释放空间后重试 create | 容量闸重新放行（证明闸不是静态开关） |
+清理只允许：到期终态源、且无活跃 runner 引用。禁止删 jobs/results/元数据、禁止删未登记残留（`sources/junk.bin` 必须在）、禁止因容量不足顺手删东西。
 
-**显式未决/失败（不得用「查不到」推结论）**：`shutil.disk_usage`、`os.stat` 或 SQLite 查询抛错 → 拒绝受理并报明确 5xx/507，**不得**把异常吞成「有容量」。这条必须写成负向测试（见 T9）。
+**测试计划**（每条含真实入口 + 改坏会红的判据）：
 
-## 4. 行为测试计划（每条含真实边界与反向红验）
-
-原则：断言必须落在**真实 HTTP 请求 payload、真实源文件字节、真实 SQLite 行、真实时钟与真实屏障**上；结构检查/同源计数不算主证据。
-
-| ID | 不变式 | 真实入口与断言 | 改坏什么会红（须 AssertionError） |
+| ID | 不变式 | 真实入口与断言 | 改坏什么会红 |
 |---|---|---|---|
-| T1 | A1/A2 | 真实 `POST /v1/uploads` + 真实 PATCH 字节体 → 直接读 SQLite `expires_at`（非 HTTP 回显） | 把 `append_bytes` 的续期删掉 → A2 断言红 |
-| T2 | A3 | 真实 GET 后逐字段比对 `expires_at` 精确值（注入可控时钟，不 sleep 7 天） | 让 GET 走续期分支 → 红 |
-| T3 | A4/A6 | 注入时钟越界 → 真实 GET 得 410 `upload_expired`；**关库重开**再得 410 | 重启重建 `expires_at` → 红 |
-| T4 | A5/C6 | 屏障卡住 I/O worker 的真实写入 → 触发周期清理 → 释放后核对磁盘字节 + DB offset + 204 ACK | 清理不看活跃写入就 unlink → 字节/offset 不一致红 |
-| T5 | A7 | 手动触发两次真实周期任务 | 第二次报错或重复删 → 红 |
-| T6 | B1 | 把 `terminal_at` 改到 6 天前 → 跑清理 → 文件仍在、`source_available=true` | TTL 改成按 `created_at` 或无 7 天 → 红 |
-| T7 | B2/B3/B6 | 真实容器（ffmpeg 生成）跑完整 DONE 与 FAILED 两条 → 改 `terminal_at` 过期 → 清理 → 源文件消失，`GET result` 仍 200 完整 payload | 清理连 jobs/results 一起删 → 红；跳过清理任务装配 → 红 |
-| T8 | B4 | 屏障卡住真实 runner 解码（ffmpeg shim 记录 argv）→ 清理周期到达 → 文件在；释放后再跑一次 → 文件消失 | 清理不查 `runner.active_jobs` → 会在解码中删源，ffmpeg 非零退出 → 红 |
-| T9 | C1–C4 精确阈值 | 真实 HTTP create/commit 打到 `阈值-1 / ==阈值 / 阈值+1` 三点，断言 HTTP 状态码**且**断言 SQLite 无新增行、sources 目录字节数不变 | 判据写成 `>` 而非 `>=` → 等值点红 |
-| T10 | C7 | 让 free 闸用真实 tmpfs 目录，跑 `df` 取真实 free，填到阈值附近 → 断言 507 → 删临时文件后同一请求 201 | 闸读错目录或忽略真实 free → 红 |
-| T11 | C5/C6 并发 | 8 个真实并发 commit（真实 TCP、真实 barrier）→ 数 SQLite `jobs` 行数 == 202 数；并发 PATCH 与清理交错 | 无锁/丢登记 → 行数 > 202 红 |
-| T12 | 显式失败 | monkeypatch `shutil.disk_usage` / `os.stat` / `conn.execute` 抛 `OSError`/`sqlite3.Error` → 必须抛错或 5xx/507 | 用 `except: pass` 吞掉 → 请求被放行 → 红 |
-| T13 | B7 | 手工放一个未登记的 `sources/junk.bin` → 跑清理 → 文件仍在 | 清理扫目录即删 → 红 |
-| T14 | 旧 WS 回归 | `tests/test_backpressure.py`、`test_scheduler.py`、`test_http_release_invariant.py` 全绿 | HTTP 改动破坏 WS 默认 → 红 |
+| T1 | 上传 TTL：创建起算、PATCH 续期、GET 不续期 | 真实 POST + 真实 PATCH 字节体后直读 SQLite `expires_at`；GET 后逐字段精确比对 | 删掉 PATCH 续期 → T1a 红；GET 走续期 → T1c 红 |
+| T2 | 过期限 → 410 `upload_expired`，元数据留 | 注入时钟越界，真实 GET 得 410；关库重开再得 410 | 重启重置 `expires_at` → 红 |
+| T3 | 活跃 PATCH I/O 期间清理不删正在写的文件 | 屏障卡住 I/O worker 真实写入 → 触发清理 → 释放后核对磁盘字节 + DB offset + 204 ACK 三者一致 | 清理不看活跃写入就 unlink → 不一致红 |
+| T4 | 周期任务幂等 | 手动触发两次真实周期任务 | 第二次报错/重复删 → 红 |
+| T5 | DONE 未满 7 天不删 | `terminal_at` 改到 6 天前 → 清理 → 文件在、`source_available=true` | TTL 误用 `created_at` → 红 |
+| T6 | **DONE 满 7 天且无引用**：源删、结果仍可领 | 真实 ffmpeg 容器跑完 DONE → 改 `terminal_at` 过期 → 清理 → 源文件消失；`GET /v1/jobs/{id}/result` 仍 **200 且 payload 完整**；`source_available=false` | 清理连 jobs/results 删 → 红；周期任务没装配 → 红 |
+| T7 | **FAILED 满 7 天且无引用**：状态与错误码不变 | 造真实 FAILED（解码失败路径）→ 过期 → 清理 → 源文件消失；`GET /v1/jobs/{id}` 仍 `FAILED` + `error_code`；`GET .../result` 仍 **409 `job_failed` + `error_code`**（不是 200） | 删源后把 FAILED 当 DONE 返回 200 → 红 |
+| T8 | **真实终态-收尾窗口**：终态已落库、runner 仍有引用时不删 | 用真实 sink + 屏障卡在 `record_result` 已提交之后、`_on_done` 弹出 `self._jobs[job_id]` 之前的真实窗口（`http_file_runner.py` 的 `_execute` finally 仍在 await `decoder.close()`）→ 跑清理 → 文件在；释放后再跑一次 → 文件消失 | 清理不查 `runner.active_jobs` 就在该窗口删源 → 收尾路径报错红 |
+| T9 | 崩溃一致释放（§3） | 在 unlink 与释放记录之间注入崩溃 → 重启 → 预留不多计也不漏计；外部身份不变 | 反序提交 → 漏记红 |
+| T10 | 释放后容量真的放开 | 过期终态源清理后重发同一 create → 201（源预留已回落） | 释放只改标记不改口径 → 仍 507 红 |
+| T11 | 未登记残留不删 | 放 `sources/junk.bin` → 跑清理 → 仍在 | 扫目录即删 → 红 |
+| T12 | 查不到≠有容量 | monkeypatch `disk_usage`/`stat`/`execute` 抛错 → 必须报错/507 | `except: pass` → 放行红 |
+| T13 | 旧 WS 回归 | `tests/test_backpressure.py`、`test_scheduler.py`、`test_http_release_invariant.py` 全绿 | HTTP 改动破坏 WS 默认 → 红 |
 
-T4/T8/T10/T11 的 producer 素材真实存在：`tests/harness/`（`server.py` 真子进程、`fake_engine.py` 假引擎但真 `Task.data` 消费）、`tests/test_http_file_runner.py` 的 `install_recording_ffmpeg`（真 argv/env 记录）、`sdk/capswriter_asr/http_client.py`（真 HTTPX 客户端）。
+生产者素材真实存在：`tests/harness/server.py`（真子进程）、`fake_engine.py`（假引擎但真 `Task.data` 消费）、`test_http_file_runner.py` 的 `install_recording_ffmpeg`（真 argv/env 记录）、`sdk/capswriter_asr/http_client.py`（真 HTTPX 客户端）。用户可见 E2E（`source_available` true→false、410、删源后领取）**随 C1/C2 实现卡交付，不单开纯验收卡**。
 
-## 5. 清理语义与规格歧义
+## 6. 合入顺序与并行
 
-清理**只**允许：① state 已 `EXPIRED` 的登记 partial 源文件；② `COMMITTED` 且 job 终态、`terminal_at` 已满 7 天、无活跃 runner/内存引用的源文件。
-清理**禁止**：删 jobs/results/元数据；删未登记残留；因容量不足顺手删任何东西；重启后重置期限。
+C1 与 C2 都改 `http_store.py`，但**不存在接口消费依赖**：C2 只消费「到期终态源」这一既有事实，不调用 C1 的新预留函数。两者可在独立 worktree 内并行规划与实现；**合入按实际数据/接口依赖串行**，顺序 C1 → C2（先有容量口径与余量检查，再让清理去释放它）。这不是一支笔原则的泛化——一支笔只约束同一时刻的写入者。
 
-**歧义 1（partial 源文件是否删）**：`test_expired_upload_is_410_and_metadata_kept` L362 明确断言过期后源文件仍存在；design.md 只说「元数据不自动删」，未说 partial 文件删。最小保守建议：**C2 先只删终态源**，partial 源文件登记为「待定」并在 §8 列为主脑决策项；若主脑批准删 partial，必须新开一步并改写该断言，不得在实现卡里顺手改测试让它变绿。
+剩余资源边界（64 KiB/read、4 在途段、解码器峰值=1、idle 300s 等）的反向红验归 **M6**，不在 M4 单开卡；只在 M6 预算不足时另议。
 
-**歧义 2（7 天起算点）**：用 `jobs.terminal_at`；`QUEUED`/`RUNNING` 无该列 → 永不删（B5）。
+## 7. 环境与待证前提
 
-**歧义 3（16 GiB 是否随删除释放）**：R7 写「含未确认尾和旧保留源」，口径是**声明长度**而非磁盘占用 → 删源**不释放**预留（C1 不改这行）。
+| 项 | 实测/现状 |
+|---|---|
+| CI 全量耗时 | run `37113170289`：425 passed, 3 skipped, **228.99s**（另一矩阵 222.47s）。真实 ffmpeg 编码与子进程重启用例是主要成本。3 skipped 的具体身份未取到（CI 未开 `-rs`），**未知** |
+| CI ffmpeg | **已装**（apt），解码链在跑。无前置卡 |
+| 本机环境 | 有 ffmpeg/ffprobe、**无 aiohttp** → 本地只能收集 361 项，`test_http_file_runner.py` 与 `test_http_file_tasks.py` 在本机**收集为 0**。C1/C2 的 HTTP 层验证须在装了 `aiohttp==3.14.3` + `httpx==0.28.1` + ffmpeg 的环境跑（CI 已具备） |
+| 无会话裸 shell | 未跑，**未知**；M6 需补一次 |
+| 进程托管 | 以 `deploy/README.md` 的既有方式为准（`update.sh`/`update.ps1`/`pm2.ecosystem.config.js.example`）。不以「无 systemd unit」阻塞 M7 |
+| M7 模型/样本 | 不在 git 属正常，来自用户本地设备目录。本轮不 SSH、不读录音。列为**待证前提**：需已获授权的隔离验证环境与代表性样本；不自动新建三平台 CI runner，既有机器按部署约定隔离验证即可；**不得为拿三个绿而生产部署** |
+| 生产发布 | 需单独授权；M4 全部增量不部署 |
 
-**歧义 4（待处理 result 预留口径）**：R7 只写「预留 result 与 WAL 峰值」，未给数字。最小保守建议：按 `待处理 Job 数 × MAX_RESULT_BYTES(64 MiB)` 计入 2 GiB DB guard，不引入新配置项；该式子让 DB guard 远早于真实字节触发，属保守方向，但需主脑认可这一具体口径。
+## 8. 决策与已否决
 
-## 6. M6/M7 环境前提（当前缺口，不得当作已验证）
+决策：(1) 额度/余量/槽位三类分别定等值侧，禁止统一 `>=`；(2) source 预留按 source-presence 口径，删除后必须释放，先 unlink 后记释放；(3) partial 不自动删物理文件，但必须计入容量；(4) 终态源按 `jobs.terminal_at` + 7 天，无配置项；(5) 预留上界含 WAL 2 倍头寸，常量不加配置，数据只查既有表；(6) PATCH/commit 也查余量，重放与查询不受容量影响；(7) 清理由 `HttpServer.serve/stop` 内的真实周期任务消费，不改 app.py；(8) 两卡实现可并行、合入按依赖串行。
 
-| 前提 | 现状 | 缺什么 |
-|---|---|---|
-| ffmpeg 在 CI | `ci.yml` L30 的 pip 列表**不含** ffmpeg；`test_http_file_runner.py` L55 `pytestmark` 整文件 `skipif(FFMPEG is None)` | CI 上 HTTP 解码/资源证据**整体 skip = 假绿**。本卡禁改 workflows → 须主脑在 M6 前单开一张卡给 CI 装 ffmpeg |
-| 三平台 runner | 只有 `ubuntu-latest`；Windows/macOS **无 runner** | M7 的三平台真实 ASR 基线**无路径**；本 Linux 假引擎 ≠ 三平台真实 ASR |
-| 真实模型与样本 | 仓库无音频 fixture（全仓 `*.mp3/*.m4a/*.opus/*.wav` 为 0）、无模型权重 | M7 的字节/质量/资源基线**缺全部素材**；需主脑提供代表性样本与许可 |
-| 无会话裸 shell | CI 走 `python -m pytest tests/ -q` | 需补一次无 env/cwd 依赖的裸 shell 全量跑（本卡未做） |
-| systemd 单元 | `deploy/` 只有 `update.sh`/`update.ps1`/`pm2.ecosystem.config.js.example`，**无 systemd unit** | M7 部署文档的 systemd 口径无真实 unit 可核 |
-| 可复用脚本 | `tests/harness/{client,server,worker,fake_engine}.py`、`tests/verify_long_upload_keepalive.py`、`tests/test_server_e2e_baseline.py`、`sdk/capswriter_asr/http_client.py` | 够 M6 用；M7 基线脚本**不存在**，需新写 |
-
-结论：M6 在补上 ffmpeg 之前只能证明「限额与清理」，不能证明解码链；M7 的三平台/真实 ASR 基线**当前完全没有环境**，不得用本机假引擎结果顶替。生产发布需单独授权，本卡与 M4 全部增量都不部署。
-
-## 7. 关键决策与已否决方案
-
-决策：(1) 保护面只落在 `uploads.state/expires_at`、`jobs.state/terminal_at`、源文件三者，不建资源表、不建新的清理框架；(2) 容量闸在 store 层判，route 只透传，错误码沿用既有 507/429 不发明新码；(3) 清理必须是**真实周期任务**（`http_server` 监督链内），库函数只作被测对象不作证据；(4) 待处理 result 预留按 `Job 数 × 64 MiB` 保守计入 DB guard，不加配置项；(5) C1→C2→C3 串行（同改 `http_store.py`/同改测试文件），C4 可与 C2 并行。
-
-已否决：M4 前做全协议横向盘点；用结构检查/同源计数当行为主证据；单点内存计数；静默只数内存；自动 retry/重跑；清理里删未登记残留；删 jobs/results；把 16 GiB 预留改成随删除释放；为 7 天起算新增配置项；把 C4 的反向红验推迟到 M6。
-
-## 8. 主脑待决（不自行决定）
-
-1. 过期 partial 源文件是否纳入周期清理（歧义 1）。现有测试断言它存在，默认按「不删」实现。
-2. 待处理 result 预留的具体口径（歧义 4）。默认 `Job 数 × 64 MiB` 计入 2 GiB DB guard。
-3. 7 天起算是否确认为 `jobs.terminal_at`（歧义 2）。
-4. M6 之前是否单开一张卡给 CI 装 ffmpeg（§6 假绿风险）。
-5. M7 三平台 runner、真实模型与代表性样本从哪来；在此之前 M7 不得开工。
-
-## 9. 未知项（明确写未知）
-
-- `python -m pytest tests/ -q` 的准确耗时未知（本机未跑全量；主要成本在真实 ffmpeg 编码与子进程重启用例）。
-- 2 GiB / 16 GiB 阈值在真实大文件下的实际触发耗时与磁盘占用未知；T9 走阈值三点而非造 16 GiB 字节。
-- 三平台真实 ASR 的字节、质量、耗时、CPU/RSS 全部未知（本卡未做任何测量）。
+已否决：全协议横向盘点；结构检查/同源计数当行为主证据；单点内存计数；静默只数内存；自动 retry/重跑；删未登记残留；删 jobs/results；把「额度等值合法」改成 `>=` 拒收；先记释放再 unlink；为 source 可用性新增资源表或通用资源账本；用 pytest fixture/常量 grep 宣称「改坏必红已验证」；把 C1/C2 说成物理必串行；以「CI 缺 ffmpeg」为 M6 前置；以 systemd unit 缺失阻塞 M7；单开纯验收实现卡；为拿三个绿而生产部署。
