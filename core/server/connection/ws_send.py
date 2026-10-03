@@ -161,14 +161,11 @@ async def ws_send(app):
             sink = state.http_result_sink
             if sink is None:
                 raise RuntimeError('HTTP 结果持久消费者未注入')
+            # HTTP 终态唯一收尾人是结果 sink（落库→转换→释放一体完成）；
+            # 本分支只做段确认，不得再做任何终态转换——重复转换与
+            # 两套终态责任并存的旧形态由结构约束钉死。
             await sink(result)
             acknowledge_segment_result(state, key)
-            if result.error_code:
-                transition_terminal(
-                    state, key, 'FAILED', code=result.error_code
-                )
-            elif result.is_final:
-                transition_terminal(state, key, 'DONE')
             logger.debug(f"已提交 HTTP 识别结果 task={result.task_id}")
             continue
 

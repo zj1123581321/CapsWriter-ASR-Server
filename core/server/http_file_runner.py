@@ -238,6 +238,11 @@ class HttpResultSink:
             f"HTTP 文件任务结果已持久化 task={result.task_id} "
             f"tokens={len(result.tokens)} 时长={result.duration:.2f}s"
         )
+        # 成功路径补完终态收尾：落库 → 转换 → 释放运行态记录。
+        # sink 是 HTTP 终态唯一收尾人（ws_send 的 HTTP 分支不再做任何转换），
+        # 与失败路径的 runner.fail_job 同形态，R4 不变式仍只有一处实现。
+        transition_terminal(self.state, key, "DONE")
+        release_terminal_task(self.state, key)
 
     async def _fail(self, job_id: str, code: str, message: str) -> None:
         await self.runner.fail_job(job_id, code, message)
