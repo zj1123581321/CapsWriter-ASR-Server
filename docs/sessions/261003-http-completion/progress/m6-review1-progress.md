@@ -5,8 +5,8 @@
 ## 四项进度
 
 1. **代码首读与初步结论：完成。** 先读 base 版本 `qa.md`、`design.md` 和新增 E2E 测试及必要 SDK/runner/worker/WS producer 路径；未先读新版 QA/evidence。代码初步未确认 finding，详细边界见 verdict。本阶段首个 review 产物提交在前。
-2. **新版 QA/evidence 索引独立核对：进行中。** 12 组逐项映射 producer 路径、实际测试与不足；不采用作者报告或红绿结论作为证据。
-3. **运行与约束力验证：未开始。** 待执行 6 个新增用例至少 5 轮、必要旧 SDK/CLI/runner 用例、3 个最小反向变异、裸 shell 与 systemd --user 白名单环境。
+2. **新版 QA/evidence 索引独立核对：完成。** 12 组逐项核对代码与 test index，不采用作者红绿结论作证据；文件名、用例名和关键行号映射一致。发现待变异复核的 P2 弱断言：组 10 验格式/长度但不验 worker 收到的 PCM 样本内容。
+3. **运行与约束力验证：进行中。** 待执行 6 个新增用例至少 5 轮、必要旧 SDK/CLI/runner 用例、至少 3 个有效 AssertionError 反向变异；另做同长度静音 PCM 假绿探针。随后在裸 shell 与 systemd --user 白名单环境运行。
 4. **定稿与远端核验：未开始。** 待判 finding severity 与 failure-visibility，提交最终 verdict/progress，推送后读取实际远端 ref 并核验 clean。
 
 ## 现场与前置
