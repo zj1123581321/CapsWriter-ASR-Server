@@ -797,3 +797,33 @@ def test_exclude_key_removed():
         body = body[1:]
     code = "\n".join(ast.unparse(statement) for statement in body)
     assert "exclude_key" not in code, f"count_active_tasks 函数体里残留 exclude_key：{code}"
+
+
+def test_store_idempotency_before_budget_backstop():
+    """commit_upload 里幂等重放识别必须排在事务内预算兜底之前。
+
+    门禁 #3 要求「store 事务内兜底同理」。核实结论是 store 侧原本就是对的：
+    ``_check_job_admission`` 在 ``commit_upload`` 里位于幂等分支之后，只对
+    「要新建 Job」的提交生效。本测试把这个顺序钉住，免得后人把两段挪反——挪反之后，
+    预算满时重试一个已受理的 upload 就会在事务内被误拒成 too_many_jobs。
+    """
+    store = _functions(_load("http_store.py"))["commit_upload"]
+    backstop = [
+        item for item in ast.walk(store)
+        if isinstance(item, ast.Call) and _call_name(item.func) == "_check_job_admission"
+    ]
+    replay = sorted(
+        (
+            item for item in ast.walk(store)
+            if isinstance(item, ast.Call) and _call_name(item.func) == "job_record"
+        ),
+        key=lambda item: item.lineno,
+    )
+    assert len(backstop) == 1, f"commit_upload 应恰好有一处 _check_job_admission，实际 {len(backstop)}"
+    # commit_upload 里 job_record 出现两次：幂等分支那次与建完事务后返回那次；
+    # 要比顺序的是**幂等分支**那次（最早的一处）。
+    assert len(replay) >= 1, "commit_upload 里找不到幂等分支的 job_record 调用"
+    assert replay[0].lineno < backstop[0].lineno, (
+        f"幂等重放识别（行 {replay[0].lineno}）必须排在预算兜底（行 {backstop[0].lineno}）"
+        f"之前——重放不消耗新名额，不能被「名额已满」误拒"
+    )
