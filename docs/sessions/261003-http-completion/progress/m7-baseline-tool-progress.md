@@ -15,13 +15,16 @@
 - 完成 `scripts/_baseline_http_ws.py` 初版：固定 loopback、server health/模型/SHA 校验、真实 SDK 默认 WS v2 与 HTTP producer 计量、私有 JSON 输出、无自动重试和 `BASELINE_FAILED`。
 - 新增 6 个定向测试及 `tests/fixtures/http_baseline_producer.json`。两条独立红验分别抓到 SRT 未归一化、WS SDK 实际帧遗漏 `model` 字段；修复后定向测试 `6 passed`。
 - HTTP CLI 测试在真实本机 TCP 假服务前运行子进程，断言 SDK 实际 POST/PATCH/commit 请求、上传源 body、选项、重发计数、退出码、stdout 隐私和落盘 JSON 字节。假 ASR 返回与正式 Linux 模型测试严格分开。
+- 已建立早 draft PR #64；PR 保持 draft。
+- 按授权从正在运行的 Paraformer 主机只读复制四个模型/词表文件到私有 Linux cache；四个文件均与之前探测到的路径和非零字节数对应。未对来源主机启动服务、写文件或重启。
+- 卡面全量命令使用 Python 3.12.3 与 `websockets==15.0.1` 退出码 0：`452 passed, 3 skipped`，约 4 分钟。3 个 skip 全部是既有 ForceAligner/VAD 模型依赖缺失；没有 HTTP decode skip。
 
 ## 接下来
 
 1. 先写 SDK 实际请求/帧计量、隐私约束、失败状态和归一化 fixture 测试，完成两条独立红验后逐步实现。
-2. 运行卡面指定的 pytest 命令并提交工具与复现文档。
-3. 在 Linux 私有 venv/cache 中准备只读复制的模型依赖，运行隔离的 `127.0.0.1` Paraformer 实例；先合成 smoke，再用同源 77 秒素材串行测 HTTP 与 SDK WS v2。
-4. 记录真实指标、未知项和 SHA；推送后创建 draft PR，不标 ready。
+2. 已提交从空环境复现说明；补做 `websockets==latest` 的卡面全量命令。
+3. 在 Linux 私有 venv/cache 中安装 CPU Paraformer 依赖，运行隔离的 `127.0.0.1` 服务；先合成 smoke，再用 WAV 与 MP4 各自串行测 HTTP 与 SDK WS v2。
+4. 记录真实指标、未知项和 SHA；更新 draft PR，不标 ready。
 
 ## 已知限制
 
