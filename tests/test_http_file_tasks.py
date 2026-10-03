@@ -33,6 +33,7 @@ from core.server.connection.ws_recv import ws_recv  # noqa: E402
 from core.server.http_server import HttpServer  # noqa: E402
 from core.server.http_store import HttpStoreError  # noqa: E402
 from core.server.state import (  # noqa: E402
+    CounterUnavailable,
     ServerState,
     begin_task,
     count_active_tasks,
@@ -1556,3 +1557,138 @@ async def test_concurrent_mixed_admission_respects_shared_total(tmp_path):
             f"准入不是原子的：快照取值 {sorted(set(sizes))} 覆盖不了最终 "
             f"{len(http_rows)} 行落库"
         )
+
+
+async def _raw_commit(base_url: str, resume_path: Path):
+    """用恢复文件里的凭据直接 POST commit。
+
+    刻意不走 SDK 的自动续传分支：要测的是「客户端在响应丢失后对同一个 upload 重新
+    commit」这个服务端行为本身，走 SDK 会把重放藏在恢复逻辑里。
+    """
+    stored = json.loads(resume_path.read_text(encoding="utf-8"))
+    headers = {"Authorization": f"Bearer {stored['token']}"}
+    async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+        return await client.post(
+            f"{base_url}/v1/uploads/{stored['upload_id']}/commit",
+            headers=headers,
+            content=b"",
+        )
+
+
+async def _wait_until(predicate, what: str, timeout: float = 10.0):
+    """轮询一个确定会成立的条件（等事件，不是赌调度概率）。"""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"等待超时：{what}")
+
+
+@pytest.mark.asyncio
+async def test_idempotent_replay_survives_full_budget(tmp_path):
+    """预算已满时，重试一个已受理且仍 QUEUED 的 upload 必须拿回同一个 Job。
+
+    重放不新建 Job、不消耗新名额，因此不该被「HTTP 名额已满」误拒。若预算判定排在
+    幂等识别之前，这里会拿到 429，破坏 commit_upload 声明的重放幂等——而这正是响应
+    丢失后客户端显式重试的路径。
+    """
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        state = server._app.state
+        assert state.tasks == {}
+        handles = await _submit_queued_jobs(tmp_path, base_url, HTTP_BUDGET, "replay")
+        queued = _read_db(server.data_dir, "SELECT job_id FROM jobs WHERE state='QUEUED'")
+        assert len(queued) == HTTP_BUDGET, len(queued)
+
+        target = handles[0]
+        assert target.job_id in {row["job_id"] for row in queued}
+
+        response = await _raw_commit(base_url, tmp_path / "replay-0.json")
+        assert response.status_code in (200, 202), response.text
+        assert response.json()["job_id"] == target.job_id, (
+            "重放必须返回同一个 Job，而不是 429 或新建的 Job"
+        )
+        # 不新建 Job 行
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == HTTP_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_new_commit_still_budget_limited(tmp_path):
+    """与上一条对照：重放豁免不等于放行，预算满时**新** upload 仍必须 429。"""
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        await _submit_queued_jobs(tmp_path, base_url, HTTP_BUDGET, "fill")
+        await _expect_error(
+            submit_file_http(
+                _source(tmp_path, "brand-new.wav"), base_url,
+                resume_path=tmp_path / "brand-new.json", chunk_bytes=1024,
+            ),
+            "too_many_jobs",
+        )
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == HTTP_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_degrade_count_silently(tmp_path):
+    """停机与准入并发时：必须排空在途临界区，且事后只能显式失败、不得静默只数内存。
+
+    构造（不赌调度概率）：把计数来源换成卡在 ``release`` 上的桩，于是 WS 首帧准入持着
+    ``admission_lock`` 停在计数里；此时发起 ``stop()``。
+
+    * 顺序正确时：stop() 走完 runner.cleanup（``self._runner is None``）后必然卡在
+      取准入锁上——取锁是一个让出点，所以这里一定存在可观测的中间态；此时
+      ``self._worker`` 必须仍在（未拆）。
+    * 顺序错误时（旧形态）：``_runner = None`` 之后紧接着的拆 worker 全程不让出，
+      观察到的必然是「worker 已经没了」，于是断言失败。
+
+    事后必须 fail-loud：``http_active_job_counter`` 不得被置回 None（None 的含义是
+    「HTTP 从未启用」，置回 None 会让停机窗口内的准入退化为只数内存，漏掉仍在
+    SQLite 里排队的 Job，静默突破共享上限）。
+    """
+    async with running_server_with_ws(tmp_path) as (server, base_url, ws_url, state):
+        await _submit_queued_jobs(tmp_path, base_url, HTTP_BUDGET, "stop")
+        # 停机前的真值：6 个排队 Job 全在 SQLite 里，内存是空的。
+        # 若计数静默退化成只数内存，会算成 0——两者差 6，漏数是实质性的。
+        true_total = await count_active_tasks(state)
+        memory_only = len(state.tasks)
+        assert true_total == HTTP_BUDGET and memory_only == 0
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original = state.http_active_job_counter
+
+        async def blocking_counter():
+            entered.set()
+            await release.wait()          # 停在准入临界区里，持锁不放
+            return await original()
+
+        state.http_active_job_counter = blocking_counter
+        ws_task = asyncio.create_task(_ws_try_start(ws_url, "ws-stop"))
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            # 此刻 WS 首帧正在临界区里计数（持锁），尚未被受理也尚未被拒
+            assert len(state.tasks) == 0
+
+            stop_task = asyncio.create_task(server.stop())
+            # 等 stop() 走完 runner.cleanup：此后它必然正卡在准入锁上（见 docstring）
+            await _wait_until(lambda: server._runner is None, "stop() 未走完 runner.cleanup")
+            assert server._worker is not None, (
+                "stop() 在准入临界区未排空时就拆了 I/O worker——在途计数会撞上已关闭的 worker"
+            )
+        finally:
+            # 无论断言成败都放行，否则 handler 会永远卡在 release.wait() 上，
+            # 把真正的失败原因盖成 fixture 收尾的 wait_closed 超时
+            release.set()
+
+        connection, rejection = await asyncio.wait_for(ws_task, 10)
+        assert rejection is None, f"{HTTP_BUDGET} 排队 HTTP + 0 WS 时首个 WS 必须被受理：{rejection}"
+        assert len(state.tasks) == 1, "WS 已被受理，内存里应有一条非终态记录"
+        await asyncio.wait_for(stop_task, 15)
+
+        # 事后只能显式失败，绝不静默退化为纯内存口径
+        assert state.http_active_job_counter is not None, (
+            "停机后不得把计数来源置回 None：None 表示「HTTP 从未启用」，"
+            "置回 None 会让停机窗口内的准入静默只数内存、漏掉排队 Job"
+        )
+        with pytest.raises(CounterUnavailable):
+            await count_active_tasks(state)
+        await connection.close()

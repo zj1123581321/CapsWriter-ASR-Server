@@ -71,7 +71,7 @@ HTTP listener、文件 runner、I/O operation 与结果泵必须进入真实监�
 | 原文件 / PATCH 块 / 流读取 | 1 GiB / file；1 MiB / PATCH；64 KiB / read |
 | 小 JSON / 并发 handler / 同时 body | 16 KiB；16 handler；同时 body 操作 2 |
 | 未完成上传会话 | 32；已中断进度可保留，不等于只能保存 2 份上传 |
-| HTTP Job 准入 / 运行 | 共享活动总量 = 内存 `state.tasks` 中的非终态记录（WS 与运行中 HTTP）加上 SQLite `jobs` 表中 `QUEUED`+`RUNNING` 的 HTTP Job，同一 Job 两处都在时按 job_id 只数一次；总量上限是现有 `max_tasks`（默认 8），其中固定预留 2 个名额只给 WS，HTTP 准入不得把总量推过 `max_tasks - 2`（默认 6）；WS 首帧与 HTTP commit 两条准入路径在同一把共享准入锁内完成「计数 → 判定 → 登记」，登记动作不得在锁外；超限时 HTTP commit 报 429 `too_many_jobs`、WS 首帧报 `overloaded`；HTTP 主动运行 1；mic 优先不变 |
+| HTTP Job 准入 / 运行 | 共享活动总量 = 内存 `state.tasks` 中的非终态记录（WS 与运行中 HTTP）加上 SQLite `jobs` 表中 `QUEUED`+`RUNNING` 的 HTTP Job，同一 Job 两处都在时按 job_id 只数一次；总量上限是现有 `max_tasks`（默认 8），其中固定预留 2 个名额只给 WS，HTTP 准入不得把总量推过 `max_tasks - 2`（默认 6）；WS 首帧与 HTTP commit 两条准入路径在同一把共享准入锁内完成「计数 → 判定 → 登记」，登记动作不得在锁外；停机时先在锁内把 DB 侧计数来源换成显式失败的再拆 worker/存储，事后准入不得退化为只数内存；幂等重放先于预算判定（重放拿回同一 Job，不新建）；超限时 HTTP commit 报 429 `too_many_jobs`、WS 首帧报 `overloaded`；HTTP 主动运行 1；mic 优先不变 |
 | 段 / 解码器 | 每任务 4 个在途 PCM 段；HTTP 解码器 1；不落完整 PCM 文件 |
 | 无输入空闲 | 300 s，与旧 WS 起点一致；当前 PATCH 失败不因此删除 upload 进度 |
 | 未完成上传 TTL | 创建或最近成功确认 PATCH 后 7 天；GET 不延长；活跃 I/O 不误清；过期 410，元数据不自动删 |

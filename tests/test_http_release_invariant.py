@@ -26,13 +26,15 @@
 from __future__ import annotations
 
 import ast
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 
-SERVER_DIR = Path(__file__).resolve().parents[1] / "core" / "server"
-SESSION_DIR = Path(__file__).resolve().parents[1] / "docs" / "sessions" / "261001-http-files"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SERVER_DIR = REPO_ROOT / "core" / "server"
+SESSION_DIR = REPO_ROOT / "docs" / "sessions" / "261001-http-files"
 
 # 位置表：每个文件里各函数允许出现的 transition_terminal 调用数（修复后基线）。
 # 新增释放路径 = 清单失配 = CI 红；改之前必须先把该行写进主脑位置表并补对应
@@ -242,6 +244,11 @@ def test_r7_spec_single_reading():
     assert "共享准入锁" in row and "登记动作不得在锁外" in row, (
         f"R7 design 行必须写明两条准入路径共用准入锁且登记在锁内：{row}"
     )
+    assert "CounterUnavailable" not in row, (
+        "design 行只写语义（显式失败、不退化），实现细节留代码注释"
+    )
+    for required in ("停机时先在锁内", "退化为只数内存", "幂等重放先于预算判定"):
+        assert required in row, f"R7 design 行缺少要素 {required!r}：{row}"
     # 旧的歧义写法不得复活
     assert "最多 8 个 QUEUED+RUNNING" not in row, f"R7 design 行退回歧义写法：{row}"
 
@@ -249,6 +256,8 @@ def test_r7_spec_single_reading():
     assert "共享活动总量 8" in qa, "qa.md 必须与 design 同源：共享活动总量 8"
     assert "全局活动 8" not in qa, "qa.md 退回与 design 不同源的「全局活动 8」"
     assert "登记不得在锁外" in qa, "qa.md 必须与 design 同源写明登记在准入锁内"
+    for required in ("退化为只数内存", "幂等重放不受预算误拒"):
+        assert required in qa, f"qa.md 必须与 design 同源写明 {required!r}"
     assert "too_many_jobs" in qa and "overloaded" in qa, (
         "qa.md 必须写明两侧超限时的错误码口径"
     )
@@ -684,6 +693,54 @@ def test_admission_registration_inside_lock():
         assert registrations[0].lineno > counts[0].lineno, (
             f"{func_name} 临界区内必须先计数后登记"
         )
+
+
+def test_all_callers_awaited_repo_wide():
+    """全仓扫描：对 ``count_active_tasks`` 的每一个调用都必须被 ``Await`` 包裹。
+
+    背景：门禁两次报了 ``compatibility-async-counter-callers``（崩溃），主脑两次核实
+    为**不成立**（无未迁移的同步调用方）。但主审两次都合理地指出：新 AST 测试只检查
+    ws_recv.py 与 http_server.py 两个文件，不能证明「全仓没有别的调用方」。
+
+    这条把「不存在未迁移调用方」从一次性 grep 变成 CI 常驻断言：扫描仓库内**全部**
+    ``.py`` 文件，任何一处未 await 的调用即失败。
+
+    两个下界断言是判据自检：若 rglob/os.walk 的范围写坏导致扫不到文件，测试会空转
+    通过，因此必须证明「确实扫到了足够多的文件与调用点」。
+    """
+    skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache",
+                 ".mypy_cache", "site-packages", ".ruff_cache"}
+    scanned_files = 0
+    scanned_calls = 0
+    offenders = []
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            path = Path(dirpath) / filename
+            rel = path.relative_to(REPO_ROOT)
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            except SyntaxError as exc:
+                offenders.append(f"{rel}: 无法解析（{exc}）")
+                continue
+            scanned_files += 1
+            awaited = {
+                id(item.value)
+                for item in ast.walk(tree)
+                if isinstance(item, ast.Await) and isinstance(item.value, ast.Call)
+            }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and _call_name(node.func) == "count_active_tasks":
+                    scanned_calls += 1
+                    if id(node) not in awaited:
+                        offenders.append(f"{rel}:{node.lineno} 调用未被 await 包裹")
+
+    # 判据自检：先证明扫描范围本身有效，再谈「没有违规」
+    assert scanned_files >= 60, f"只扫到 {scanned_files} 个 .py 文件，扫描范围写坏了"
+    assert scanned_calls >= 8, f"只找到 {scanned_calls} 个 count_active_tasks 调用点，扫描范围写坏了"
+    assert not offenders, "存在未 await 的 count_active_tasks 调用：\n" + "\n".join(offenders)
 
 
 def test_counter_calls_are_awaited():

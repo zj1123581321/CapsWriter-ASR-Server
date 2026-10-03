@@ -429,6 +429,18 @@ class HttpStore:
         ).fetchall()
         return {row["job_id"] for row in rows}
 
+    def committed_job(self, upload_id: str, token: str) -> Optional[JobRecord]:
+        """已受理 upload 的幂等重放：返回同一个 Job；尚未受理则返回 None。
+
+        预算判定必须先问它一句：重放不消耗新名额，因此不该被「HTTP 名额已满」误拒。
+        走 ``_row_for_token``，所以 token 校验、404/410 语义与新提交完全一致，
+        不会因为提前判定而泄露 upload 是否存在。
+        """
+        row = self._row_for_token(upload_id, token)
+        if row["state"] == UPLOAD_COMMITTED and row["job_id"]:
+            return self.job_record(row["job_id"], token)
+        return None
+
     def _check_job_admission(self) -> None:
         # 事务内的 DB 侧兜底，数字与共享预算同源（见 __init__ 的 http_budget）。
         # 权威判定在 core/server/state.py 的 count_active_tasks（跨内存+DB、且在
@@ -563,15 +575,22 @@ class HttpStore:
             raise HttpStoreError("integrity_mismatch", "源文件 SHA-256 与声明不一致", status=422)
 
     def commit_upload(self, upload_id: str, token: str) -> JobRecord:
-        """核对完整 hash/length 后，在唯一事务里建立唯一 Job 并置 COMMITTED。"""
+        """核对完整 hash/length 后，在唯一事务里建立唯一 Job 并置 COMMITTED。
+
+        顺序要求：**幂等重放识别必须在预算兜底之前**。重放不新建 Job、不消耗新名额，
+        因此不能被 ``_check_job_admission`` 以「名额已满」拒掉——否则响应丢失后的
+        显式重试拿不回同一个 Job。
+        """
         row = self._row_for_token(upload_id, token)
         if row["state"] == UPLOAD_COMMITTED and row["job_id"]:
-            # 已经存在的 Job 重复 commit 必须仍返回同一 Job，不因推理协调者不可用另造
+            # 已经存在的 Job 重复 commit 必须仍返回同一 Job，不因推理协调者不可用另造，
+            # 也不因当前预算已满而另造或误拒
             return self.job_record(row["job_id"], token)
         if row["confirmed_offset"] != row["size_bytes"]:
             raise HttpStoreError("upload_incomplete", "上传尚未达到声明长度", status=409,
                                  confirmed_offset=row["confirmed_offset"])
         self._verify_source(row)
+        # 只有走到这里才是「要新建 Job」，此时才谈得上预算兜底
         self._check_job_admission()
         if not self._inference_ready():
             # 没有真实推理协调者就不受理，绝不受理后永远排队

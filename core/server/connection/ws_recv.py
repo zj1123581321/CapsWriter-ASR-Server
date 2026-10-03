@@ -17,6 +17,7 @@ import websockets
 
 from ..state import console
 from ..state import (
+    CounterUnavailable,
     begin_task,
     count_active_tasks,
     ensure_server_runtime,
@@ -566,11 +567,17 @@ async def ws_recv(websocket, app) -> None:
                 # 再先后登记，静默越过 max_tasks。拒绝路径的网络写（queue_error_and_close）
                 # 刻意放在锁外，不让一个慢客户端占着准入锁。
                 ensure_server_runtime(state)
-                async with state.admission_lock:
-                    active_count = await count_active_tasks(state)
-                    accepted = active_count < Config.max_tasks
-                    if accepted:
-                        begin_task(state, key, Config.max_inflight_segments)
+                try:
+                    async with state.admission_lock:
+                        active_count = await count_active_tasks(state)
+                        accepted = active_count < Config.max_tasks
+                        if accepted:
+                            begin_task(state, key, Config.max_inflight_segments)
+                except CounterUnavailable as exc:
+                    # 停机窗口：DB 侧计数已失效。这里绝不按内存口径放行（那会漏掉
+                    # 仍在 SQLite 里排队的 Job、静默突破共享上限），显式失败并留日志。
+                    logger.error("WS 准入被拒：共享预算的 DB 侧计数不可用（HTTP 正在停机）：%s", exc)
+                    raise
                 if not accepted:
                     await queue_error_and_close(
                         state, websocket, socket_id, msg.task_id, 'overloaded',

@@ -32,6 +32,16 @@ TERMINAL_STATUSES = frozenset({'DONE', 'FAILED'})
 WS_RESERVED_SLOTS = 2
 
 
+class CounterUnavailable(RuntimeError):
+    """共享预算的 DB 侧计数来源已失效（HTTP listener 正在停机）。
+
+    与「HTTP 从未启用」（``state.http_active_job_counter is None``，压根没有 SQLite
+    可数）是两回事。那种情况下退化为纯内存口径是正确的；本异常表示**曾经有** SQLite
+    存储、此刻正在拆，因此绝不能按内存口径放行——那会漏掉仍在 ``jobs`` 表里排队的
+    Job，把共享上限静默突破。停机窗口内的准入必须显式失败。
+    """
+
+
 def http_job_budget(max_tasks: int) -> int:
     """共享上限里 HTTP 可占的名额：max_tasks - WS_RESERVED_SLOTS。
 
@@ -90,7 +100,14 @@ async def count_active_tasks(state) -> int:
 
     DB 计数来源是 ``state.http_active_job_counter``（零参协程），由 HttpServer 注入
     并强制走受监督的单 I/O worker 线程——SQLite 连接绑定该线程，跨线程直接用会抛
-    ``sqlite3.ProgrammingError``。WS 未启用 HTTP 时为 None，此时总量退化为纯内存口径。
+    ``sqlite3.ProgrammingError``。
+
+    两种「拿不到 DB 计数」必须区分开，不得混为一谈：
+
+    * ``http_active_job_counter is None`` —— **HTTP 从未启用**，根本没有 SQLite 存储，
+      此时总量退化为纯内存口径是正确的。
+    * 计数来源在停机期间被换成会抛 ``CounterUnavailable`` 的桩 —— **正在停机**，
+      此时必须 fail-loud 上抛，绝不退化为内存口径（否则漏数排队 Job、静默放行）。
 
     exclude_key 已删除：全仓零调用方，按「不新增没有第二消费者的抽象」直接删掉，
     而不是为它补一套排除逻辑。
@@ -106,6 +123,8 @@ async def count_active_tasks(state) -> int:
         if record.status not in TERMINAL_STATUSES
     ]
     counter = state.http_active_job_counter
+    # None 只表示「HTTP 从未启用」；停机中的失效会由桩协程抛 CounterUnavailable 上抛，
+    # 不在这里捕获——静默退化成内存口径就是漏数排队 Job、静默放行。
     db_job_ids = set(await counter()) if counter is not None else set()
     # 已登记的运行中 HTTP 由内存侧计入，DB 侧不再重复计数
     registered_http = {key[2] for key in memory_keys if key[0] == 'http'}
