@@ -151,6 +151,8 @@ async def test_flac_upload_matches_transcode_and_v2_frames(fake_media_tools, tmp
         "-nostdin",
         "-i",
         str(audio_path),
+        "-map",
+        "0:a:0",
         "-ar",
         "16000",
         "-ac",
