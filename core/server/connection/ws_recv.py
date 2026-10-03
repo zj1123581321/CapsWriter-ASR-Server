@@ -560,14 +560,23 @@ async def ws_recv(websocket, app) -> None:
                 # R7：WS 准入与 HTTP commit 共用同一原语与同一总量口径
                 # （内存非终态 + DB 里 QUEUED+RUNNING 的 HTTP Job，按 job_id 去重）。
                 # 排队中的 HTTP Job 在 WS 侧同样占名额。WS 口径仍是 overloaded。
-                active_count = await count_active_tasks(state)
-                if active_count >= Config.max_tasks:
+                #
+                # 「计数 → 判定 → 登记」三步全在共享准入锁内完成。登记（begin_task）
+                # 必须在锁内：否则 N 个并发首帧可以都读到未达上限的计数、各自通过判定，
+                # 再先后登记，静默越过 max_tasks。拒绝路径的网络写（queue_error_and_close）
+                # 刻意放在锁外，不让一个慢客户端占着准入锁。
+                ensure_server_runtime(state)
+                async with state.admission_lock:
+                    active_count = await count_active_tasks(state)
+                    accepted = active_count < Config.max_tasks
+                    if accepted:
+                        begin_task(state, key, Config.max_inflight_segments)
+                if not accepted:
                     await queue_error_and_close(
                         state, websocket, socket_id, msg.task_id, 'overloaded',
                         f"服务端活动任务已达上限 {Config.max_tasks}", True,
                     )
                     return
-                begin_task(state, key, Config.max_inflight_segments)
             record = state.tasks[key]
             if msg.model is not None and msg.model != Config.model_type:
                 await _cancel_audio_cache(cache)

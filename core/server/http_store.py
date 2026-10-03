@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from core.server.segmenter import validate_segment_params
+from core.server.state import http_job_budget
 
 
 # ---- R7 资源起点（启用 HTTP 后的起始 guard，不是实测吞吐）----
@@ -40,7 +41,6 @@ MAX_JSON_BYTES = 16 * 1024                        # 16 KiB 小 JSON
 MAX_HANDLERS = 16                                 # 16 并发 handler
 MAX_BODY_CONCURRENCY = 2                          # 同时 body 操作 2
 MAX_OPEN_UPLOADS = 32                             # 32 个未完成上传会话
-MAX_HTTP_JOBS = 8                                 # 存储侧粗上限兜底，不是共享预算（见 _check_job_admission）
 IO_MAILBOX = 32                                   # I/O mailbox 32 有界操作
 SOURCE_RESERVE_BYTES = 16 * 1024 * 1024 * 1024   # 16 GiB source 声明长度总预留
 DB_GUARD_BYTES = 2 * 1024 * 1024 * 1024           # 2 GiB DB+WAL+SHM/结果整体 guard
@@ -187,8 +187,22 @@ def _acquire_exclusive_lock(lock_path: Path):
 class HttpStore:
     """上传/Job/结果的唯一持久真源。所有方法都是同步的，只能在 I/O worker 里调用。"""
 
-    def __init__(self, data_dir: Path, inference_ready: Optional[Callable[[], bool]] = None):
+    def __init__(
+        self,
+        data_dir: Path,
+        inference_ready: Optional[Callable[[], bool]] = None,
+        http_budget: Optional[int] = None,
+    ):
         self.data_dir = Path(data_dir)
+        # 事务内 DB 兜底的准入上限。与 HttpServer 的共享预算判定同源：两边都调
+        # core.server.state.http_job_budget，不会各自漂移出两个数字。
+        # 生产路径由 HttpServer 显式注入；直接构造存储（存储层单测）时按服务端
+        # 默认 max_tasks 算，避免在本模块再写死一个常量。
+        if http_budget is None:
+            from config_server import ServerConfig
+
+            http_budget = http_job_budget(ServerConfig.max_tasks)
+        self.http_budget = http_budget
         self.sources_dir = self.data_dir / "sources"
         self.db_path = self.data_dir / "http.sqlite3"
         self.lock_path = self.data_dir / "http.lock"
@@ -416,11 +430,10 @@ class HttpStore:
         return {row["job_id"] for row in rows}
 
     def _check_job_admission(self) -> None:
-        # 注意：这不是共享预算的判定，只是存储侧的粗上限兜底（恒松于
-        # max_tasks - WS_RESERVED_SLOTS，因此正常路径下不会先触发）。
-        # 真正的准入判定只有一处：core/server/state.py 的 count_active_tasks，
-        # 它跨内存 state.tasks 与本表并按 job_id 去重。
-        if len(self.active_job_ids()) >= MAX_HTTP_JOBS:
+        # 事务内的 DB 侧兜底，数字与共享预算同源（见 __init__ 的 http_budget）。
+        # 权威判定在 core/server/state.py 的 count_active_tasks（跨内存+DB、且在
+        # 共享准入锁内与登记互斥）；这里只兜住绕过内存路径的写入，两者不会打架。
+        if len(self.active_job_ids()) >= self.http_budget:
             raise HttpStoreError("too_many_jobs", "HTTP 任务准入已满", status=429)
 
     # ---------------- 对外操作 ----------------

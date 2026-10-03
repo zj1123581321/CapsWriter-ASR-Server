@@ -28,7 +28,12 @@ from typing import Callable, Optional
 
 from config_server import ServerConfig
 from core.server.http_file_runner import RunnerUnavailable
-from core.server.state import WS_RESERVED_SLOTS, count_active_tasks, ensure_server_runtime
+from core.server.state import (
+    WS_RESERVED_SLOTS,
+    count_active_tasks,
+    ensure_server_runtime,
+    http_job_budget,
+)
 from core.server.http_store import (
     IO_MAILBOX,
     MAX_BODY_CONCURRENCY,
@@ -46,14 +51,6 @@ logger = logging.getLogger("server")
 
 class HttpServerError(Exception):
     """HTTP 装配/监督失败：调用方必须以非零退出，不得吞掉。"""
-
-
-def http_job_budget(max_tasks: int) -> int:
-    """共享上限里 HTTP 可占的名额：max_tasks - WS_RESERVED_SLOTS。
-
-    预留的 WS_RESERVED_SLOTS 个名额恒定留给 WS（既有默认的实时语音入口）。
-    """
-    return max_tasks - WS_RESERVED_SLOTS
 
 
 def _import_aiohttp():
@@ -175,7 +172,13 @@ class HttpServer:
         return self
 
     def _open_store(self) -> HttpStore:
-        return HttpStore(self.data_dir, inference_ready=self._inference_ready).open()
+        # 存储侧的 DB 兜底与本 listener 的准入判定用同一个 http_job_budget，
+        # 两处不会各自漂移出两个数字。
+        return HttpStore(
+            self.data_dir,
+            inference_ready=self._inference_ready,
+            http_budget=http_job_budget(ServerConfig.max_tasks),
+        ).open()
 
     def attach_runner(self, runner) -> None:
         """装配真实文件 runner：此后 commit 才受理并立即调度。"""
@@ -467,25 +470,38 @@ class HttpServer:
     async def _commit_upload(self, request):
         token = self._token(request)
         self._reject_encoding(request)
+        length = self._content_length(request)
+        # body 读不占准入锁：它只走 aiohttp 网络 I/O，不碰 I/O worker 线程，
+        # 把它放进临界区只会让所有准入排在一个慢客户端后面。
+        await self._read_body(request, MAX_CHUNK_BYTES, length)
+        state = self._app.state
+        upload_id = request.match_info["upload_id"]
         # R7：HTTP 与 WS 共用 max_tasks 的共享总量预算，且 WS 恒定预留
         # WS_RESERVED_SLOTS 个名额。总量走唯一原语 count_active_tasks（内存
         # state.tasks 非终态 + DB 里 QUEUED+RUNNING 的 HTTP Job，按 job_id 去重），
-        # 排队中的 HTTP Job 也在其中。同一 TOCTOU 窗口，不发明新错误码。
-        if await count_active_tasks(self._app.state) >= http_job_budget(ServerConfig.max_tasks):
-            raise HttpStoreError(
-                "too_many_jobs",
-                f"HTTP 可用名额已满（共享上限 {ServerConfig.max_tasks} 扣除为 WS 预留 "
-                f"{WS_RESERVED_SLOTS} 个名额后，HTTP 最多 {http_job_budget(ServerConfig.max_tasks)} 个）",
-                status=429,
+        # 排队中的 HTTP Job 也在其中。不发明新错误码。
+        #
+        # 「计数 → 判定 → 登记」全在同一把共享准入锁内。登记（Job 落库）必须在锁内：
+        # 否则 N 个并发 commit 会同时读到未达上限的计数、全部通过判定，再依次落库，
+        # 静默越过 HTTP 名额上限。临界区内 await 的两处都只落在受监督的单 I/O
+        # worker 线程上（DB 计数与 commit_upload），而 worker 只跑同步 SQLite/文件代码，
+        # 不会回头拿这把 asyncio 锁，故不存在锁序反转或 worker 等锁的死锁。
+        ensure_server_runtime(state)
+        async with state.admission_lock:
+            if await count_active_tasks(state) >= http_job_budget(ServerConfig.max_tasks):
+                raise HttpStoreError(
+                    "too_many_jobs",
+                    f"HTTP 可用名额已满（共享上限 {ServerConfig.max_tasks} 扣除为 WS 预留 "
+                    f"{WS_RESERVED_SLOTS} 个名额后，HTTP 最多 "
+                    f"{http_job_budget(ServerConfig.max_tasks)} 个）",
+                    status=429,
+                )
+            existed = await self._worker.run(
+                lambda: self._store.conn.execute(
+                    "SELECT state FROM uploads WHERE upload_id=?", (upload_id,)
+                ).fetchone()
             )
-        length = self._content_length(request)
-        await self._read_body(request, MAX_CHUNK_BYTES, length)
-        existed = await self._worker.run(
-            lambda: self._store.conn.execute(
-                "SELECT state FROM uploads WHERE upload_id=?", (request.match_info["upload_id"],)
-            ).fetchone()
-        )
-        job = await self._worker.run(self._store.commit_upload, request.match_info["upload_id"], token)
+            job = await self._worker.run(self._store.commit_upload, upload_id, token)
         already_committed = existed is not None and existed["state"] == "COMMITTED"
         if self.file_runner is not None and not already_committed:
             # 只在首次受理时调度：重复 commit 返回同一 Job，不重投、不自动重跑

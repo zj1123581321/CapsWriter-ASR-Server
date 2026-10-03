@@ -32,6 +32,15 @@ TERMINAL_STATUSES = frozenset({'DONE', 'FAILED'})
 WS_RESERVED_SLOTS = 2
 
 
+def http_job_budget(max_tasks: int) -> int:
+    """共享上限里 HTTP 可占的名额：max_tasks - WS_RESERVED_SLOTS。
+
+    单一来源：HttpServer 的准入判定与 HttpStore 事务内的 DB 兜底都调它，
+    两处因此不会各自漂移出两个不同的数字（历史上正是 8 与 6 两个数并存）。
+    """
+    return max_tasks - WS_RESERVED_SLOTS
+
+
 def derive_owner_id(owner_kind: str, task_id: str, socket_id: str = '') -> str:
     """从真实任务字段推导归属 ID，不在状态中复制保存 owner_id。"""
     if owner_kind not in OWNER_KINDS:
@@ -64,7 +73,7 @@ def task_key_from_result(result: Result) -> TaskKey:
     return make_task_key(result.owner_kind, result.task_id, result.socket_id)
 
 
-async def count_active_tasks(state, exclude_key: TaskKey | None = None) -> int:
+async def count_active_tasks(state) -> int:
     """共享活动任务总量：WS 与 HTTP 准入判定的唯一原语。
 
     总量 = 内存 ``state.tasks`` 中的非终态记录（WS 与已登记的运行中 HTTP）
@@ -83,13 +92,18 @@ async def count_active_tasks(state, exclude_key: TaskKey | None = None) -> int:
     并强制走受监督的单 I/O worker 线程——SQLite 连接绑定该线程，跨线程直接用会抛
     ``sqlite3.ProgrammingError``。WS 未启用 HTTP 时为 None，此时总量退化为纯内存口径。
 
-    exclude_key 供调用方排除自身已占位的 key。
+    exclude_key 已删除：全仓零调用方，按「不新增没有第二消费者的抽象」直接删掉，
+    而不是为它补一套排除逻辑。
+
+    调用方必须在 ``state.admission_lock`` 内调用，并把「登记」（WS 的 ``begin_task``、
+    HTTP 的 Job 落库）放进**同一个**临界区。只锁计数不锁登记等于没锁：两个协程可以
+    都读到未达上限的计数、各自通过判定，再先后登记，静默越过 max_tasks。
     """
     ensure_server_runtime(state)
     memory_keys = [
         key
         for key, record in state.tasks.items()
-        if key != exclude_key and record.status not in TERMINAL_STATUSES
+        if record.status not in TERMINAL_STATUSES
     ]
     counter = state.http_active_job_counter
     db_job_ids = set(await counter()) if counter is not None else set()
@@ -165,6 +179,9 @@ class ServerState:
     # R7：共享预算的 DB 侧计数来源（零参协程，返回 QUEUED+RUNNING 的 job_id 集合）。
     # 由 HttpServer 注入，内部走受监督的单 I/O worker 线程；未启用 HTTP 时为 None。
     http_active_job_counter: object = None
+    # R7：共享准入锁。WS 首帧与 HTTP commit 两条准入路径共用它，把「计数 → 判定 →
+    # 登记」变成互斥的临界区。由 ensure_server_runtime 初始化。
+    admission_lock: Optional[asyncio.Lock] = None
 
 
 
@@ -247,6 +264,11 @@ def ensure_server_runtime(state) -> None:
     for name, value in defaults.items():
         if not hasattr(state, name):
             setattr(state, name, value)
+    # R7：admission_lock 是 dataclass 字段，默认值就是 None，因此不能靠上面的
+    # hasattr 分支填。asyncio.Lock 构造不绑定事件循环（3.10+ 惰性取 loop），
+    # 在同步装配期创建是安全的。
+    if getattr(state, 'admission_lock', None) is None:
+        state.admission_lock = asyncio.Lock()
 
 
 def begin_task(state, key: TaskKey, max_inflight_segments: int = 4) -> None:

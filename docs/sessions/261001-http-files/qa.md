@@ -35,8 +35,8 @@
    当前证明：未测。取消不释放未完 I/O，无自动重跑。
 
 9. **重复 final 与资源边界**  
-   待测：两次 final、旧 offset、超前 offset、不同源文件、空文件、块超限、队列/磁盘额度边界都产生明确错误，旧数据不覆写。R7 全单位：1 GiB 文件、1 MiB PATCH、64 KiB read、16 handler、2 同时 body、32 未完成上传、HTTP 运行 1、共享活动总量 8（跨内存 `state.tasks` 与 SQLite `jobs` 表的 `QUEUED`+`RUNNING`，同一 Job 只数一次；其中 2 个名额恒定预留给 WS，HTTP 最多占 6，超限时 HTTP 报 429 `too_many_jobs`、WS 报 `overloaded`）、每任务 4 段、64 MiB 结果、16 GiB source 预留、2 GiB DB+WAL+SHM、2 GiB 实际剩余。  
-   当前证明：未测物理容量；旧整数默认 WS 分段与背压仍由既有测试覆盖。
+   待测：两次 final、旧 offset、超前 offset、不同源文件、空文件、块超限、队列/磁盘额度边界都产生明确错误，旧数据不覆写。R7 全单位：1 GiB 文件、1 MiB PATCH、64 KiB read、16 handler、2 同时 body、32 未完成上传、HTTP 运行 1、共享活动总量 8（跨内存 `state.tasks` 与 SQLite `jobs` 表的 `QUEUED`+`RUNNING`，同一 Job 只数一次；其中 2 个名额恒定预留给 WS，HTTP 最多占 6，超限时 HTTP 报 429 `too_many_jobs`、WS 报 `overloaded`；WS 首帧与 HTTP commit 在同一把共享准入锁内完成「计数 → 判定 → 登记」，登记不得在锁外）、每任务 4 段、64 MiB 结果、16 GiB source 预留、2 GiB DB+WAL+SHM、2 GiB 实际剩余。  
+   当前证明：未测物理容量；旧整数默认 WS 分段与背压仍由既有测试覆盖。并发准入已由屏障测试证明：8 个并发 commit 在有锁时共享总量停在上限内、无锁时读同一份空快照导致越限。
 
 10. **解码与 PCM producer**  
     待测：真实文件解码器的 argv、输入文件和环境可核对；输出是有界 16 kHz mono f32 PCM 段，不把整文件或路径交给 worker；格式矩阵不能用缺依赖 skip 冒充通过。  

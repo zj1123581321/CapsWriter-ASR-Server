@@ -239,12 +239,16 @@ def test_r7_spec_single_reading():
     assert "只数一次" in row, f"R7 design 行必须写明同一 Job 的去重口径：{row}"
     # 预留名额必须是可核对的数字，而不是「预留几个」这种无约束措辞
     assert "预留 2 个名额" in row, f"R7 design 行必须写明 WS 预留名额数：{row}"
+    assert "共享准入锁" in row and "登记动作不得在锁外" in row, (
+        f"R7 design 行必须写明两条准入路径共用准入锁且登记在锁内：{row}"
+    )
     # 旧的歧义写法不得复活
     assert "最多 8 个 QUEUED+RUNNING" not in row, f"R7 design 行退回歧义写法：{row}"
 
     qa = (SESSION_DIR / "qa.md").read_text(encoding="utf-8")
     assert "共享活动总量 8" in qa, "qa.md 必须与 design 同源：共享活动总量 8"
     assert "全局活动 8" not in qa, "qa.md 退回与 design 不同源的「全局活动 8」"
+    assert "登记不得在锁外" in qa, "qa.md 必须与 design 同源写明登记在准入锁内"
     assert "too_many_jobs" in qa and "overloaded" in qa, (
         "qa.md 必须写明两侧超限时的错误码口径"
     )
@@ -620,3 +624,119 @@ async def test_http_double_terminal_eliminated(tmp_path, monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover - 手动调试入口
     pytest.main([__file__, "-q"])
+
+
+def _admission_lock_blocks(node: ast.AST) -> list:
+    """函数体内 ``async with <...>.admission_lock:`` 的 AsyncWith 节点。"""
+    return [
+        item
+        for item in ast.walk(node)
+        if isinstance(item, ast.AsyncWith)
+        and any(
+            ast.unparse(entry.context_expr).endswith("admission_lock")
+            for entry in item.items
+        )
+    ]
+
+
+def _calls_in(block: ast.AST, name: str) -> list:
+    """块内名字为 name 的登记点：Call（ws 的 begin_task(...)) 或 Attribute
+    （http 传进 worker 线程的 self._store.commit_upload，它是方法引用不是调用）。"""
+    found = [
+        item
+        for item in ast.walk(block)
+        if (isinstance(item, ast.Call) and _call_name(item.func) == name)
+        or (isinstance(item, ast.Attribute) and item.attr == name)
+    ]
+    return sorted(found, key=lambda item: item.lineno)
+
+
+def test_admission_registration_inside_lock():
+    """登记（WS begin_task / HTTP Job 落库）必须与计数同在共享准入锁的临界区内。
+
+    只锁计数不锁登记等于没锁：两个协程可以都读到未达上限的计数、各自通过判定，
+    再先后登记，静默越过 max_tasks。本轮门禁 finding
+    ``correctness-nonatomic-shared-admission`` 就是这个形状。
+
+    判据只钉**准入那一次**登记：ws_recv 里另有 2 处 begin_task（坏请求、任务冲突）
+    是终态失败记账，本来就不占名额，不该被算进准入临界区。
+    """
+    cases = [
+        ("connection/ws_recv.py", "ws_recv", "begin_task"),
+        ("http_server.py", "_commit_upload", "commit_upload"),
+    ]
+    for relpath, func_name, registration in cases:
+        node = _functions(_load(relpath))[func_name]
+        blocks = _admission_lock_blocks(node)
+        assert len(blocks) == 1, (
+            f"{func_name} 必须恰好有一处 async with state.admission_lock，实际 {len(blocks)}"
+        )
+        block = blocks[0]
+        counts = _calls_in(block, "count_active_tasks")
+        registrations = _calls_in(block, registration)
+        assert len(counts) == 1, (
+            f"{func_name} 的临界区内应有且仅有一处 count_active_tasks，实际 {len(counts)}"
+        )
+        assert len(registrations) == 1, (
+            f"{func_name} 的临界区内应有且仅有一处 {registration}（登记动作），"
+            f"实际 {len(registrations)}——登记必须在锁内，锁外那次等于没锁"
+        )
+        assert registrations[0].lineno > counts[0].lineno, (
+            f"{func_name} 临界区内必须先计数后登记"
+        )
+
+
+def test_counter_calls_are_awaited():
+    """两个准入点对 count_active_tasks 的调用必须被 Await 包裹。
+
+    背景：门禁曾报 ``compatibility-async-counter-callers``（崩溃），主脑核实为
+    **不成立**——全仓只有 2 个生产调用方（ws_recv.py、http_server.py），均已 await。
+    但原结构测试只断言「调用恰好一次」，没有断言「被 await」，也就是没有对住主审
+    担心的那个机制。本测试把证据固化进 CI：将来有人把调用改成同步（例如把原语退回
+    纯内存口径、不再 await DB 计数）时，这里直接失败，而不是等一个缺 REPO FACTS
+    的评审来猜。
+    """
+    for relpath, func_name in (
+        ("connection/ws_recv.py", "ws_recv"),
+        ("http_server.py", "_commit_upload"),
+    ):
+        node = _functions(_load(relpath))[func_name]
+        calls = [
+            item
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call) and _call_name(item.func) == "count_active_tasks"
+        ]
+        assert len(calls) == 1, f"{func_name} 应恰好调用 count_active_tasks 一次，实际 {len(calls)}"
+        awaited = {
+            id(item.value)
+            for item in ast.walk(node)
+            if isinstance(item, ast.Await) and isinstance(item.value, ast.Call)
+        }
+        assert id(calls[0]) in awaited, (
+            f"{func_name} 的 count_active_tasks 调用没有被 await 包裹——"
+            f"原语是 async 的，同步调用会拿到协程对象而非计数"
+        )
+
+    # 原语自身必须是 async（同步定义会让上面的 await 直接类型错误）
+    primitive = _functions(_load("state.py"))["count_active_tasks"]
+    assert isinstance(primitive, ast.AsyncFunctionDef), "count_active_tasks 必须是 async def"
+
+
+def test_exclude_key_removed():
+    """count_active_tasks 不得再带 exclude_key 参数。
+
+    该参数全仓零调用方（主脑实测），按本仓「不新增没有第二消费者的抽象」的约定，
+    正确处置是删掉而不是为它补去重逻辑。留着它等于留一条没人走、也没人验证的路。
+    """
+    primitive = _functions(_load("state.py"))["count_active_tasks"]
+    names = [arg.arg for arg in primitive.args.args]
+    assert names == ["state"], f"count_active_tasks 的参数应只剩 state，实际 {names}"
+    assert primitive.args.kwonlyargs == [] and primitive.args.vararg is None, (
+        "count_active_tasks 不得带额外参数"
+    )
+    # 只看函数体代码（docstring 是说明文字，允许提及这个名字）
+    body = primitive.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    code = "\n".join(ast.unparse(statement) for statement in body)
+    assert "exclude_key" not in code, f"count_active_tasks 函数体里残留 exclude_key：{code}"

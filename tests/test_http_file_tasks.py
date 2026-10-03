@@ -1363,3 +1363,196 @@ async def test_five_ws_plus_queued_http_refuses_http(tmp_path):
         assert await count_active_tasks(state) == 6
         for connection in accepted:
             await connection.close()
+
+
+class _BarrierCounter:
+    """包一层 DB 计数来源，用**屏障**而不是调度概率制造并发窗口。
+
+    屏障放在**读快照之后**：每个请求先把 DB 的 QUEUED+RUNNING 集合读出来，再进屏障
+    等「本批全部到齐」，到齐（或超时）后才放行去判定。
+
+    * 无锁（并发进入临界区）：本批所有请求在任何 Job 落库之前就读完快照，于是拿到
+      **同一份空快照**，全部判定通过、随后全部落库 → 静默超限。
+    * 有锁：临界区一次只进一个，第 2 个请求根本到不了这里，屏障等不到人、超时后
+      自行放行，行为退化成正常串行——每个请求都读到自己那一轮的真实快照。
+
+    屏障只在「本批全部到齐」时才真正同步；超时只是保证有锁时不会死锁，
+    判定的通过/失败不依赖超时是否发生。
+    """
+
+    def __init__(self, inner, batch: int, timeout: float = 0.5):
+        self._inner = inner
+        self._batch = batch
+        self._timeout = timeout
+        self._arrived = 0
+        self._all_here = asyncio.Event()
+        self.snapshots: list = []
+
+    async def __call__(self):
+        snapshot = set(await self._inner())
+        self.snapshots.append(snapshot)
+        self._arrived += 1
+        if self._arrived >= self._batch:
+            self._all_here.set()
+        try:
+            await asyncio.wait_for(self._all_here.wait(), self._timeout)
+        except asyncio.TimeoutError:
+            pass  # 有锁时凑不齐本批：放行本请求，串行语义不受影响
+        return snapshot
+
+
+async def _gather_commits(tmp_path: Path, base_url: str, count: int, tag: str):
+    """并发发起 count 个各自独立上传的 commit，返回 (受理数, 被拒数)。"""
+    sources = [_source(tmp_path, name=f"{tag}-{index}.wav") for index in range(count)]
+    resumes = [tmp_path / f"{tag}-{index}.json" for index in range(count)]
+
+    async def one(source: Path, resume: Path):
+        try:
+            handle = await submit_file_http(source, base_url, resume_path=resume, chunk_bytes=1024)
+        except AsrError as error:
+            assert error.code == "too_many_jobs", error.code
+            return False
+        assert handle.job_id
+        return True
+
+    return await asyncio.gather(*(one(s, r) for s, r in zip(sources, resumes)))
+
+
+class _BarrierCounter:
+    """包一层 DB 计数来源，用**屏障**而不是调度概率制造并发窗口。
+
+    屏障放在**读快照之后**：每个请求先把 DB 的 QUEUED+RUNNING 集合读出来，再进屏障
+    等「本批全部到齐」，到齐（或超时）后才放行去判定。
+
+    * 无锁（并发进入临界区）：本批所有请求都在任何 Job 落库之前读完了快照，于是拿到
+      **同一份空快照**，全部判定通过、随后全部落库 → 静默超限。
+    * 有锁：临界区一次只进一个，第 2 个请求根本到不了这里，屏障等不到人、超时后
+      自行放行，行为退化成正常串行——每个请求都读到自己那一轮的真实快照。
+
+    屏障只在「本批全部到齐」时才真正同步；超时只是保证有锁时不会死锁，
+    判定的通过/失败不依赖超时是否发生。
+    """
+
+    def __init__(self, inner, batch: int, timeout: float = 0.5):
+        self._inner = inner
+        self._batch = batch
+        self._timeout = timeout
+        self._arrived = 0
+        self._all_here = asyncio.Event()
+        self.snapshots: list = []
+
+    async def __call__(self):
+        snapshot = set(await self._inner())
+        self.snapshots.append(snapshot)
+        self._arrived += 1
+        if self._arrived >= self._batch:
+            self._all_here.set()
+        try:
+            await asyncio.wait_for(self._all_here.wait(), self._timeout)
+        except asyncio.TimeoutError:
+            pass  # 有锁时凑不齐本批：放行本请求，串行语义不受影响
+        return snapshot
+
+
+async def _gather_commits(tmp_path: Path, base_url: str, count: int, tag: str):
+    """并发发起 count 个各自独立上传的 commit，返回每个请求是否被受理。"""
+    sources = [_source(tmp_path, name=f"{tag}-{index}.wav") for index in range(count)]
+    resumes = [tmp_path / f"{tag}-{index}.json" for index in range(count)]
+
+    async def one(source: Path, resume: Path) -> bool:
+        try:
+            handle = await submit_file_http(
+                source, base_url, resume_path=resume, chunk_bytes=1024
+            )
+        except AsrError as error:
+            assert error.code == "too_many_jobs", error.code
+            return False
+        assert handle.job_id
+        return True
+
+    return await asyncio.gather(*(one(s, r) for s, r in zip(sources, resumes)))
+
+
+@pytest.mark.asyncio
+async def test_concurrent_http_commit_respects_budget(tmp_path):
+    """并发 commit 不破上限：8 个请求同时进来，HTTP 侧最多占 HTTP_BUDGET 个名额。
+
+    关键判据是**原子性**，不是行数：行数还有存储侧事务内兜底守着，即使没有准入锁也
+    可能不超（那是 429，不是越限）。真正区分有锁/无锁的是快照序列——有锁时第 k 个被
+    受理的 commit 必须已经看到前 k-1 个的占用，读到的 DB 快照依次是 0,1,2,…；
+    无锁时所有请求都在任何 Job 落库之前读完快照，于是全部读到 0、全部通过判定、
+    随后一起落库。
+
+    屏障保证「所有请求都在第一次落库之前读完快照」，因此这个差异是构造出来的，
+    不是靠调度概率撞出来的。
+    """
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        state = server._app.state
+        counter = _BarrierCounter(state.http_active_job_counter, batch=8)
+        state.http_active_job_counter = counter
+
+        accepted = await _gather_commits(tmp_path, base_url, 8, "burst")
+        # 必须在测试自己再调 count_active_tasks 之前取快照（那会多记一条）
+        sizes = sorted(len(snapshot) for snapshot in counter.snapshots)
+
+        rows = _read_db(
+            server.data_dir, "SELECT job_id FROM jobs WHERE state IN ('QUEUED','RUNNING')"
+        )
+        assert len(rows) <= HTTP_BUDGET, f"HTTP 占用 {len(rows)} 超过预算 {HTTP_BUDGET}"
+        assert accepted.count(False) >= 1, "8 个并发 commit 必须至少有一个拿到 429"
+        assert len(sizes) == 8, sizes
+        assert accepted.count(True) == HTTP_BUDGET, accepted
+        # 原子性判据：快照取值必须覆盖 0..最终行数，即每一次落库都被下一个请求的
+        # 检查看到（无锁时全部请求读到同一个 0，只有 {0} 一个取值）。
+        assert sorted(set(sizes)) == list(range(len(rows) + 1)), (
+            f"准入不是原子的：快照取值 {sorted(set(sizes))} 覆盖不了最终 {len(rows)} 行落库"
+        )
+        assert await count_active_tasks(state) == HTTP_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mixed_admission_respects_shared_total(tmp_path):
+    """3 个 WS 占着名额时，8 个并发 commit 不得把共享总量推过 max_tasks。
+
+    故意让 WS 占 3 个：HTTP 名额上限是 6，于是「存储侧兜底单独守 6」不再够用。
+    无锁时本批请求全部读到 DB 空快照（count=3 < 6 全通过判定），存储侧兜底再放进
+    6 个，共享总量变成 3 + 6 = 9，越过 max_tasks=8；有锁时 3 个请求进得去、
+    其余在共享判定处就被拒为 429（而不是被存储兜底静默降级）。
+    """
+    from core.server.state import TaskLifecycle
+
+    async with running_server_with_ws(tmp_path) as (server, base_url, _ws_url, state):
+        ws_slots = 3
+        for index in range(ws_slots):
+            state.tasks[make_task_key("ws", f"ws-task-{index}", f"socket-{index}")] = (
+                TaskLifecycle()
+            )
+        counter = _BarrierCounter(state.http_active_job_counter, batch=8)
+        state.http_active_job_counter = counter
+
+        accepted = await _gather_commits(tmp_path, base_url, 8, "mixed")
+        sizes = sorted(len(snapshot) for snapshot in counter.snapshots)
+
+        http_rows = _read_db(
+            server.data_dir, "SELECT job_id FROM jobs WHERE state IN ('QUEUED','RUNNING')"
+        )
+        assert len(http_rows) <= HTTP_BUDGET, f"HTTP 占用 {len(http_rows)} 超过预算 {HTTP_BUDGET}"
+        assert accepted.count(False) >= 1, "8 个并发 commit 必须至少有一个拿到 429"
+        assert len(sizes) == 8, sizes
+        # 共享总量是本条的主判据：WS 3 + HTTP 最多 6，但只有 WS 3 + HTTP 3 才不越过 8
+        total = await count_active_tasks(state)
+        assert total <= ServerConfig.max_tasks, (
+            f"共享总量 {total} 越过 max_tasks {ServerConfig.max_tasks}"
+            f"（WS {ws_slots} + HTTP {len(http_rows)}）"
+        )
+        # 有锁：共享判定最多放行 HTTP_BUDGET - ws_slots 个，其余当场 429。
+        # 无锁：8 个全过共享判定，多出来的被存储兜底静默降级成 429，这里会是 6。
+        assert accepted.count(True) == HTTP_BUDGET - ws_slots, (
+            f"共享判定放行了 {accepted.count(True)} 个，期望 {HTTP_BUDGET - ws_slots} 个"
+        )
+        # 原子性判据（与 test_concurrent_http_commit_respects_budget 同一口径）：
+        # 快照取值必须覆盖 0..最终行数。无锁时全部请求读到同一个 0，只有 {0}。
+        assert sorted(set(sizes)) == list(range(len(http_rows) + 1)), (
+            f"准入不是原子的：快照取值 {sorted(set(sizes))} 覆盖不了最终 "
+            f"{len(http_rows)} 行落库"
+        )
