@@ -1,0 +1,34 @@
+{
+  "fixture_id": "synthetic-eight-bytes",
+  "input_bytes_hex": "6162636465666768",
+  "producer": "sdk/capswriter_asr/http_client.py::submit_file_http",
+  "ws_v2": {
+    "producer": "sdk/capswriter_asr/client.py::_audio_frame via transcribe_file",
+    "synthetic_preencoded_bytes_hex": "00ff",
+    "frame_utf8": "{\"task_id\": \"task-fixture\", \"source\": \"file\", \"data\": \"AP8=\", \"is_final\": true, \"time_start\": 1700000000.25, \"seg_duration\": 15.0, \"seg_overlap\": 2.0, \"encoding\": \"flac\", \"samples_total\": 160, \"model\": \"paraformer\"}"
+  },
+  "requests": [
+    {
+      "method": "POST",
+      "path": "/v1/uploads",
+      "body_utf8": "{\"size_bytes\":8,\"sha256\":\"9c56cc51b374c3ba189210d5b6d4bf57790d351c96c47c02190ecf1e430635ab\",\"options\":{\"language\":null,\"context\":null,\"model\":null,\"seg_duration\":15.0,\"seg_overlap\":2.0}}"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/uploads/{upload_id}",
+      "upload_offset": "0",
+      "body_hex": "61626364"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/uploads/{upload_id}",
+      "upload_offset": "4",
+      "body_hex": "65666768"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/uploads/{upload_id}/commit",
+      "body_hex": ""
+    }
+  ]
+}
