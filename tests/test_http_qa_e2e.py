@@ -26,6 +26,7 @@ from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import numpy as np
 import pytest
 import websockets
@@ -442,3 +443,116 @@ async def test_real_sdk_upload_bytes_match_server_disk_sha(tmp_path):
         assert row["sha256"] == create_body["sha256"]
         assert row["confirmed_offset"] == len(source_bytes)
         assert handle.job_id == stored["job_id"]
+
+
+# ---------------------------------------------------------------- 组 3：丢响应后的显式恢复
+
+
+class RequestRecorder:
+    """包住 httpx 的唯一发送出口，记录每次真实请求，并可丢弃指定响应。
+
+    「丢弃」不是伪造响应：请求照样经真实 httpx 栈发到真实服务端，服务端照样真实建
+    Job 并返回 202，只是这一次响应在回到客户端之前被扔掉，SDK 自己的
+    ``httpx.TransportError → AsrError(connection_lost)`` 映射仍然原样执行。
+    """
+
+    def __init__(self, drop_commit: bool = False):
+        self.calls: list[tuple[str, str]] = []
+        self.dropped: list[dict] = []
+        self._drop_commit = drop_commit
+
+    def install(self, monkeypatch) -> "RequestRecorder":
+        recorder = self
+        original_send = httpx.AsyncClient.send
+
+        async def send(client, request, **kwargs):
+            recorder.calls.append((request.method, str(request.url)))
+            response = await original_send(client, request, **kwargs)
+            if (
+                recorder._drop_commit
+                and request.method == "POST"
+                and request.url.path.endswith("/commit")
+            ):
+                recorder.dropped.append({
+                    "status": response.status_code,
+                    "body": response.text,
+                })
+                raise httpx.RemoteProtocolError(
+                    "commit 响应在返回客户端前丢失", request=request,
+                )
+            return response
+
+        monkeypatch.setattr(httpx.AsyncClient, "send", send)
+        return self
+
+
+@pytest.mark.asyncio
+async def test_lost_commit_response_recovers_with_exactly_one_recognition(
+    tmp_path, monkeypatch
+):
+    """组 3：commit 确认真的丢失后，显式恢复拿到同一 Job，识别恰好发生 1 次。
+
+    证据分三层：客户端实际发出的请求序列（只有一次 GET 恢复，不再自动重发 commit）、
+    SQLite 里的 Job/结果行数、以及真实 ffmpeg 解码次数与识别子进程收到的段数——
+    最后一项保证「没有把同一个 Job 重新识别一遍」。
+    """
+    ffmpeg_log = install_recording_ffmpeg(tmp_path, monkeypatch)
+    source = make_container(tmp_path, "speech.mp3", seconds=20.0)
+    recovery = tmp_path / "resume.json"
+
+    async with running_runner_server(tmp_path) as harness:
+        recorder = RequestRecorder(drop_commit=True).install(monkeypatch)
+        with pytest.raises(sdk_http.AsrError) as caught:
+            await submit_file_http(
+                source, harness.base_url, resume_path=recovery, chunk_bytes=64 * 1024,
+                seg_duration=5.0, seg_overlap=1.0,
+            )
+        assert caught.value.code == "connection_lost"
+        assert len(recorder.dropped) == 1
+        assert recorder.dropped[0]["status"] == 202, recorder.dropped
+        committed_job = json.loads(recorder.dropped[0]["body"])["job_id"]
+        # 提交阶段：一次创建、若干 PATCH、一次 commit——commit 只发过一次
+        assert [method for method, _ in recorder.calls].count("POST") == 2
+        assert sum(1 for method, url in recorder.calls if url.endswith("/commit")) == 1
+
+        partial = json.loads(recovery.read_text(encoding="utf-8"))
+        assert partial["job_id"] is None, "客户端没拿到确认就不许假装自己知道 job_id"
+        assert partial["confirmed_offset"] == source.stat().st_size
+        upload_id = partial["upload_id"]
+
+        # 服务端确实已经建了 Job（响应是在网络里丢的，不是在服务端丢的）
+        rows = harness.read_db(
+            "SELECT job_id, state FROM jobs WHERE job_id=?", (committed_job,)
+        )
+        assert len(rows) == 1, rows
+
+        # ---- 显式恢复：客户端只发一次 GET，从 COMMITTED 找回同一 Job ---------
+        before_resume = len(recorder.calls)
+        handle = await resume_file_http(source, harness.base_url, resume_path=recovery)
+        resumed_calls = recorder.calls[before_resume:]
+        assert [method for method, _ in resumed_calls] == ["GET"], resumed_calls
+        assert resumed_calls[0][1].endswith(f"/v1/uploads/{upload_id}"), resumed_calls
+        assert handle.job_id == committed_job
+        assert handle.upload_id == upload_id
+        assert json.loads(recovery.read_text(encoding="utf-8"))["job_id"] == committed_job
+
+        status = await wait_terminal(harness, recovery)
+        assert status.state == "DONE", status
+        transcript = await get_file_result_http(harness.base_url, resume_path=recovery)
+        assert transcript.raw["task_id"] == committed_job
+
+        # ---- 识别次数：一次解码、一次 Job、每个段只被识别一次 ----------------
+        assert len(read_ffmpeg_starts(ffmpeg_log)) == 1, read_ffmpeg_starts(ffmpeg_log)
+        assert harness.read_db("SELECT COUNT(*) AS n FROM jobs")[0]["n"] == 1
+        assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 1
+        tasks = harness.tasks(committed_job)
+        assert len(tasks) >= 2, tasks
+        assert len(harness.calls) == len(tasks), (harness.calls, tasks)
+        assert sum(1 for item in tasks if item["is_final"]) == 1
+        finals = [item for item in harness.results(committed_job) if item["is_final"]]
+        assert len(finals) == 1, harness.results(committed_job)
+        assert transcript.raw["text"] == finals[0]["text"]
+        # 恢复之后客户端一次都没有再发 PATCH 或 commit（后面的请求全是状态轮询）
+        after_resume = [method for method, _ in recorder.calls[before_resume + 1:]]
+        assert after_resume, "恢复之后至少应有状态轮询请求"
+        assert set(after_resume) == {"GET"}, after_resume
