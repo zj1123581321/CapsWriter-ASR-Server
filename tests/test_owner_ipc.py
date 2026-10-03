@@ -19,6 +19,8 @@ from core.server.state import (
     begin_task,
     make_task_key,
     register_http_job,
+    release_terminal_task,
+    transition_terminal,
 )
 from core.server.connection.ws_send import ws_send
 from core.server.worker.task_handler import TaskHandler
@@ -205,6 +207,11 @@ async def test_parent_dispatcher_injects_http_sink_without_fake_socket():
 
     async def sink(result):
         received.append(result)
+        # 镜像真实 HttpResultSink 的终态责任：落库由存储层完成、这里由替身
+        # 直接补内存终态（落库→转换→释放一体）。ws_send 的 HTTP 分支不再
+        # 做任何转换——终态唯一收尾人是 sink。
+        transition_terminal(state, key, "DONE")
+        release_terminal_task(state, key)
 
     state.http_result_sink = sink
     state.queue_out.put(Result(
@@ -223,4 +230,6 @@ async def test_parent_dispatcher_injects_http_sink_without_fake_socket():
     assert received[0].owner_kind == "http"
     assert received[0].socket_id == ""
     assert state.active_http_jobs == []
-    assert state.tasks[key].status == "DONE"
+    # sink 收尾后运行态记录已按终态释放（与生产断言 state.tasks == {} 同口径）；
+    # 终态事实由 transition_terminal 完成、release_terminal_task 弹出记录
+    assert key not in state.tasks
