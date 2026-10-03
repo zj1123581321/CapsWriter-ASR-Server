@@ -87,7 +87,7 @@ HTTP 用例未 skip。定向生命周期与 worker 竞态各重复 5 轮，共�
 
 worker 竞态单测内部又各跑 5 个 append/commit/record_result 屏障交错；pending future 达 2 时 cleanup 已入单 worker 队列，释放 writer 后再删源并检查 offset/结果。`test_shutdown_waits_for_inflight_cleanup_io` 检查实际 worker pending 集合、closed 状态和 fatal；权限失败测试检查 serve 抛出的异常、worker 收尾、源与数据库行。
 
-- base 红验：通过 `/home/zlx/projects/personal/agent-config/scripts/git/scratch-worktree.sh <repo> f882cd63... -- /tmp/http-m4-c2-red-run.sh` 在固定 base 临时树拷入完整新测试文件，只增加一个实际周期 producer 断言；先由注入脚本确认测试名/断言都已写入，再执行目标用例。旧 base 的 HTTP listener 启动后，eligible DONE 源仍在，pytest 以目标 `AssertionError` 失败（不是 ImportError/AttributeError）：
+- base 红验：通过 `本机 agent-config 中的 scripts/git/scratch-worktree.sh <repo> f882cd63... -- /tmp/http-m4-c2-red-run.sh` 在固定 base 临时树拷入完整新测试文件，只增加一个实际周期 producer 断言；先由注入脚本确认测试名/断言都已写入，再执行目标用例。旧 base 的 HTTP listener 启动后，eligible DONE 源仍在，pytest 以目标 `AssertionError` 失败（不是 ImportError/AttributeError）：
 
 ```text
 confirmed copied test and injected eligible-source assertion in tests/test_http_cleanup.py
@@ -125,7 +125,7 @@ review-discipline 全文已读；H0 固定、OCR wrapper 固定 SHA、完整 5 �
 
 ### 偏差
 
-生产实现/测试均未修改。严格审查了卡面要求的代码与测试；自述文件、C1 存档 verdict、其他协议均未作正确性依据。独立 stop 重入探针为隔离 App/HTTP 服务，不等同部署主机上的 systemd 实测。生产历史 DB 最大行数未量取，所以性能量级保持未知。pickup memory 探针退出 2，原文为：`memory 巡检报告不可用：memory_dir_mismatch（/home/zlx/.local/state/memory-doctor/latest.json）`；欠账探针为 `summary: orphan 0 owned 0 unattributable 0 too-new 0 recent-7d 0 stale-over-7d 0 missing_ledger_repos 0`。
+生产实现/测试均未修改。严格审查了卡面要求的代码与测试；自述文件、C1 存档 verdict、其他协议均未作正确性依据。独立 stop 重入探针为隔离 App/HTTP 服务，不等同部署主机上的 systemd 实测。生产历史 DB 最大行数未量取，所以性能量级保持未知。pickup memory 探针退出 2，原文为：`memory 巡检报告不可用：memory_dir_mismatch（本机 memory-doctor 状态文件）`；欠账探针为 `summary: orphan 0 owned 0 unattributable 0 too-new 0 recent-7d 0 stale-over-7d 0 missing_ledger_repos 0`。
 
 ### 最贵的一步
 
@@ -135,4 +135,4 @@ OCR 主腿从 start 到完成 553.789 秒；整文件测试约 1.77 秒，两个
 
 按卡面只提交本 verdict 与进度文件、push 当前 review 分支，并从远端核验 tip 与本地 clean status；不创建 review PR，不改 ready/merge/deploy 状态。
 
-机读判据由 `/home/zlx/projects/personal/agent-config/scripts/review/extract-failure-visibility.sh` 对本文件提取，实际 stdout 为 `p2-only`。仓库内相对路径 `scripts/review/extract-failure-visibility.sh` 不存在，已在 agent-config 中按文件名检索并调用其绝对路径；判据未靠人读文本推断。
+机读判据由 `本机 agent-config 中的 scripts/review/extract-failure-visibility.sh` 对本文件提取，实际 stdout 为 `p2-only`。仓库内相对路径 `scripts/review/extract-failure-visibility.sh` 不存在，已在 agent-config 中按文件名检索并调用本机脚本路径；判据未靠人读文本推断。
