@@ -20,13 +20,14 @@
 - 卡面全量命令使用 Python 3.12.3 与 `websockets==15.0.1` 退出码 0：`452 passed, 3 skipped`，约 4 分钟。3 个 skip 全部是既有 ForceAligner/VAD 模型依赖缺失；没有 HTTP decode skip。
 - 同一全量命令将 websockets 约束改为未 pin，实际解析 `17.2`，退出码 0：`452 passed, 3 skipped`，约 3 分 46 秒；skip 与 15.0.1 完全相同，没有 HTTP decode skip。
 - Linux 独立服务 venv 已按 `requirements-server-linux.txt` 安装并通过 `uv pip check`；Python 3.12.3、sherpa-onnx 1.13.8、ONNX Runtime 1.30.0，`CPUExecutionProvider` 可用。基线 SHA 的 detached server worktree 已建立，模型目录软链只存在于该隔离树且未进入主分支。
+- 隔离服务固定在完整 SHA `820c3a2ee4fccc1b44187bd99c40cf99c16e1ca2` 并只监听 loopback；health 的模型、协议版本、worker 状态和短 SHA 前缀与预期匹配。先后完成 3 秒无语音 WAV 的 WS v2/HTTP smoke，再逐个完成 77.184 秒 WAV 与 MP4 的 WS v2/HTTP 测量；4 项均以 `DONE` 结束，详细匿名数字见 `docs/sessions/261003-http-completion/m7-linux-baseline-evidence.md`。
+- WAV：WS v2 1,972,515 JSON UTF-8 字节、HTTP 2,469,966 PATCH body 字节；MP4：WS v2 3,619,954 JSON UTF-8 字节、HTTP 18,974,961 PATCH body 字节。HTTP 重复 body 均为 0。各协议耗时、DONE/token/timestamp 与未核实参考稿差异均已落匿名 evidence；完整正文、路径、音频哈希、字幕和模型响应只留私有目录。
 
-## 接下来
+## 收尾状态
 
-1. 先写 SDK 实际请求/帧计量、隐私约束、失败状态和归一化 fixture 测试，完成两条独立红验后逐步实现。
-2. 已提交从空环境复现说明；15.0.1 与当前最新 17.2 的全量命令均通过。
-3. 运行隔离的 `127.0.0.1` 服务；先合成 smoke，再用 WAV 与 MP4 各自串行测 HTTP 与 SDK WS v2。
-4. 记录真实指标、未知项和 SHA；更新 draft PR，不标 ready。
+- 工具、测试、复现指南、匿名 Linux 实测 evidence 与阶段进度均已落盘；15.0.1 与最新 17.2 全量测试均通过（各 `452 passed, 3 skipped`）。
+- Linux 首测全部完成，服务版本与工作目录 SHA 已核对，字幕保持 `unverified`。本次隔离服务已通过自有监控器停止，退出码 0 且无服务进程残留；私有模型、素材与识别结果不进入仓库。
+- PR #64 的正文已补上匿名实测证据，保持 open draft；本卡不执行 ready、merge 或 deploy。下一步由 Pi 主脑独立 review，后续三平台正式基线另按最终 merged SHA 执行。
 
 ## 已知限制
 
