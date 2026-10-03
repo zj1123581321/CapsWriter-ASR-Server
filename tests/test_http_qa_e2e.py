@@ -19,6 +19,8 @@ import asyncio
 import base64
 import functools
 import json
+import shutil
+import subprocess
 import sys
 from hashlib import sha256
 from pathlib import Path
@@ -31,17 +33,29 @@ import websockets
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "sdk"))
 
-from capswriter_asr import AsrError, get_file_result_http, submit_file_http  # noqa: E402
+from capswriter_asr import (  # noqa: E402
+    get_file_job_http,
+    get_file_result_http,
+    resume_file_http,
+    submit_file_http,
+)
+from capswriter_asr import http_client as sdk_http  # noqa: E402
 
 from core.protocol import AudioMessage  # noqa: E402
 from core.server.connection.ws_recv import ws_recv  # noqa: E402
 from tests.test_http_file_runner import (  # noqa: E402
     FAKE_ENGINE,
+    decoded_sample_count,
+    install_recording_ffmpeg,
     make_container,
+    raw_get,
+    read_ffmpeg_starts,
     running_runner_server,
     submit,
     wait_terminal,
 )
+
+FFMPEG = shutil.which("ffmpeg")
 
 pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 入口默认关闭")
 
@@ -255,3 +269,176 @@ async def test_real_ws_and_http_share_one_worker_without_key_pollution(tmp_path)
             await asyncio.wait_for(ws_server.wait_closed(), timeout=5)
 
 
+
+
+# ---------------------------------------------------------------- 组 1：真实线缆字节
+
+
+class RecordingProxy:
+    """端口转发代理：真实客户端字节转发给真实服务端，同时逐字节记录两个方向。
+
+    记录的是 TCP 上真实流过的字节，不是 SDK 内部函数的入参，因此「请求体是源文件
+    原字节」这条断言覆盖的是真正的发布边界。
+    """
+
+    def __init__(self, target_port: int):
+        self.target_port = target_port
+        self.client_chunks: list[bytes] = []
+        self.server_chunks: list[bytes] = []
+        self._server: asyncio.AbstractServer | None = None
+
+    async def start(self) -> "RecordingProxy":
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        return self
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.sockets[0].getsockname()[1]}"
+
+    async def _handle(self, reader, writer):
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_connection(
+                "127.0.0.1", self.target_port
+            )
+        except OSError:
+            writer.close()
+            return
+
+        async def pump(source, sink, record):
+            try:
+                while chunk := await source.read(65536):
+                    record.append(chunk)
+                    sink.write(chunk)
+                    await sink.drain()
+            except (OSError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                try:
+                    sink.write_eof()
+                except (OSError, RuntimeError):
+                    pass
+
+        try:
+            await asyncio.gather(
+                pump(reader, upstream_writer, self.client_chunks),
+                pump(upstream_reader, writer, self.server_chunks),
+            )
+        finally:
+            for handle in (writer, upstream_writer):
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+    async def stop(self) -> None:
+        self._server.close()
+        await asyncio.wait_for(self._server.wait_closed(), timeout=5)
+
+    def client_bytes(self) -> bytes:
+        return b"".join(self.client_chunks)
+
+    def server_bytes(self) -> bytes:
+        return b"".join(self.server_chunks)
+
+    def requests(self) -> list[dict]:
+        """按 HTTP/1.1 报文解析客户端方向；收不全的尾部不算一次请求。"""
+        stream = self.client_bytes()
+        parsed: list[dict] = []
+        offset = 0
+        while True:
+            head_end = stream.find(b"\r\n\r\n", offset)
+            if head_end < 0:
+                return parsed
+            lines = stream[offset:head_end].decode("latin-1").split("\r\n")
+            method, target, _version = lines[0].split(" ", 2)
+            headers = {}
+            for line in lines[1:]:
+                name, _, value = line.partition(":")
+                headers[name.strip().lower()] = value.strip()
+            length = int(headers.get("content-length", "0"))
+            body_start = head_end + 4
+            if len(stream) < body_start + length:
+                return parsed
+            parsed.append({
+                "method": method,
+                "target": target,
+                "headers": headers,
+                "body": stream[body_start:body_start + length],
+            })
+            offset = body_start + length
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_upload_bytes_match_server_disk_sha(tmp_path):
+    """组 1：真实 SDK 的线缆字节与服务端写盘的长度/SHA 一致。
+
+    上传请求体必须是源文件原字节的顺序切片：不是 JSON、不是 Base64、不是 multipart，
+    也没有 Content-Encoding；创建请求只是小 JSON，且远小于源文件本身。
+    """
+    source = make_container(tmp_path, "speech.mp3", seconds=30.0)
+    source_bytes = source.read_bytes()
+    assert len(source_bytes) > 4096, "对照样本必须明显大于创建 JSON，否则「整文件未入 JSON」无约束力"
+    recovery = tmp_path / "resume.json"
+
+    async with running_runner_server(tmp_path) as harness:
+        proxy = await RecordingProxy(harness.port).start()
+        handle = await submit_file_http(
+            source, proxy.url, resume_path=recovery, chunk_bytes=64 * 1024,
+            seg_duration=5.0, seg_overlap=1.0,
+        )
+        # 轮询也走同一代理：恢复文件绑定的就是这条客户端看到的地址
+        deadline = asyncio.get_running_loop().time() + 60
+        while True:
+            status = await get_file_job_http(proxy.url, resume_path=recovery)
+            if status.state in {"DONE", "FAILED"}:
+                break
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError(f"任务未在期限内到达终态，最后状态={status}")
+            await asyncio.sleep(0.02)
+        await proxy.stop()
+        assert status.state == "DONE", status
+
+        requests = proxy.requests()
+        creates = [item for item in requests if item["method"] == "POST" and item["target"] == "/v1/uploads"]
+        patches = [item for item in requests if item["method"] == "PATCH"]
+        commits = [item for item in requests if item["target"].endswith("/commit")]
+        assert len(creates) == 1, [item["target"] for item in requests]
+        assert len(commits) == 1, [item["target"] for item in requests]
+        assert patches, "没有任何 PATCH 请求，线缆字节证据缺失"
+
+        # PATCH 体是源文件原字节的顺序切片，且 Content-Length 与实际体长一致
+        assert b"".join(item["body"] for item in patches) == source_bytes
+        for item in patches:
+            assert item["headers"]["content-type"] == "application/octet-stream"
+            assert int(item["headers"]["content-length"]) == len(item["body"])
+            assert "content-encoding" not in item["headers"]
+        running = 0
+        for item in patches:
+            assert running == int(item["headers"]["upload-offset"])
+            assert item["body"] == source_bytes[running:running + len(item["body"])]
+            running += len(item["body"])
+        assert running == len(source_bytes)
+
+        # 整份文件没有以 JSON / Base64 / multipart 的形式出现
+        assert b"multipart/form-data" not in proxy.client_bytes()
+        assert b"content-encoding" not in proxy.client_bytes().lower()
+        assert base64.b64encode(source_bytes) not in proxy.client_bytes()
+        create_body = json.loads(creates[0]["body"])
+        assert create_body["size_bytes"] == len(source_bytes)
+        assert create_body["sha256"] == sha256(source_bytes).hexdigest()
+        assert len(creates[0]["body"]) < 1024, "创建请求必须是小 JSON，不能夹带文件内容"
+
+        # 服务端写盘：长度、SHA、逐字节都等于源文件
+        stored = json.loads(recovery.read_text(encoding="utf-8"))
+        written = harness.data_dir / "sources" / f"{stored['upload_id']}.bin"
+        assert written.stat().st_size == len(source_bytes)
+        assert written.read_bytes() == source_bytes
+        assert sha256(written.read_bytes()).hexdigest() == create_body["sha256"]
+        row = harness.read_db(
+            "SELECT size_bytes, sha256, confirmed_offset FROM uploads WHERE upload_id=?",
+            (stored["upload_id"],),
+        )[0]
+        assert row["size_bytes"] == len(source_bytes)
+        assert row["sha256"] == create_body["sha256"]
+        assert row["confirmed_offset"] == len(source_bytes)
+        assert handle.job_id == stored["job_id"]
