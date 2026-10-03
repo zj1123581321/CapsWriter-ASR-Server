@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,19 +25,43 @@ print("OK:" + json.dumps(None if settings is None else [settings[0], settings[1]
 '''
 
 
+def _dependency_paths() -> list[str]:
+    """当前解释器可见的第三方依赖目录：排除标准库与仓库根。
+
+    子进程的 HOME 指向 pytest 的 tmp_path，用户 site-packages 因此不可见；
+    依赖必须由这里显式带过去，否则 user site 布局下探针连 websockets 都导不进。
+    """
+    stdlib = Path(sysconfig.get_path("stdlib")).resolve()
+    paths = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        candidate = Path(entry).resolve()
+        if candidate == REPO_ROOT or candidate.is_relative_to(stdlib) or not candidate.is_dir():
+            continue
+        paths.append(str(candidate))
+    return paths
+
+
+def _probe_env(tmp_path: Path, **env_overrides) -> dict[str, str]:
+    """裸环境：只带 PATH/HOME/LANG/PYTHONPATH 与显式覆盖项，不继承父进程其它变量。"""
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "PYTHONPATH": os.pathsep.join([str(REPO_ROOT), *_dependency_paths()]),
+        "LANG": "C.UTF-8",
+    }
+    env.update(env_overrides)
+    return env
+
+
 def _probe(tmp_path: Path, **env_overrides) -> subprocess.CompletedProcess:
     """在无 PI/DELEGATE 身份的裸环境里真实导入 config_server 并解析启用配置。"""
     script = tmp_path / "probe_config.py"
     script.write_text(PROBE.format(repo=str(REPO_ROOT)), encoding="utf-8")
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(tmp_path),
-        "PYTHONPATH": str(REPO_ROOT),
-        "LANG": "C.UTF-8",
-    }
-    env.update(env_overrides)
     return subprocess.run(
-        [sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=60,
+        [sys.executable, str(script)], capture_output=True, text=True,
+        env=_probe_env(tmp_path, **env_overrides), timeout=60,
         stdin=subprocess.DEVNULL,
     )
 
@@ -102,15 +127,9 @@ print("IDLE:" + json.dumps({{
 def _idle_probe(tmp_path: Path, **env_overrides) -> subprocess.CompletedProcess:
     script = tmp_path / "probe_idle.py"
     script.write_text(IDLE_PROBE.format(repo=str(REPO_ROOT)), encoding="utf-8")
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(tmp_path),
-        "PYTHONPATH": str(REPO_ROOT),
-        "LANG": "C.UTF-8",
-    }
-    env.update(env_overrides)
     return subprocess.run(
-        [sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=60,
+        [sys.executable, str(script)], capture_output=True, text=True,
+        env=_probe_env(tmp_path, **env_overrides), timeout=60,
         stdin=subprocess.DEVNULL,
     )
 
@@ -127,3 +146,51 @@ def test_upload_idle_default_300_reaches_http_reader(tmp_path):
     payload = json.loads(override.stdout.strip().split("IDLE:", 1)[1])
     assert payload["config"] == 12
     assert payload["reader"] == 12
+
+
+ENV_PROBE = '''\
+import json, os, sys
+import config_server
+import websockets
+print("ENV:" + json.dumps({
+    "argv": sys.argv,
+    "executable": sys.executable,
+    "cwd": os.getcwd(),
+    "home": os.environ.get("HOME"),
+    "pythonpath": os.environ.get("PYTHONPATH", ""),
+    "config_server": config_server.__file__,
+    "websockets": websockets.__file__,
+    "env_keys": sorted(os.environ),
+}))
+'''
+
+
+def test_subprocess_consumes_constructed_env_and_argv(tmp_path, monkeypatch):
+    """真实子进程核对 argv/解释器/HOME/PYTHONPATH/依赖来源，且不继承 PI/DELEGATE/CW 变量。"""
+    for name in ("PI_DELEGATE_DISPATCH_ID", "DELEGATE_DISPATCH_ID", "PI_SESSION_ID",
+                 "CW_PORT", "CW_HTTP_PORT", "CW_HTTP_DATA_DIR"):
+        monkeypatch.setenv(name, "leaked-value")
+    script = tmp_path / "probe_env.py"
+    script.write_text(ENV_PROBE, encoding="utf-8")
+    env = _probe_env(tmp_path)
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=60,
+        stdin=subprocess.DEVNULL, cwd=str(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().split("ENV:", 1)[1])
+
+    # argv 与解释器：探针真的由本进程的解释器和脚本路径拉起
+    assert payload["argv"] == [str(script)]
+    assert payload["executable"] == sys.executable
+    assert payload["cwd"] == str(tmp_path)
+    assert payload["home"] == str(tmp_path)
+    # 依赖可见性：仓库真的被子进程 import 到；websockets 必须解析到与父进程
+    # 同一个文件（hosted runner 把依赖装在 stdlib 树内的 site-packages，
+    # 不能断言它落在被排除标准库之后的 _dependency_paths 里）
+    assert payload["pythonpath"].split(os.pathsep) == [str(REPO_ROOT), *_dependency_paths()]
+    assert Path(payload["config_server"]).is_relative_to(REPO_ROOT)
+    import websockets
+    assert Path(payload["websockets"]).resolve() == Path(websockets.__file__).resolve()
+    # 裸环境：父进程的 PI/DELEGATE/CW 变量一个都没漏进来
+    assert payload["env_keys"] == ["HOME", "LANG", "PATH", "PYTHONPATH"]
