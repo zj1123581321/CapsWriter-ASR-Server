@@ -22,7 +22,7 @@
 - 两次 skip 身份完全一致：`tests/test_aligner_integration.py` ForceAligner backend/model 两项；`tests/test_segmenter.py` 缺 Silero-VAD 模型或 onnxruntime 一项。pytest 未报告 HTTP runner/HTTP decode skip，HTTP tests 均收集执行。
 - 149 warnings 是既有 multiprocessing fork 与 websockets `ConnectionClosed.code/reason` deprecation warnings；无测试失败。
 - 派发基线不可用（baseline lookup: `gh api request failed`），继承红未能判定；本卡两次全量均无新红。
-- C2 分支已推送。PR #62 open/draft，base 是 C1 PR #60 的分支，5 files changed，944 additions/4 deletions。PR #60 仍 open/draft 时不将 #62 标 ready、不合并。
+- C2 分支已推送。PR #62 open/draft，base 是 C1 PR #60 的分支，5 files changed，955 additions/4 deletions。PR #60 仍 open/draft 时不将 #62 标 ready、不合并。
 
 ## 仍待验证
 
