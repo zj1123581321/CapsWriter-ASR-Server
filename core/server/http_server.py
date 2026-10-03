@@ -28,6 +28,7 @@ from typing import Callable, Optional
 
 from config_server import ServerConfig
 from core.server.http_file_runner import RunnerUnavailable
+from core.server.state import count_active_tasks
 from core.server.http_store import (
     IO_MAILBOX,
     MAX_BODY_CONCURRENCY,
@@ -444,18 +445,14 @@ class HttpServer:
     async def _commit_upload(self, request):
         token = self._token(request)
         self._reject_encoding(request)
-        # R7：HTTP 准入与 WS 共用 max_tasks 的总量预算。计数以内存实际活动任务
-        # 为准（与 ws_recv 的 overloaded 判定同一份 state.tasks，活动 = 非终态）；
+        # R7：HTTP 准入与 WS 共用 max_tasks 的总量预算。计数走唯一原语
+        # count_active_tasks（活动 = state.tasks 非终态，HTTP 与 WS 一并计入）；
         # HTTP 自己的表内计数由 store._check_job_admission 在事务里兜底。
         # 与 WS 判定同为内存侧建议性计数（TOCTOU 窗口相同），不发明新错误码。
-        ws_active = sum(
-            1 for key, record in self._app.state.tasks.items()
-            if key[0] == "ws" and record.status not in {"DONE", "FAILED"}
-        )
-        if ws_active >= ServerConfig.max_tasks:
+        if count_active_tasks(self._app.state) >= ServerConfig.max_tasks:
             raise HttpStoreError(
                 "too_many_jobs",
-                f"服务端活动任务已达共享上限 {ServerConfig.max_tasks}（WS 占用）",
+                f"服务端活动任务已达共享上限 {ServerConfig.max_tasks}",
                 status=429,
             )
         length = self._content_length(request)

@@ -57,8 +57,9 @@ HTTP 客户端 -> 受限落盘/续传确认 -> commit 受理出唯一 Job
 失败任务在 result 接口上带出已存 `error_code`。runner 不可用时 commit 明确 503，不受理后永远排队；
 任一段解码、提交或结果失败即整 Job FAILED（先可靠提交，再停止后续段），迟到结果不覆盖终态。
 HTTP 同时只运行 1 个 Job，未拿到闸门的保持 QUEUED，不解码也不占在途段；
-受理侧与 WS 共用 `max_tasks` 的总量预算（commit 前按内存活动任务计数，WS 占满即
-429 `too_many_jobs`，HTTP 自己的表内计数在事务里兜底）。FAILED 的可靠提交在所有调用方
+受理侧与 WS 共用 `max_tasks` 的总量预算（commit 前按 `count_active_tasks` 计
+内存非终态记录，HTTP 与 WS 一并计入，满则 429 `too_many_jobs`；HTTP 自己的表内
+计数在事务里兜底）。FAILED 的可靠提交在所有调用方
 （runner 自身、结果 sink、finalize）都有同一条 `wait_for` 有界期限：落库未成功时不释放
 owner/闸门，记“持久失败事实未落库”并按监督路径一致语义非零退出，由重启收敛兜底。
 推理段超时发生在父进程监控协程时，会先可靠写入 `FAILED[inference_timeout]` 再让进程非零退出；

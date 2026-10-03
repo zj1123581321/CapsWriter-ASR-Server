@@ -18,6 +18,7 @@ import websockets
 from ..state import console
 from ..state import (
     begin_task,
+    count_active_tasks,
     ensure_server_runtime,
     make_task_key,
     register_segment_submission,
@@ -556,10 +557,7 @@ async def ws_recv(websocket, app) -> None:
                 return
 
             if active is None:
-                active_count = sum(
-                    item.status not in {'DONE', 'FAILED'}
-                    for item in state.tasks.values()
-                )
+                active_count = count_active_tasks(state)
                 if active_count >= Config.max_tasks:
                     await queue_error_and_close(
                         state, websocket, socket_id, msg.task_id, 'overloaded',

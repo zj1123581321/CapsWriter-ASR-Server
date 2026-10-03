@@ -57,6 +57,19 @@ def task_key_from_result(result: Result) -> TaskKey:
     return make_task_key(result.owner_kind, result.task_id, result.socket_id)
 
 
+def count_active_tasks(state, exclude_key: TaskKey | None = None) -> int:
+    """活动任务总量：state.tasks 中非终态记录，HTTP 与 WS 一并计入。
+
+    准入判定的唯一原语。exclude_key 供调用方排除自身已占位的 key。
+    """
+    ensure_server_runtime(state)
+    return sum(
+        1
+        for key, record in state.tasks.items()
+        if key != exclude_key and record.status not in {"DONE", "FAILED"}
+    )
+
+
 @dataclass
 class TaskLifecycle:
     status: str = 'RECEIVING'
