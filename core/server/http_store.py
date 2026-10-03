@@ -773,13 +773,19 @@ class HttpStore:
     def cleanup_terminal_sources(
         self, active_job_ids, now: Optional[float] = None
     ) -> None:
-        """只 unlink 已登记、到期且没有 runner 引用的 DONE/FAILED 源文件。
+        """持久化逾期上传终态，并 unlink 到期且没有 runner 引用的 Job 源文件。
 
         Job 状态和 terminal_at 是唯一年龄依据；任务、结果与上传元数据始终保留。
+        未完成上传只从 UPLOADING 转 EXPIRED，partial 字节与 source-presence 计费保留。
         调用方在网络 loop 取得 runner.active_jobs 的只读快照后，把本方法投到单 I/O
         worker；所有 SQL 与 unlink 因而串行，不会和 PATCH/commit 的文件 I/O 重叠。
         """
-        cutoff = (time.time() if now is None else now) - SOURCE_RETENTION_SECONDS
+        now = time.time() if now is None else now
+        self.conn.execute(
+            "UPDATE uploads SET state=? WHERE state=? AND expires_at <= ?",
+            (UPLOAD_EXPIRED, UPLOAD_UPLOADING, now),
+        )
+        cutoff = now - SOURCE_RETENTION_SECONDS
         rows = self.conn.execute(
             "SELECT jobs.job_id, uploads.source_name FROM jobs"
             " JOIN uploads ON uploads.upload_id=jobs.upload_id"
