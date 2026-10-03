@@ -428,6 +428,10 @@ class HttpStore:
 
         源文件已不存在（ENOENT，即已被安全删除的终态源）就不再计费；权限等其他 stat 错误
         显式上抛给监督，绝不静默当成「源已删除」或「占用为 0」。
+
+        代价是每次准入判定对每个已登记源做一次 stat。它只跑在受监督的单 I/O worker 线程里，
+        不在网络循环上；未登记残留（无 uploads 行的文件）不进这套账，但它们的物理占用由
+        disk_usage 自然覆盖。
         """
         for row in self.conn.execute("SELECT source_name, size_bytes FROM uploads"):
             try:
@@ -621,7 +625,10 @@ class HttpStore:
         return self._upload_record(self._row_for_token(upload_id, token))
 
     def append_bytes(self, upload_id: str, token: str, offset: int, data) -> int:
-        """字节 flush/fsync → 条件 offset 事务 → 返回新 offset（route 据此发 204 ACK）。"""
+        """字节 flush/fsync → 条件 offset 事务 → 返回新 offset（route 据此发 204 ACK）。
+
+        落盘前先过物理余量闸：余量不足时 507，不写盘、不 ACK、offset 不前进。
+        """
         payload = bytes(data)
         if len(payload) > MAX_CHUNK_BYTES:
             raise HttpStoreError("payload_too_large", "单次 PATCH 超过 1 MiB", status=413)
@@ -693,7 +700,8 @@ class HttpStore:
 
         顺序要求：**幂等重放识别必须在预算兜底之前**。重放不新建 Job、不消耗新名额，
         因此不能被 ``_check_job_admission`` 以「名额已满」拒掉——否则响应丢失后的
-        显式重试拿不回同一个 Job。
+        显式重试拿不回同一个 Job。容量三闸同理：新受理才查 DB guard 与物理余量，
+        且在源核验之前就为本次新增 Job 预留结果峰值。
         """
         row = self._row_for_token(upload_id, token)
         if row["state"] == UPLOAD_COMMITTED and row["job_id"]:

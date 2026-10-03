@@ -41,6 +41,17 @@ WAL 上界；按 `confirmed_offset` 算未物化字节（重复收费已写字�
 stat/SQLite 失败视 0；只为 create 查一次容量；用预算函数自身输出当参考模型；
 为 M4 新增资源表或通用账本；把 `Path.exists()` 当可靠读数（权限错误会静默变 False）。
 
+## 远程地址
+
+- draft PR：https://github.com/zlxlabs/CapsWriter-ASR-Server/pull/60 （draft，执行器不置 ready）
+- 分支：`card/http-m4-c1-capacity-261003`｜base：`e066930`
+- 全量验证（两套 websockets 各跑一遍，均为 `445 passed, 3 skipped`）：
+  - websockets 最新：`445 passed, 3 skipped, 149 warnings in 213.54s (0:03:33)`
+  - websockets==15.0.1：`445 passed, 3 skipped, 149 warnings in 216.63s (0:03:36)`
+- 3 skip 的实际身份（`-rs`）：`test_aligner_integration.py:53/62` ForceAligner 后端/模型未安装；
+  `test_segmenter.py:208` 缺 silero-VAD 模型或 onnxruntime。base 为 425 passed/3 skipped，
+  净增 20 条，无 HTTP 解码类 skip。
+
 ## 下一步唯一动作
 
 主脑在 draft PR 上跑主审并核对本文件与 `m4-plan.md` 的来源标注；通过后置 ready。
