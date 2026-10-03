@@ -18,12 +18,14 @@
 - 已建立早 draft PR #64；PR 保持 draft。
 - 按授权从正在运行的 Paraformer 主机只读复制四个模型/词表文件到私有 Linux cache；四个文件均与之前探测到的路径和非零字节数对应。未对来源主机启动服务、写文件或重启。
 - 卡面全量命令使用 Python 3.12.3 与 `websockets==15.0.1` 退出码 0：`452 passed, 3 skipped`，约 4 分钟。3 个 skip 全部是既有 ForceAligner/VAD 模型依赖缺失；没有 HTTP decode skip。
+- 同一全量命令将 websockets 约束改为未 pin，实际解析 `17.2`，退出码 0：`452 passed, 3 skipped`，约 3 分 46 秒；skip 与 15.0.1 完全相同，没有 HTTP decode skip。
+- Linux 独立服务 venv 已按 `requirements-server-linux.txt` 安装并通过 `uv pip check`；Python 3.12.3、sherpa-onnx 1.13.8、ONNX Runtime 1.30.0，`CPUExecutionProvider` 可用。基线 SHA 的 detached server worktree 已建立，模型目录软链只存在于该隔离树且未进入主分支。
 
 ## 接下来
 
 1. 先写 SDK 实际请求/帧计量、隐私约束、失败状态和归一化 fixture 测试，完成两条独立红验后逐步实现。
-2. 已提交从空环境复现说明；补做 `websockets==latest` 的卡面全量命令。
-3. 在 Linux 私有 venv/cache 中安装 CPU Paraformer 依赖，运行隔离的 `127.0.0.1` 服务；先合成 smoke，再用 WAV 与 MP4 各自串行测 HTTP 与 SDK WS v2。
+2. 已提交从空环境复现说明；15.0.1 与当前最新 17.2 的全量命令均通过。
+3. 运行隔离的 `127.0.0.1` 服务；先合成 smoke，再用 WAV 与 MP4 各自串行测 HTTP 与 SDK WS v2。
 4. 记录真实指标、未知项和 SHA；更新 draft PR，不标 ready。
 
 ## 已知限制
