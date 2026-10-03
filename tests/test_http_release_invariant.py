@@ -169,6 +169,46 @@ def _is_owner_kind_check(test: ast.expr, kind: str) -> bool:
     )
 
 
+def test_admission_callers_share_one_primitive():
+    """两个准入判定必须经过 count_active_tasks，禁止就地内联求和。
+
+    同一形态已第三次出现：HTTP 先只数自己的表、上一卡只数 WS。根因是
+    「活动任务总量」在 ws_recv 与 _commit_upload 各写一遍。本约束让下次
+    有人想在调用方改算式时，CI 在行为测试变红之前就先红。
+    """
+    state_funcs = _functions(_load("state.py"))
+    assert "count_active_tasks" in state_funcs, (
+        "活动任务总量必须在 core/server/state.py 提供唯一原语 count_active_tasks"
+    )
+    primitive = state_funcs["count_active_tasks"]
+    ws_filters = [
+        node
+        for node in ast.walk(primitive)
+        if _is_key_kind_check(node, "ws")
+    ]
+    assert not ws_filters, (
+        "count_active_tasks 不得只数 WS；HTTP 与 WS 必须一并计入"
+    )
+
+    ws_recv = _functions(_load("connection/ws_recv.py"))["ws_recv"]
+    commit = _functions(_load("http_server.py"))["_commit_upload"]
+    for label, node in (("ws_recv", ws_recv), ("_commit_upload", commit)):
+        calls = [
+            item
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call) and _call_name(item.func) == "count_active_tasks"
+        ]
+        assert len(calls) == 1, f"{label} 的准入判定必须恰好一处调用 count_active_tasks，实际 {len(calls)}"
+        inline_sums = [
+            item
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call) and _call_name(item.func) == "sum"
+        ]
+        assert not inline_sums, (
+            f"{label} 不得就地内联求和；活动任务总量必须走 count_active_tasks"
+        )
+
+
 def test_release_position_table_is_exact():
     """约束 1：释放原语的全部调用点与位置表逐行一致（新增路径必失败）。"""
     actual = {}

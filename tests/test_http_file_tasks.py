@@ -345,6 +345,44 @@ async def test_http_admission_shares_ws_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_shared_budget_counts_http_occupancy(tmp_path):
+    """7 WS + 1 已受理 HTTP = 活动总量 8 = max_tasks 时，第 9 个任务必须被拒。
+
+    主脑探针实测：上一卡只数 key[0]=='ws'，此场景仍会把第 9 个 accepted。
+    活动占用落在 state.tasks 非终态记录上（与唯一判定原语同一口径）；
+    被拒必须是 429 too_many_jobs，且不留下 Job 行。
+    """
+    from core.server.state import TaskLifecycle, make_task_key
+
+    source = _source(tmp_path)
+    recovery = tmp_path / "resume9.json"
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        tasks = server._app.state.tasks
+        for index in range(7):
+            tasks[make_task_key("ws", f"ws-task-{index}", f"socket-{index}")] = (
+                TaskLifecycle()
+            )
+        # 已受理 HTTP 的运行态记录：与 WS 一样占共享预算
+        tasks[make_task_key("http", "occupied-http-job")] = TaskLifecycle()
+        error = await _expect_error(
+            submit_file_http(source, base_url, resume_path=recovery, chunk_bytes=1024),
+            "too_many_jobs",
+        )
+        assert error.code == "too_many_jobs"
+        stored = json.loads(recovery.read_text(encoding="utf-8"))
+        headers = {"Authorization": f"Bearer {stored['token']}"}
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            commit = await client.post(
+                f"{base_url}/v1/uploads/{stored['upload_id']}/commit",
+                headers=headers,
+                content=b"",
+            )
+        assert commit.status_code == 429, commit.text
+        assert commit.json()["code"] == "too_many_jobs"
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 0
+
+
+@pytest.mark.asyncio
 async def test_job_lifecycle_repeated_commit_and_result_not_ready(tmp_path):
     """唯一 Job：重复 commit 仍返回同一 Job；无持久结果时 409 result_not_ready。"""
     source = _source(tmp_path, size=2048)
