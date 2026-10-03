@@ -62,7 +62,10 @@ HTTP 同时只运行 1 个 Job，未拿到闸门的保持 QUEUED，不解码也�
 worker 崩溃、收尾排错等 runner 之外的 HTTP 终态一律经 `finalize_http_job`
 唯一入口：先以条件更新（不覆盖已有终态）持久化 FAILED，成功之后才
 `transition_terminal` 释放 owner/唤醒等待者；持久写有 `wait_for` 超时上限，
-超时或失败时不释放 owner。释放路径的位置表与顺序由
+超时或失败时不释放 owner。结果路径上 HTTP 终态的唯一收尾人是结果 sink
+（成功：record_result 落库 DONE → 转换 → 释放；失败：runner.fail_job 同形态），
+`ws_send` 的 HTTP 分支只做段确认、不再做任何终态转换，每条路径恰好转换一次。
+释放路径的位置表与顺序由
 `tests/test_http_release_invariant.py` 的 AST 机械检查钉住。
 服务重启后 QUEUED/RUNNING 收敛为 FAILED[server_restarted]，不做自动重跑。
 
