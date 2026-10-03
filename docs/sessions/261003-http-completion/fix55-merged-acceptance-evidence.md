@@ -12,7 +12,7 @@
 | 主干身份 | 已核实 | `git ls-remote origin refs/heads/master` 与 `main_sha_at_check` 均为 `29194075a088dd00b8b3a3e8d8fc3a752f643f24`。 |
 | 主干 CI | `success` | GitHub workflow run `37125979194`，event=`push`，head=`29194075a088dd00b8b3a3e8d8fc3a752f643f24`；`websockets==15.0.1` 与默认 `websockets` 两个测试矩阵 job 均 `completed/success`。 |
 
-受限复验写回原派发目录的 `accept_precheck.json`，当前顶层 `status=green`。旧 timeout JSON 已先复制到 `/tmp/fix55-accept-precheck-before-rerun.json`，SHA-256：`6343f8f79c9403252920b5d128eb5bd310c0a42f5a29b3a0f730d1f7b3116b77`。原始事实日志仍为 `/home/zlx/.local/state/delegate/cards/caps-http-261003-fix55-formal-precheck.log`。
+受限复验写回原派发目录的 `accept_precheck.json`，当前顶层 `status=green`。旧 timeout JSON 已先复制到本机临时目录 `fix55-accept-precheck-before-rerun.json`，SHA-256：`6343f8f79c9403252920b5d128eb5bd310c0a42f5a29b3a0f730d1f7b3116b77`。原始事实日志仍在 delegate 私有状态目录的 `cards/caps-http-261003-fix55-formal-precheck.log`。
 
 ## 原超时停在哪
 
@@ -24,7 +24,7 @@ uv run --no-project --python 3.12 --with numpy --with rich --with websockets --w
 
 工具的 `scripts/ci/ci_evidence.py:142-150` 只把两条固定命令识别为 `ci-standard-v1`：`bash tests/all-shards.sh all` 与 `bash scripts/ci/remote-suite.sh`。本卡自定义 `uv ... pytest tests/` 命令不匹配，因此工具按普通 Verify 路径执行 `bash -c <卡面命令>`，工作目录是临时合并 worktree，子进程继承预检进程环境；`start_new_session=True`。这说明验证通道是本机完整 pytest，而不是 CI 等待通道。
 
-临时树根由 `precheck_worktrees.py` 的 `precheck_worktree_root()` 决定：本机 `XDG_STATE_HOME` 未设置时默认为 `/home/zlx/.local/state/delegate/precheck-worktrees`，目录名含创建者 PID。原 PID `1846363` 当前已退出，未找到 `accept-precheck-1846363-*` 残留树、活动测试子进程或可归因于该次执行的锁。原结果没有保存子进程 PID、实际 cwd、环境白名单、Verify 输出或子步骤时长；因此不能证明当时是 `uv` 锁、环境、测试用例还是其他运行时延迟造成了 1200 秒耗尽。
+临时树根由 `precheck_worktrees.py` 的 `precheck_worktree_root()` 决定：本机 `XDG_STATE_HOME` 未设置时默认为 `$HOME/.local/state/delegate/precheck-worktrees`，目录名含创建者 PID。原 PID `1846363` 当前已退出，未找到 `accept-precheck-1846363-*` 残留树、活动测试子进程或可归因于该次执行的锁。原结果没有保存子进程 PID、实际 cwd、环境白名单、Verify 输出或子步骤时长；因此不能证明当时是 `uv` 锁、环境、测试用例还是其他运行时延迟造成了 1200 秒耗尽。
 
 能确定的是预算边界：预检主程序用总闹钟 1200 秒；默认 Verify 单步超时为 2700 秒。原报告的 `总时限 1200s 超时，卡在步骤 verify_on_merged_main` 表示外层总闹钟先于单步 Verify 超时触发，并把三项状态统一降为 `unknown`。它不能证明 pytest 本身卡死。旧代码的 `check_verify_on_merged_main()` 在单步 `communicate()` 上捕获 `subprocess.TimeoutExpired` 时会杀子进程组，但外层 `PrecheckTimeout` 走另一条捕获路径；源代码未在该路径显式杀掉 Verify 子进程组。当前未观察到旧子进程残留，故这一点是代码路径风险，不是已观察到的旧现场残留。
 
@@ -33,14 +33,14 @@ uv run --no-project --python 3.12 --with numpy --with rich --with websockets --w
 执行一次，未重试：
 
 ```sh
-XDG_STATE_HOME=/home/zlx/.local/state python3 /home/zlx/.local/lib/agent-config-runtime/current/scripts/delegate/accept_precheck.py \
+XDG_STATE_HOME="$HOME/.local/state" python3 "$HOME/.local/lib/agent-config-runtime/current/scripts/delegate/accept_precheck.py" \
   --dispatch-id dlg-20261003-095625-b3602a \
-  --repo-path /home/zlx/projects/oss/CapsWriter-Offline-with-AI-worktrees/http-fix55-accept-261003 \
+  --repo-path "$PWD" \
   --commit-range e066930ef38aabe8e5051c9256463646f62a7186..6adeba5b39409964ca11634ed2ba1760a4fde56c \
   --timeout-sec 1200 --verify-timeout-sec 2700
 ```
 
-`--repo-path` 指向本卡独立 worktree；工具按其 git common dir 定位主仓。`--commit-range` 保持原业务范围，参数没有扩大；1200 秒总上限未延长。复验临时树为 `accept-precheck-323199-k_pg2odf`，PID 323199 退出后由工具正常清理。运行环境为 Python 3.12.3、uv 0.12.10、`HOME=/home/zlx`；`XDG_STATE_HOME` 显式设为绝对路径。复验结果文件仍由真实 producer 写入，关键字段为：`status=green`、`head_sha=6adeba5b39409964ca11634ed2ba1760a4fde56c`、`main_sha_at_check=29194075a088dd00b8b3a3e8d8fc3a752f643f24`、scope green、Verify exit 0。
+`--repo-path` 指向本卡独立 worktree；工具按其 git common dir 定位主仓。上面的公开命令用 `$PWD`、`$HOME` 表示复验时展开的本机路径。`--commit-range` 保持原业务范围，参数没有扩大；1200 秒总上限未延长。复验临时树为 `accept-precheck-323199-k_pg2odf`，PID 323199 退出后由工具正常清理。运行环境为 Python 3.12.3、uv 0.12.10；`XDG_STATE_HOME` 显式设为 `$HOME/.local/state`。复验结果文件仍由真实 producer 写入，关键字段为：`status=green`、`head_sha=6adeba5b39409964ca11634ed2ba1760a4fde56c`、`main_sha_at_check=29194075a088dd00b8b3a3e8d8fc3a752f643f24`、scope green、Verify exit 0。
 
 ## 独立裸 shell 全量测试
 
