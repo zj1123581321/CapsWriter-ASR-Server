@@ -48,6 +48,22 @@ MAX_RESULT_BYTES = 64 * 1024 * 1024               # 64 MiB 最终 JSON
 FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024  # 实际剩余文件系统 2 GiB 安全余量
 UPLOAD_TTL_SECONDS = 7 * 24 * 3600                # 未完成上传 TTL 7 天
 
+# ---- 单个待处理 Job 的结果峰值预留（R7 的「完整结果 + WAL 峰值」，常量不加配置）----
+# 一次 record_result 会让同一批页出现两份：落进最终 DB 的一份，与同时留在 -wal 里的帧副本
+# （外加 -shm 的 wal-index）。真实 sqlite3 实测（page_size=4096、真实 63.99 MiB 合法完整
+# 结果、生产默认自动 checkpoint，单次提交相对提交前的真实增量）：
+#   最终 DB  +67,211,264 B（1.0015×payload）
+#   -wal     +67,576,362 B（1.0070×payload）
+#   -shm     +131,072 B
+#   合计     134,922,696 B ≈ 2.0105×payload
+# 即「payload × 2」（134,217,728 B）**不覆盖**，差 704,968 B——它只是接近的猜测，不是上界。
+# 下面的上界改由 SQLite 页几何算出（页大小运行时读 PRAGMA，不写死 4096），在生产
+# MAX_RESULT_BYTES=64 MiB 下得 141,902,242 B（2.1145×），对实测峰值留 5.17% 余量；
+# tests/test_http_capacity.py 用缩小预算的真实 SQLite 字节复现同一关系。
+WAL_FRAME_OVERHEAD_BYTES = 32            # WAL 帧头 24 B + -shm wal-index 每帧 8 B
+RESULT_COMMIT_EXTRA_PAGES = 32           # 同事务里被改写的非结果页（b-tree 根/空闲链表），实测 ≤ 20 页
+RESULT_RESERVATION_SAFETY = 1.05         # 页几何精确值之上再留 5%，吸收 SQLite 版本差异
+
 SCHEMA_VERSION = 1
 
 UPLOAD_UPLOADING = "UPLOADING"
@@ -342,11 +358,17 @@ class HttpStore:
         return self.sources_dir / source_name
 
     def _db_bytes(self) -> int:
+        """真实 DB/-wal/-shm 占用。DB 主文件缺失是显式失败，绝不当成 0 字节。"""
         total = 0
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(str(self.db_path) + suffix)
-            if candidate.exists():
-                total += candidate.stat().st_size
+            try:
+                total += os.stat(candidate).st_size
+            except FileNotFoundError as exc:
+                # -wal/-shm 在没有并发写者、或干净关闭后本就不存在，按 0 计
+                if suffix:
+                    continue
+                raise StoreUnavailable("HTTP 数据库文件缺失，拒绝把未知占用当作 0") from exc
         return total
 
     def _free_bytes(self) -> int:
@@ -401,6 +423,101 @@ class HttpStore:
 
     # ---------------- 准入（错误不删除任何旧数据） ----------------
 
+    def _iter_present_sources(self):
+        """逐个已登记源给出 (声明长度, 真实文件长度)。
+
+        源文件已不存在（ENOENT，即已被安全删除的终态源）就不再计费；权限等其他 stat 错误
+        显式上抛给监督，绝不静默当成「源已删除」或「占用为 0」。
+        """
+        for row in self.conn.execute("SELECT source_name, size_bytes FROM uploads"):
+            try:
+                length = os.stat(self._source_path(row["source_name"])).st_size
+            except FileNotFoundError:
+                continue
+            yield row["size_bytes"], length
+
+    def _reserved_source_bytes(self) -> int:
+        """16 GiB 源预留口径：留在磁盘上的已登记源（UPLOADING/EXPIRED/COMMITTED）按声明长度计费。
+
+        不按状态排除：过期但仍保留物理文件的 partial 同样占着磁盘，必须计费；只有已被安全
+        删除的终态源才退出预留。
+        """
+        return sum(size for size, _length in self._iter_present_sources())
+
+    def _unmaterialized_source_bytes(self) -> int:
+        """已承诺但尚未落盘的源字节：Σ(声明长度 - 真实文件长度)。
+
+        用真实文件长度而不是 confirmed_offset 扣减，所以已写进磁盘的已确认前缀、以及崩溃
+        残留的「已写入但未确认尾」都算已占物理空间（已经体现在 disk_usage 里），不会在
+        free 与预留两侧被收两遍费；同时也不会漏算这些仍未确认的已写入字节。
+        """
+        return sum(max(0, size - length) for size, length in self._iter_present_sources())
+
+    def _sqlite_page_size(self) -> int:
+        """真实 SQLite 页大小。预留量纲依赖它，读不到就是显式失败，不能默认成某个数。"""
+        row = self.conn.execute("PRAGMA page_size").fetchone()
+        if row is None or not isinstance(row[0], int) or row[0] <= 0:
+            raise StoreUnavailable("读不到 SQLite page_size，拒绝按未知页几何预留结果容量")
+        return int(row[0])
+
+    def _result_reservation_bytes(self) -> int:
+        """单个 QUEUED/RUNNING Job 落最终结果时必须提前占住的 DB+WAL+SHM 峰值。
+
+        量纲：结果记录本身占 ``1 + ceil(未本地保存的 payload / (page_size - 4))`` 页——表
+        b-tree 叶页可本地保存 page_size-35 字节，其余走溢出页，溢出页每页净装 page_size-4
+        字节；同一批页在 WAL 里再存一份帧（page_size + 24 字节，-shm 每帧再 8 字节）。
+        峰值 ≈ 页数 × (2 × page_size + WAL_FRAME_OVERHEAD_BYTES)，见模块常量处的真实字节实测。
+        """
+        page_size = self._sqlite_page_size()
+        overflow = max(0, MAX_RESULT_BYTES - (page_size - 35))
+        record_pages = 1 + math.ceil(overflow / (page_size - 4))
+        peak = (record_pages + RESULT_COMMIT_EXTRA_PAGES) * (2 * page_size + WAL_FRAME_OVERHEAD_BYTES)
+        return math.ceil(peak * RESULT_RESERVATION_SAFETY)
+
+    def _pending_result_reservation_bytes(self) -> int:
+        """所有 QUEUED/RUNNING Job 的结果预留合计。
+
+        数据只来自既有 jobs 表；Job 进入终态后这份 pending 自动退出，同一份结果字节转为
+        已被 _db_bytes() 实测到的真实文件占用，不开第二本资源账本。
+        """
+        pending = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE state IN (?, ?)", (JOB_QUEUED, JOB_RUNNING)
+        ).fetchone()["n"]
+        return pending * self._result_reservation_bytes()
+
+    def _check_storage_guard(self, new_job_reservation: int = 0) -> None:
+        """实际 DB+WAL+SHM 字节 + 全部待处理结果预留 + 本次新增 Job 预留 <= DB_GUARD_BYTES。
+
+        额度类：等值放行，只有 ``>`` 才 507 storage_guard_full。
+        """
+        projected = self._db_bytes() + self._pending_result_reservation_bytes() + new_job_reservation
+        if projected > DB_GUARD_BYTES:
+            raise HttpStoreError(
+                "storage_guard_full",
+                "HTTP 数据库与结果整体 guard 已满（含待处理结果与 WAL 预留）",
+                status=507,
+            )
+
+    def _check_physical_margin(self, *, new_source_bytes: int = 0, new_result_reservation: int = 0) -> None:
+        """真实 disk_usage 余量扣掉已承诺但尚未落盘的占用后，仍须 >= FREE_SPACE_MARGIN_BYTES。
+
+        余量类：等值放行。扣减项互不重复：未物化源字节（含所有其他已承诺上传的尾，不只是
+        本请求自己那一块）、全部待处理结果预留、以及本次请求新承诺的源字节或结果预留。
+        """
+        available = (
+            self._free_bytes()
+            - self._unmaterialized_source_bytes()
+            - new_source_bytes
+            - self._pending_result_reservation_bytes()
+            - new_result_reservation
+        )
+        if available < FREE_SPACE_MARGIN_BYTES:
+            raise HttpStoreError(
+                "disk_guard_full",
+                "实际剩余文件系统扣除已承诺占用后低于安全余量",
+                status=507,
+            )
+
     def _check_create_admission(self, size_bytes: int) -> None:
         conn = self.conn
         open_uploads = conn.execute(
@@ -408,16 +525,10 @@ class HttpStore:
         ).fetchone()["n"]
         if open_uploads >= MAX_OPEN_UPLOADS:
             raise HttpStoreError("too_many_uploads", "未完成上传会话已达上限", status=429)
-        declared = conn.execute(
-            "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM uploads WHERE state != ?",
-            (UPLOAD_EXPIRED,),
-        ).fetchone()["total"]
-        if declared + size_bytes > SOURCE_RESERVE_BYTES:
+        if self._reserved_source_bytes() + size_bytes > SOURCE_RESERVE_BYTES:
             raise HttpStoreError("source_reserve_full", "源音频声明长度总预留已满", status=507)
-        if self._db_bytes() > DB_GUARD_BYTES:
-            raise HttpStoreError("storage_guard_full", "HTTP 数据库与结果整体 guard 已满", status=507)
-        if self._free_bytes() < FREE_SPACE_MARGIN_BYTES:
-            raise HttpStoreError("disk_guard_full", "实际剩余文件系统低于安全余量", status=507)
+        self._check_storage_guard()
+        self._check_physical_margin(new_source_bytes=size_bytes)
 
     def active_job_ids(self) -> set:
         """QUEUED+RUNNING 的 Job id 集合：共享预算的 DB 侧计数来源。
@@ -528,6 +639,9 @@ class HttpStore:
                                  confirmed_offset=confirmed)
         if len(payload) == 0:
             return confirmed
+        # 物理余量闸覆盖 PATCH：余量扣掉所有已承诺但未落盘的源字节（含其他上传的尾）与全部
+        # 待处理结果预留后不足时，不写盘、不 ACK、offset 不前进
+        self._check_physical_margin()
         path = self._source_path(row["source_name"])
         fd = os.open(path, os.O_RDWR)
         try:
@@ -589,6 +703,10 @@ class HttpStore:
         if row["confirmed_offset"] != row["size_bytes"]:
             raise HttpStoreError("upload_incomplete", "上传尚未达到声明长度", status=409,
                                  confirmed_offset=row["confirmed_offset"])
+        # 新 Job 必须在落库前就把自己的结果峰值预留出来：create 只看已存在的存量，
+        # 这次新增 Job 的预留由这里和物理余量闸一起算，否则 commit 会绕过 DB guard。
+        self._check_storage_guard(new_job_reservation=self._result_reservation_bytes())
+        self._check_physical_margin(new_result_reservation=self._result_reservation_bytes())
         self._verify_source(row)
         # 只有走到这里才是「要新建 Job」，此时才谈得上预算兜底
         self._check_job_admission()
