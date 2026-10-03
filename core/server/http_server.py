@@ -49,6 +49,8 @@ from core.server.http_store import (
 
 logger = logging.getLogger("server")
 
+SOURCE_CLEANUP_INTERVAL_SECONDS = 60 * 60
+
 
 class HttpServerError(Exception):
     """HTTP 装配/监督失败：调用方必须以非零退出，不得吞掉。"""
@@ -149,6 +151,9 @@ class HttpServer:
         self.fatal: Optional[BaseException] = None
         self._fatal_event = asyncio.Event()
         self._client_payload_error = None
+        self._source_cleanup_task: Optional[asyncio.Task] = None
+        self._source_cleanup_stopping = False
+        self._source_cleanup_inflight = False
         # 真实推理协调者是否已装配（M3 注入实现）；默认 False → commit 明确 503
         self.inference_available = False
         # 已装配的文件 runner（E3）；为 None 时 commit 仍只看 inference_available
@@ -261,6 +266,11 @@ class HttpServer:
         if sockets is not None and sockets.sockets:
             self._bound_port = sockets.sockets[0].getsockname()[1]
         logger.info(f"HTTP 文件任务 listener 已就绪 (监听: {self.addr}:{self._bound_port or self.port})")
+        self._source_cleanup_stopping = False
+        self._source_cleanup_task = asyncio.create_task(
+            self._source_cleanup_loop(), name="http-source-cleanup"
+        )
+        self._source_cleanup_task.add_done_callback(self._on_source_cleanup_done)
         try:
             await self._fatal_event.wait()
             if self.fatal is not None:
@@ -268,7 +278,39 @@ class HttpServer:
         finally:
             await self.stop()
 
+    async def _source_cleanup_loop(self) -> None:
+        while not self._source_cleanup_stopping:
+            runner = self.file_runner
+            active_job_ids = tuple(runner.active_jobs) if runner is not None else ()
+            self._source_cleanup_inflight = True
+            try:
+                await self._worker.run(
+                    self._store.cleanup_terminal_sources,
+                    active_job_ids,
+                )
+            finally:
+                self._source_cleanup_inflight = False
+            if not self._source_cleanup_stopping:
+                await asyncio.sleep(SOURCE_CLEANUP_INTERVAL_SECONDS)
+
+    def _on_source_cleanup_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._mark_fatal(exc)
+
     async def stop(self) -> None:
+        # 先停清理生产者。运行中的清理 I/O 必须完成并由 worker callback 观察后，
+        # 才能按既有顺序回收 runner、aiohttp listener 与单 I/O worker。
+        self._source_cleanup_stopping = True
+        cleanup_task = self._source_cleanup_task
+        self._source_cleanup_task = None
+        if cleanup_task is not None:
+            if not cleanup_task.done() and not self._source_cleanup_inflight:
+                cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+
         # 先停 runner：Job 调度与解码进程必须在 I/O worker 与存储关闭前收尾
         if self.file_runner is not None:
             await self.file_runner.stop()

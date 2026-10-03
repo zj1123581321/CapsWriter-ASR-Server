@@ -47,6 +47,7 @@ DB_GUARD_BYTES = 2 * 1024 * 1024 * 1024           # 2 GiB DB+WAL+SHM/结果整�
 MAX_RESULT_BYTES = 64 * 1024 * 1024               # 64 MiB 最终 JSON
 FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024  # 实际剩余文件系统 2 GiB 安全余量
 UPLOAD_TTL_SECONDS = 7 * 24 * 3600                # 未完成上传 TTL 7 天
+SOURCE_RETENTION_SECONDS = 7 * 24 * 3600          # 终态源从 terminal_at 起保留 7 天
 
 # ---- 单个待处理 Job 的结果峰值预留（R7 的「完整结果 + WAL 峰值」，常量不加配置）----
 # 一次 record_result 会让同一批页出现两份：落进最终 DB 的一份，与同时留在 -wal 里的帧副本
@@ -748,10 +749,16 @@ class HttpStore:
         result_available = self.conn.execute(
             "SELECT 1 FROM results WHERE job_id=?", (job_id,)
         ).fetchone() is not None
-        source_available = self.conn.execute(
-            "SELECT 1 FROM uploads WHERE upload_id=? AND state != ?",
-            (row["upload_id"], UPLOAD_EXPIRED),
-        ).fetchone() is not None
+        upload = self.conn.execute(
+            "SELECT source_name, state FROM uploads WHERE upload_id=?",
+            (row["upload_id"],),
+        ).fetchone()
+        source_available = upload is not None and upload["state"] != UPLOAD_EXPIRED
+        if source_available:
+            try:
+                os.stat(self._source_path(upload["source_name"]))
+            except FileNotFoundError:
+                source_available = False
         return JobRecord(
             job_id=row["job_id"],
             state=row["state"],
@@ -762,6 +769,39 @@ class HttpStore:
             result_available=bool(result_available and row["state"] == JOB_DONE),
             source_available=bool(source_available),
         )
+
+    def cleanup_terminal_sources(
+        self, active_job_ids, now: Optional[float] = None
+    ) -> None:
+        """持久化逾期上传终态，并 unlink 到期且没有 runner 引用的 Job 源文件。
+
+        Job 状态和 terminal_at 是唯一年龄依据；任务、结果与上传元数据始终保留。
+        未完成上传只从 UPLOADING 转 EXPIRED，partial 字节与 source-presence 计费保留。
+        调用方在网络 loop 取得 runner.active_jobs 的只读快照后，把本方法投到单 I/O
+        worker；所有 SQL 与 unlink 因而串行，不会和 PATCH/commit 的文件 I/O 重叠。
+        """
+        now = time.time() if now is None else now
+        self.conn.execute(
+            "UPDATE uploads SET state=? WHERE state=? AND expires_at <= ?",
+            (UPLOAD_EXPIRED, UPLOAD_UPLOADING, now),
+        )
+        cutoff = now - SOURCE_RETENTION_SECONDS
+        rows = self.conn.execute(
+            "SELECT jobs.job_id, uploads.source_name FROM jobs"
+            " JOIN uploads ON uploads.upload_id=jobs.upload_id"
+            " WHERE jobs.state IN (?, ?) AND jobs.terminal_at IS NOT NULL"
+            " AND jobs.terminal_at <= ?",
+            (JOB_DONE, JOB_FAILED, cutoff),
+        ).fetchall()
+        active = set(active_job_ids)
+        for row in rows:
+            if row["job_id"] in active:
+                continue
+            try:
+                os.unlink(self._source_path(row["source_name"]))
+            except FileNotFoundError:
+                # 上一轮已完成 unlink；幂等保留任务行、结果和上传元数据。
+                continue
 
     def get_result(self, job_id: str, token: str) -> dict:
         row = self._job_row_for_token(job_id, token)
