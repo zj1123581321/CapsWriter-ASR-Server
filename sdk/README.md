@@ -43,6 +43,8 @@ asyncio.run(main())
 
 上面的首次示例显式选用 `s16le`，服务端无需安装 FFmpeg 即可接收。SDK 默认编码是 `flac`；若使用默认值，服务端也必须在 `PATH` 中安装 FFmpeg，且 `/health` 的 `encodings` 必须包含 `flac`。无论客户端选择何种编码，SDK 都只需要客户端本机的 `ffmpeg`：压缩编码会先转码，再从已发出的压缩字节流解码累计出 `samples_total` 供服务端对账，不使用源文件的容器时长。服务端必须报告协议版本 2 和所选编码；SDK 不会降级到 v1，也不会自动重试。同步程序可调用 `transcribe_file_sync(path, url, ...)`。
 
+转码时 SDK 对 ffmpeg 显式传 `-map 0:a:0`：**多音轨文件只转录第一条音轨**，视频轨、字幕轨和数据轨都不会被拉进 ffmpeg 的解码图。若文件没有任何音轨，ffmpeg 会非零退出，SDK 抛 `AsrError('decode_failed')`，不会静默产出空音频。
+
 `transcribe_file` 和同步入口还接受 `encoding`（`flac`、`ogg_opus`、`f32le`、`s16le`）、`language`、`context`、`seg_duration`、`seg_overlap`、`deadline_total`、`idle_timeout`、`model` 与 `on_progress(result_dict)`。异步接口会并发上传和接收结果；失败时抛出 `AsrError`。识别结果的字段见[服务协议](../docs/reference/protocol.md)。
 
 SDK 也提供命令行字幕导出，默认写入 SRT：

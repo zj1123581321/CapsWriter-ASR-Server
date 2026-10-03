@@ -96,7 +96,13 @@ async def _transcode(path: Path, encoding: str) -> bytes:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise AsrError("decode_failed", "找不到 ffmpeg")
-    args = [ffmpeg, "-nostdin", "-i", str(path), "-ar", "16000", "-ac", "1"]
+    # 显式只取第一条音轨：ffmpeg 自动选流会把视频轨拉进解码图，白付解码成本。
+    # 不带 "?" 是为了无音轨文件 fail fast（报错）而不是静默产出空音频。
+    args = [
+        ffmpeg, "-nostdin", "-i", str(path),
+        "-map", "0:a:0",
+        "-ar", "16000", "-ac", "1",
+    ]
     if encoding == "ogg_opus":
         args.extend(["-c:a", "libopus", "-b:a", "32k", "-f", "ogg"])
     else:
