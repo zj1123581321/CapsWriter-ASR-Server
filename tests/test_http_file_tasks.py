@@ -1366,59 +1366,7 @@ async def test_five_ws_plus_queued_http_refuses_http(tmp_path):
             await connection.close()
 
 
-class _BarrierCounter:
-    """包一层 DB 计数来源，用**屏障**而不是调度概率制造并发窗口。
-
-    屏障放在**读快照之后**：每个请求先把 DB 的 QUEUED+RUNNING 集合读出来，再进屏障
-    等「本批全部到齐」，到齐（或超时）后才放行去判定。
-
-    * 无锁（并发进入临界区）：本批所有请求在任何 Job 落库之前就读完快照，于是拿到
-      **同一份空快照**，全部判定通过、随后全部落库 → 静默超限。
-    * 有锁：临界区一次只进一个，第 2 个请求根本到不了这里，屏障等不到人、超时后
-      自行放行，行为退化成正常串行——每个请求都读到自己那一轮的真实快照。
-
-    屏障只在「本批全部到齐」时才真正同步；超时只是保证有锁时不会死锁，
-    判定的通过/失败不依赖超时是否发生。
-    """
-
-    def __init__(self, inner, batch: int, timeout: float = 0.5):
-        self._inner = inner
-        self._batch = batch
-        self._timeout = timeout
-        self._arrived = 0
-        self._all_here = asyncio.Event()
-        self.snapshots: list = []
-
-    async def __call__(self):
-        snapshot = set(await self._inner())
-        self.snapshots.append(snapshot)
-        self._arrived += 1
-        if self._arrived >= self._batch:
-            self._all_here.set()
-        try:
-            await asyncio.wait_for(self._all_here.wait(), self._timeout)
-        except asyncio.TimeoutError:
-            pass  # 有锁时凑不齐本批：放行本请求，串行语义不受影响
-        return snapshot
-
-
-async def _gather_commits(tmp_path: Path, base_url: str, count: int, tag: str):
-    """并发发起 count 个各自独立上传的 commit，返回 (受理数, 被拒数)。"""
-    sources = [_source(tmp_path, name=f"{tag}-{index}.wav") for index in range(count)]
-    resumes = [tmp_path / f"{tag}-{index}.json" for index in range(count)]
-
-    async def one(source: Path, resume: Path):
-        try:
-            handle = await submit_file_http(source, base_url, resume_path=resume, chunk_bytes=1024)
-        except AsrError as error:
-            assert error.code == "too_many_jobs", error.code
-            return False
-        assert handle.job_id
-        return True
-
-    return await asyncio.gather(*(one(s, r) for s, r in zip(sources, resumes)))
-
-
+# 服务于 test_concurrent_http_commit_respects_budget、test_concurrent_mixed_admission_respects_shared_total
 class _BarrierCounter:
     """包一层 DB 计数来源，用**屏障**而不是调度概率制造并发窗口。
 
@@ -1455,6 +1403,7 @@ class _BarrierCounter:
         return snapshot
 
 
+# 服务于 test_concurrent_http_commit_respects_budget、test_concurrent_mixed_admission_respects_shared_total
 async def _gather_commits(tmp_path: Path, base_url: str, count: int, tag: str):
     """并发发起 count 个各自独立上传的 commit，返回每个请求是否被受理。"""
     sources = [_source(tmp_path, name=f"{tag}-{index}.wav") for index in range(count)]
