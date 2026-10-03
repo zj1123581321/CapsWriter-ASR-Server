@@ -16,6 +16,7 @@ from .state import ServerState, console
 from .worker.process_manager import ProcessManager
 from .connection.server_manager import SocketManager
 from .http_server import HttpServer
+from .http_file_runner import HttpFileRunner
 from . import logger
 
 class CapsWriterServer:
@@ -41,6 +42,7 @@ class CapsWriterServer:
         self.socket_manager = SocketManager(self)
         # HTTP 文件任务默认关闭；仅在显式提供 CW_HTTP_PORT + CW_HTTP_DATA_DIR 时装配
         self.http_server = None
+        self.http_file_runner = None
         self.exit_code = 0
 
         self.version = __version__
@@ -140,6 +142,10 @@ class CapsWriterServer:
         http_settings = resolve_http_settings()
         if http_settings is not None:
             self.http_server = HttpServer(self, *http_settings).prepare()
+            # 装配真实文件 runner：ffmpeg 不可用时同样 fail fast，不假受理
+            self.http_file_runner = HttpFileRunner(self.state, self.http_server)
+            self.http_server.attach_runner(self.http_file_runner)
+            self.state.http_result_sink = self.http_file_runner.result_sink
 
         # 开启网络服务监听 (接管当前线程直至退出)
         try:

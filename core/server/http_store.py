@@ -65,12 +65,16 @@ OPTION_FIELDS = ("model", "language", "context", "seg_duration", "seg_overlap")
 class HttpStoreError(Exception):
     """带机器可读 code 的存储/准入错误；一律由 route 原样映射为 HTTP 状态。"""
 
-    def __init__(self, code: str, message: str, status: int = 400, confirmed_offset: Optional[int] = None):
+    def __init__(self, code: str, message: str, status: int = 400,
+                 confirmed_offset: Optional[int] = None,
+                 error_code: Optional[str] = None):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
         self.status = status
         self.confirmed_offset = confirmed_offset
+        # 仅任务终态错误携带：对外暴露已持久化的 Job error_code
+        self.error_code = error_code
 
 
 class StoreUnavailable(HttpStoreError):
@@ -594,14 +598,72 @@ class HttpStore:
         row = self._job_row_for_token(job_id, token)
         payload = self.conn.execute("SELECT payload FROM results WHERE job_id=?", (job_id,)).fetchone()
         if row["state"] == JOB_FAILED:
-            raise HttpStoreError("job_failed", "任务已失败", status=409)
+            # 失败任务必须暴露已存 error_code，调用方不必再查一次状态
+            raise HttpStoreError(
+                "job_failed",
+                f"任务已失败：{row['error_code'] or 'unknown'}",
+                status=409,
+                error_code=row["error_code"],
+            )
         if row["state"] != JOB_DONE or payload is None:
             raise HttpStoreError("result_not_ready", "任务结果尚未就绪", status=409)
         # 只接受真实持久化的完整结果，不接受任何内存态或推断结果
         return json.loads(payload["payload"])
 
+    def job_source(self, job_id: str) -> dict:
+        """HTTP runner 取源文件与受理参数的唯一入口。
+
+        路径只由服务端生成的 source_name 拼出，调用方无法指定任意路径。
+        """
+        row = self.conn.execute(
+            "SELECT uploads.source_name AS source_name, uploads.options_json AS options_json,"
+            " jobs.time_submit AS time_submit FROM jobs"
+            " JOIN uploads ON uploads.upload_id=jobs.upload_id WHERE jobs.job_id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise HttpStoreError("unknown_job", "没有对应的 HTTP 文件任务", status=404)
+        return {
+            "path": self._source_path(row["source_name"]),
+            "options": json.loads(row["options_json"]),
+            "time_submit": row["time_submit"],
+        }
+
+    def mark_running(self, job_id: str) -> bool:
+        """QUEUED -> RUNNING 的条件更新（SQLite 是唯一真源）。
+
+        只在仍是 QUEUED 时转移，因此已 DONE/FAILED 不会被改回运行态；
+        已经在运行的 Job 返回 False，不会重置 started_at。
+        """
+        now = time.time()
+        cursor = self.conn.execute(
+            "UPDATE jobs SET state=?, started_at=COALESCE(started_at, ?)"
+            " WHERE job_id=? AND state=?",
+            (JOB_RUNNING, now, job_id, JOB_QUEUED),
+        )
+        return cursor.rowcount == 1
+
+    def fail_job(self, job_id: str, error_code: str) -> bool:
+        """可靠提交 FAILED；已是终态时不覆盖（迟到失败不推翻 DONE/FAILED）。"""
+        if not isinstance(error_code, str) or not error_code:
+            raise HttpStoreError("invalid_error_code", "失败任务必须带非空错误码", status=500)
+        now = time.time()
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                "UPDATE jobs SET state=?, error_code=?, terminal_at=? WHERE job_id=? AND state IN (?,?)",
+                (JOB_FAILED, error_code, now, job_id, JOB_QUEUED, JOB_RUNNING),
+            )
+            committed = cursor.rowcount == 1
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+        return committed
+
     def record_result(self, job_id: str, result: dict) -> None:
-        """完整 result 与 DONE 必须同一次提交（供 E3 runner 使用，本增量不主动调用）。"""
+        """完整 result 与 DONE 同一次提交（由 HTTP runner 的结果 sink 调用）。"""
         if not isinstance(result, dict):
             raise HttpStoreError("invalid_result", "识别结果必须是对象", status=422)
         numeric_fields = ("duration", "time_start", "time_submit", "time_complete")
@@ -630,6 +692,9 @@ class HttpStore:
             or not all(isinstance(token, str) for token in tokens)
             or not valid_timestamps
             or len(tokens) != len(timestamps)
+            # tokens 拼接必须与 text_accu 完全一致：只比 text_accu，
+            # 不比语义独立的 text（pipeline 同样约定见 core/server/worker/pipeline.py）
+            or "".join(tokens) != result.get("text_accu")
             or not valid_numbers
         ):
             raise HttpStoreError("invalid_result", "识别结果字段与完整文件任务不匹配", status=422)

@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import multiprocessing
+import os
 import queue
+import signal
+from pathlib import Path
 from types import SimpleNamespace
 
 import websockets
@@ -209,3 +212,292 @@ class ManagedFakeServerHarness:
         self.info_queue.close()
         self.manager.shutdown()
         assert not graceful_timeout, "服务主进程未在 5 秒内响应 worker 停止信号"
+
+
+class _FaultyPutQueue:
+    """第 N 次真实入队就抛错的队列代理（只在注入故障时使用）。"""
+
+    def __init__(self, queue, fail_at: int = 2):
+        self._queue = queue
+        self._fail_at = fail_at
+        self._puts = 0
+
+    def put(self, item, *args, **kwargs):
+        if hasattr(item, "task_id"):
+            self._puts += 1
+            if self._puts >= self._fail_at:
+                raise RuntimeError("injected background failure (enqueue)")
+        return self._queue.put(item, *args, **kwargs)
+
+    def get(self, *args, **kwargs):
+        return self._queue.get(*args, **kwargs)
+
+
+def _apply_fault(fault):
+    """把未知后台异常注入 runner 的真实代码路径（真实数据流，非替身实现）。"""
+    if fault == "pcm_chunks":
+        from core.server.http_file_runner import FileSourceDecoder
+
+        async def faulty_pcm_chunks(self):
+            raise RuntimeError("injected background failure (pcm_chunks)")
+            yield b""  # pragma: no cover - 只为保持 async generator 形态
+
+        FileSourceDecoder.pcm_chunks = faulty_pcm_chunks
+    elif fault == "enqueue":
+        return _FaultyPutQueue
+    elif fault is not None:
+        raise ValueError(f"未知故障注入类型: {fault!r}")
+    return None
+
+
+def run_managed_http_server(
+    info_queue, options, calls, received, queue_in, queue_out, data_dir,
+    fault=None, ffmpeg_shim=None, env=None,
+):
+    """独立主进程：真 HTTP listener + 真文件 runner + 真 ws_send + 真识别子进程。
+
+    SIGTERM/SIGINT 走与生产 app.stop() 同一收尾顺序并以 0 退出；
+    runner 的未知后台异常上抛到 listener 监督链，进程非零退出。
+    """
+    import os
+    import signal
+    import sys
+    import time
+    import traceback
+
+    for key, value in dict(env or {}).items():
+        os.environ[key] = str(value)
+
+    if ffmpeg_shim is not None:
+        os.environ["PATH"] = f"{ffmpeg_shim}{os.pathsep}{os.environ.get('PATH', '')}"
+        os.environ["CW_TEST_ENV_MARKER"] = "runner-env-marker"
+
+    from config_server import ServerConfig
+    from core.server.http_file_runner import HttpFileRunner
+    from core.server.http_server import HttpServer
+    from tests.harness.worker import run_recording_worker
+
+    ServerConfig.seg_cut_snap = False
+    manager = multiprocessing.Manager()
+    state = ServerState(queue_in=queue_in, queue_out=queue_out)
+    state.sockets_id = manager.list()
+    state.active_http_jobs = manager.list()
+    _apply_fault(fault)
+    if fault == "enqueue":
+        state.queue_in = _FaultyPutQueue(queue_in)
+
+    app = SimpleNamespace(state=state)
+    # 镜像生产 Application（core/server/app.py 的 ServerState(app=self)）：
+    # fail_active_tasks 等终态收尾从 state.app 取真实 runner
+    state.app = app
+    worker = multiprocessing.Process(
+        target=run_recording_worker,
+        args=(queue_in, queue_out, state.sockets_id, state.active_http_jobs,
+              options, calls, received),
+        daemon=True,
+    )
+    worker.start()
+    state.recognize_process = worker
+    process_manager = ProcessManager(app)
+    process_manager._process = worker
+    process_manager.is_alive = True
+    app.process_manager = process_manager
+    process_manager._wait_for_models()
+
+    http_server = HttpServer(app, "127.0.0.1", 0, data_dir)
+    http_server.prepare()
+    runner = HttpFileRunner(state, http_server)
+    http_server.attach_runner(runner)
+    state.http_result_sink = runner.result_sink
+    # 与生产 Application 同一形状：进程管理器从这里拿到真实 runner
+    app.http_file_runner = runner
+    # R4 探针：按环境变量把 FAILED 持久写卡在真实 I/O 入口上，父进程用标记文件
+    # 控制卡点与放行（跨进程等价于 in-process 探针的 asyncio.Event）
+    block_marker = os.environ.get("CW_TEST_PERSIST_BLOCK_MARKER")
+    if block_marker:
+        marker = Path(block_marker)
+        entered = Path(os.environ["CW_TEST_PERSIST_BLOCK_ENTERED"])
+        block_wait = float(os.environ.get("CW_TEST_PERSIST_BLOCK_WAIT", "30"))
+        real_fail_job = http_server.fail_job
+
+        async def blocked_fail_job(job_id, error_code):
+            entered.write_text("1")
+            deadline = time.monotonic() + block_wait
+            while not marker.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            return await real_fail_job(job_id, error_code)
+
+        http_server.fail_job = blocked_fail_job
+
+    async def shutdown():
+        state.queue_out.put(None)
+        process_manager.stop()
+        await http_server.stop()
+
+    async def serve():
+        from core.tools.daemon_executor import SimpleDaemonExecutor
+
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(SimpleDaemonExecutor())
+        stopping = asyncio.Event()
+        for name in ("SIGTERM", "SIGINT"):
+            signum = getattr(signal, name, None)
+            if signum is not None:
+                loop.add_signal_handler(signum, stopping.set)
+
+        sender = asyncio.create_task(ws_send(app))
+        monitor = asyncio.create_task(process_manager.monitor())
+        listener = asyncio.create_task(http_server.serve())
+        wait_stop = asyncio.ensure_future(stopping.wait())
+        tasks = {sender, monitor, listener, wait_stop}
+        while http_server._bound_port is None and not listener.done():
+            await asyncio.sleep(0.01)
+        if listener.done() and listener.exception() is not None:
+            print(
+                f"HTTP_LISTENER_FAILED={listener.exception()}",
+                file=sys.stderr, flush=True,
+            )
+            raise listener.exception()
+        info_queue.put((http_server._bound_port, worker.pid))
+
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        error = None
+        for task in done:
+            if task is wait_stop or task.cancelled():
+                continue
+            exc = task.exception()
+            if exc is not None and error is None:
+                error = exc
+        for task in tasks:
+            task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=15
+        )
+        if stopping.is_set():
+            await shutdown()
+        if error is not None:
+            print(f"HTTP_SERVER_FAILURE={error!r}", file=sys.stderr, flush=True)
+            traceback.print_exception(type(error), error, error.__traceback__)
+            raise error
+
+    asyncio.run(serve())
+
+
+def _child_with_stderr(args, stderr_fd):
+    """子进程先独立成组并把 fd 2/sys.stderr 指到测试日志文件，再进入真实服务主体。
+
+    两处都要处理：pytest 之类的捕获器可能已经把 sys.stderr 换成指向临时文件的对象，
+    只 dup2 不足以让 rich/print/traceback 落到本文件；独立成组则让父进程能用
+    killpg 一次收掉它自己 fork 出去的 Manager 与识别子进程，避免 SIGKILL 后遗留孤儿。
+    """
+    import sys as _sys
+
+    os.setsid()
+    os.dup2(stderr_fd, 2)
+    _sys.stderr = open(2, "w", buffering=1, errors="replace", closefd=False)
+    run_managed_http_server(*args)
+
+
+class ManagedHttpServerHarness:
+    """跨进程 HTTP 文件任务服务端句柄（信号、崩溃与非零退出验收用）。"""
+
+    def __init__(self):
+        self.process = None
+        self.stderr_path = None
+        self._stderr_handle = None
+        self.exitcode = None
+
+    @classmethod
+    async def start(cls, *, data_dir, options=None, fault=None, ffmpeg_shim=None,
+                    stderr_path=None, env=None):
+        self = cls()
+        self.manager = multiprocessing.Manager()
+        self.calls = self.manager.list()
+        self.received = self.manager.list()
+        self.info_queue = multiprocessing.Queue()
+        self.queue_in = self.manager.Queue()
+        self.queue_out = self.manager.Queue()
+        self.stderr_path = stderr_path or (Path(data_dir).parent / "server-stderr.log")
+        self.data_dir = Path(data_dir)
+        self.stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        self._stderr_handle = open(self.stderr_path, "wb")
+        self.process = multiprocessing.Process(
+            target=_child_with_stderr,
+            args=(
+                (
+                    self.info_queue, options or {}, self.calls, self.received,
+                    self.queue_in, self.queue_out, Path(data_dir), fault, ffmpeg_shim,
+                    dict(env or {}),
+                ),
+                self._stderr_handle.fileno(),
+            ),
+        )
+        self.process.start()
+        try:
+            port, self.worker_pid = await asyncio.to_thread(self.info_queue.get, True, 30)
+        except queue.Empty as exc:
+            await self.cleanup()
+            raise AssertionError(
+                f"等待 HTTP 测试服务启动信息超时 (30s)：{self.stderr_tail()}"
+            ) from exc
+        self.port = port
+        self.base_url = f"http://127.0.0.1:{port}"
+        return self
+
+    def read_db(self, sql: str, params: tuple = ()):
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{self.data_dir / 'http.sqlite3'}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    async def wait_for_exit(self, timeout: float = 20) -> int:
+        await asyncio.to_thread(self.process.join, timeout)
+        if self.process.is_alive():
+            raise AssertionError(
+                f"服务主进程在 {timeout}s 内未退出：{self.stderr_tail()}"
+            )
+        self.exitcode = self.process.exitcode
+        return self.exitcode
+
+    async def terminate(self, signum, timeout: float = 20) -> int:
+        # 只给服务主进程发信号：它自己按生产顺序收尾子进程，
+        # 整组广播会让 Manager/识别子进程被抢先杀掉而把正常 SIGTERM 变成非零退出
+        os.kill(self.process.pid, signum)
+        return await self.wait_for_exit(timeout)
+
+    async def stop(self, timeout: float = 20) -> int:
+        if self.process.is_alive():
+            return await self.terminate(signal.SIGTERM, timeout)
+        return self.process.exitcode
+
+    def stderr_tail(self, limit: int = 4000) -> str:
+        if self.stderr_path is None or not self.stderr_path.exists():
+            return ""
+        return self.stderr_path.read_text(encoding="utf-8", errors="replace")[-limit:]
+
+    async def cleanup(self) -> None:
+        if self.process is not None:
+            # 子进程 setsid 后自成组：主进程被 SIGKILL 时，它 fork 出去的 Manager 与
+            # 识别子进程不会自动退出，必须按组号收掉，否则每次运行都漏孤儿。
+            # 必须在回收主进程之前拿组号，reap 之后 getpgid 会查不到。
+            pgid = self.process.pid
+            if self.process.is_alive():
+                self.process.kill()
+            await asyncio.to_thread(self.process.join, 5)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await asyncio.to_thread(self.process.join, 5)
+        self.exitcode = self.process.exitcode if self.process is not None else None
+        if self._stderr_handle is not None:
+            self._stderr_handle.close()
+            self._stderr_handle = None
+        if self.info_queue is not None:
+            self.info_queue.close()
+        if self.manager is not None:
+            self.manager.shutdown()

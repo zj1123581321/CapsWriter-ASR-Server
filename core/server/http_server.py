@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from config_server import ServerConfig
+from core.server.http_file_runner import RunnerUnavailable
+from core.server.state import count_active_tasks
 from core.server.http_store import (
     IO_MAILBOX,
     MAX_BODY_CONCURRENCY,
@@ -112,6 +114,9 @@ class HttpServer:
     """aiohttp listener + I/O worker + 监督。"""
 
     def __init__(self, app, addr: str, port: int, data_dir: Path):
+        # 共享预算计数需要读 app.state.tasks（与 ws_recv 的 overloaded 判定同一份
+        # 内存状态）；store 层只有 SQLite，跨层注入沿用 inference_ready 的锚点
+        self._app = app
         self.addr = addr
         self.port = port
         self.data_dir = Path(data_dir)
@@ -127,6 +132,8 @@ class HttpServer:
         self._client_payload_error = None
         # 真实推理协调者是否已装配（M3 注入实现）；默认 False → commit 明确 503
         self.inference_available = False
+        # 已装配的文件 runner（E3）；为 None 时 commit 仍只看 inference_available
+        self.file_runner = None
         self._bound_port: Optional[int] = None
 
     # ---------------- 装配 ----------------
@@ -157,13 +164,40 @@ class HttpServer:
     def _open_store(self) -> HttpStore:
         return HttpStore(self.data_dir, inference_ready=self._inference_ready).open()
 
+    def attach_runner(self, runner) -> None:
+        """装配真实文件 runner：此后 commit 才受理并立即调度。"""
+        self.file_runner = runner
+        self.inference_available = True
+
+    def report_fatal(self, exc: BaseException) -> None:
+        """后台未知异常的唯一上抛口：停止 listener 并让进程非零退出。"""
+        self._mark_fatal(exc)
+
     def _inference_ready(self) -> bool:
         """实际推理协调者是否可用。
 
-        本增量没有真实文件 runner（属于 E3），因此恒为 False：外部 commit 明确
-        503 inference_unavailable，而不是受理后永远排队。E3 注入真实实现即可。
+        已装配 runner 时以 runner 为准（收尾后自动回到 503）；没有 runner 时
+        沿用 E2 的开关（默认 False → commit 明确 503，而不是受理后永远排队）。
         """
+        if self.file_runner is not None:
+            return self.file_runner.available
         return bool(self.inference_available)
+
+    # ---------------- runner 所需的受监督 I/O 入口 ----------------
+
+    async def job_source(self, job_id: str) -> dict:
+        """源文件路径与受理参数；只在 I/O worker 里读 SQLite。"""
+        return await self._worker.run(self._store.job_source, job_id)
+
+    async def record_result(self, job_id: str, payload: dict) -> None:
+        await self._worker.run(self._store.record_result, job_id, payload)
+
+    async def mark_running(self, job_id: str) -> bool:
+        # 开始解码前的 QUEUED -> RUNNING 转移；已在运行或已终态返回 False
+        return await self._worker.run(self._store.mark_running, job_id)
+
+    async def fail_job(self, job_id: str, error_code: str) -> bool:
+        return await self._worker.run(self._store.fail_job, job_id, error_code)
 
     def _add_routes(self, application) -> None:
         web = self._web
@@ -198,6 +232,11 @@ class HttpServer:
             await self.stop()
 
     async def stop(self) -> None:
+        # 先停 runner：Job 调度与解码进程必须在 I/O worker 与存储关闭前收尾
+        if self.file_runner is not None:
+            await self.file_runner.stop()
+            self.file_runner = None
+            self.inference_available = False
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -222,7 +261,10 @@ class HttpServer:
                 try:
                     return await handler(request)
                 except HttpStoreError as exc:
-                    return self._error_response(exc.status, exc.code, exc.message, request_id, exc.confirmed_offset)
+                    return self._error_response(
+                        exc.status, exc.code, exc.message, request_id,
+                        exc.confirmed_offset, exc.error_code,
+                    )
                 except asyncio.CancelledError:
                     # route 取消只结束等待方，底层 I/O 由 HttpIoWorker 跑完
                     raise
@@ -243,10 +285,14 @@ class HttpServer:
             logger.error("HTTP 未知 operation 失败，listener 将停止：%s", exc)
         self._fatal_event.set()
 
-    def _error_response(self, status, code, message, request_id, confirmed_offset=None):
+    def _error_response(self, status, code, message, request_id, confirmed_offset=None,
+                        error_code=None):
         payload = {"code": code, "message": message, "request_id": request_id}
         if confirmed_offset is not None:
             payload["confirmed_offset"] = confirmed_offset
+        if error_code is not None:
+            # 终态失败必须带上已持久化的 Job error_code
+            payload["error_code"] = error_code
         response = self._json(status, payload)
         if status == 408:
             response.force_close()
@@ -399,6 +445,16 @@ class HttpServer:
     async def _commit_upload(self, request):
         token = self._token(request)
         self._reject_encoding(request)
+        # R7：HTTP 准入与 WS 共用 max_tasks 的总量预算。计数走唯一原语
+        # count_active_tasks（活动 = state.tasks 非终态，HTTP 与 WS 一并计入）；
+        # HTTP 自己的表内计数由 store._check_job_admission 在事务里兜底。
+        # 与 WS 判定同为内存侧建议性计数（TOCTOU 窗口相同），不发明新错误码。
+        if count_active_tasks(self._app.state) >= ServerConfig.max_tasks:
+            raise HttpStoreError(
+                "too_many_jobs",
+                f"服务端活动任务已达共享上限 {ServerConfig.max_tasks}",
+                status=429,
+            )
         length = self._content_length(request)
         await self._read_body(request, MAX_CHUNK_BYTES, length)
         existed = await self._worker.run(
@@ -407,7 +463,16 @@ class HttpServer:
             ).fetchone()
         )
         job = await self._worker.run(self._store.commit_upload, request.match_info["upload_id"], token)
-        status = 200 if existed is not None and existed["state"] == "COMMITTED" else 202
+        already_committed = existed is not None and existed["state"] == "COMMITTED"
+        if self.file_runner is not None and not already_committed:
+            # 只在首次受理时调度：重复 commit 返回同一 Job，不重投、不自动重跑
+            try:
+                self.file_runner.submit(job.job_id)
+            except RunnerUnavailable as exc:
+                # 已经受理但此刻不可调度：立即可靠 FAILED，绝不留下永远排队的 Job
+                await self.file_runner.fail_job(job.job_id, "inference_unavailable", str(exc))
+                raise HttpStoreError("inference_unavailable", str(exc), status=503)
+        status = 200 if already_committed else 202
         return self._json(status, job.public(), headers={"X-Request-Id": request["request_id"]})
 
     async def _get_job(self, request):

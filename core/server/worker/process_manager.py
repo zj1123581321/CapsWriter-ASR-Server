@@ -157,6 +157,15 @@ class ProcessManager:
                         True,
                     )
                     await timeout_close
+                elif key[0] == 'http':
+                    # HTTP 分支：先可靠落库 FAILED，成功后才释放 owner/唤醒
+                    # 等待者；落库超时或失败不释放，随后仍 SystemExit(1)
+                    # 非零退出，交由重启收敛兜底。
+                    from ..http_file_runner import finalize_http_job
+                    await finalize_http_job(
+                        state, key, 'FAILED', 'inference_timeout',
+                        f"推理段超时，最早提交时间距今 {now - submitted_at:.3f}s",
+                    )
                 else:
                     from ..state import transition_terminal
                     transition_terminal(

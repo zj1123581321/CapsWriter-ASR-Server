@@ -57,6 +57,19 @@ def task_key_from_result(result: Result) -> TaskKey:
     return make_task_key(result.owner_kind, result.task_id, result.socket_id)
 
 
+def count_active_tasks(state, exclude_key: TaskKey | None = None) -> int:
+    """活动任务总量：state.tasks 中非终态记录，HTTP 与 WS 一并计入。
+
+    准入判定的唯一原语。exclude_key 供调用方排除自身已占位的 key。
+    """
+    ensure_server_runtime(state)
+    return sum(
+        1
+        for key, record in state.tasks.items()
+        if key != exclude_key and record.status not in {"DONE", "FAILED"}
+    )
+
+
 @dataclass
 class TaskLifecycle:
     status: str = 'RECEIVING'
@@ -299,3 +312,17 @@ def acknowledge_segment_result(state, key: TaskKey) -> None:
             record.segment_slots.release()
         if not pending:
             state.pending_segments.pop(key, None)
+
+
+def release_terminal_task(state, key: TaskKey) -> None:
+    """终态后释放 HTTP 任务的运行态记录。
+
+    只有已终态的任务可以释放：非终态记录一旦被清掉，runner 就会误以为该任务
+    已结束并停止提交后续段。结果 sink 与 runner 共用这一个出口，保证
+    「持久化或可靠 FAILED 之后才释放」这条不变式只有一处实现。
+    """
+    record = state.tasks.get(key)
+    if record is not None and record.status in {'DONE', 'FAILED'}:
+        state.tasks.pop(key, None)
+        from . import logger
+        logger.debug(f"已释放终态 HTTP 任务运行态记录 task={key[2]}")

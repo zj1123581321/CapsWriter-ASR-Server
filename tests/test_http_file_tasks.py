@@ -14,6 +14,7 @@ import threading
 from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -32,10 +33,11 @@ pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 入口�
 
 
 class _StubApp:
-    """HttpServer 只用到 app.loop（socket manager 才用），这里给出真实事件循环引用。"""
+    """HttpServer 只用到 app.loop 与 app.state（共享预算计数），这里给出真实引用。"""
 
     def __init__(self, loop):
         self.loop = loop
+        self.state = SimpleNamespace(tasks={})
 
 
 
@@ -308,6 +310,79 @@ async def test_resume_after_failed_patch_only_sends_unconfirmed_suffix(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_http_admission_shares_ws_budget(tmp_path):
+    """F4：HTTP 准入与 WS 共用 max_tasks=8 的总量预算（R7 规格）。
+
+    WS 活动任务占满共享预算时 HTTP commit 必须 429 too_many_jobs（复用既有
+    口径，不发明新错误码）；7 个 WS 时同一上传必须被受理——边界随共享计数
+    移动。计数以内存 state.tasks 为准（与 ws_recv 的 overloaded 判定同一份）。
+    """
+    from core.server.state import TaskLifecycle, make_task_key
+
+    source = _source(tmp_path)
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        tasks = server._app.state.tasks
+        # 7 个 WS 活动任务：共享预算未满，HTTP 必须被受理
+        for index in range(7):
+            tasks[make_task_key("ws", f"ws-task-{index}", f"socket-{index}")] = (
+                TaskLifecycle()
+            )
+        recovery = tmp_path / "resume7.json"
+        handle = await submit_file_http(
+            source, base_url, resume_path=recovery, chunk_bytes=1024
+        )
+        assert handle.job_id, "7 个 WS + 0 个 HTTP 时共享预算未满，commit 必须受理"
+
+        # 第 8 个 WS 占满共享预算：HTTP 再收就会双向突破 max_tasks
+        tasks[make_task_key("ws", "ws-task-7", "socket-7")] = TaskLifecycle()
+        error = await _expect_error(
+            submit_file_http(source, base_url, resume_path=tmp_path / "resume8.json", chunk_bytes=1024),
+            "too_many_jobs",
+        )
+        assert error.code == "too_many_jobs"
+        # 被拒的 commit 不留 Job 行（受理失败即不建立任务）
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 1
+
+
+@pytest.mark.asyncio
+async def test_shared_budget_counts_http_occupancy(tmp_path):
+    """7 WS + 1 已受理 HTTP = 活动总量 8 = max_tasks 时，第 9 个任务必须被拒。
+
+    主脑探针实测：上一卡只数 key[0]=='ws'，此场景仍会把第 9 个 accepted。
+    活动占用落在 state.tasks 非终态记录上（与唯一判定原语同一口径）；
+    被拒必须是 429 too_many_jobs，且不留下 Job 行。
+    """
+    from core.server.state import TaskLifecycle, make_task_key
+
+    source = _source(tmp_path)
+    recovery = tmp_path / "resume9.json"
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        tasks = server._app.state.tasks
+        for index in range(7):
+            tasks[make_task_key("ws", f"ws-task-{index}", f"socket-{index}")] = (
+                TaskLifecycle()
+            )
+        # 已受理 HTTP 的运行态记录：与 WS 一样占共享预算
+        tasks[make_task_key("http", "occupied-http-job")] = TaskLifecycle()
+        error = await _expect_error(
+            submit_file_http(source, base_url, resume_path=recovery, chunk_bytes=1024),
+            "too_many_jobs",
+        )
+        assert error.code == "too_many_jobs"
+        stored = json.loads(recovery.read_text(encoding="utf-8"))
+        headers = {"Authorization": f"Bearer {stored['token']}"}
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            commit = await client.post(
+                f"{base_url}/v1/uploads/{stored['upload_id']}/commit",
+                headers=headers,
+                content=b"",
+            )
+        assert commit.status_code == 429, commit.text
+        assert commit.json()["code"] == "too_many_jobs"
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 0
+
+
+@pytest.mark.asyncio
 async def test_job_lifecycle_repeated_commit_and_result_not_ready(tmp_path):
     """唯一 Job：重复 commit 仍返回同一 Job；无持久结果时 409 result_not_ready。"""
     source = _source(tmp_path, size=2048)
@@ -358,8 +433,9 @@ async def test_persisted_done_result_is_served_after_reopen(tmp_path):
         "time_complete": 3.0,
         "text": "你好世界",
         "text_accu": "你好世界",
-        "tokens": ["你", "好"],
-        "timestamps": [0.1, 0.5],
+        # 文件任务的 tokens 拼接必须与 text_accu 一致（storage 与 pipeline 同一约定）
+        "tokens": ["你", "好", "世", "界"],
+        "timestamps": [0.1, 0.5, 0.9, 1.3],
         "is_final": True,
     }
     async with running_server(tmp_path, inference=True) as (server, base_url):
@@ -383,8 +459,8 @@ async def test_persisted_done_result_is_served_after_reopen(tmp_path):
             assert fetched.status_code == 200
             payload = fetched.json()
             assert payload["text"] == "你好世界"
-            assert payload["tokens"] == ["你", "好"]
-            assert payload["timestamps"] == [0.1, 0.5]
+            assert payload["tokens"] == ["你", "好", "世", "界"]
+            assert payload["timestamps"] == [0.1, 0.5, 0.9, 1.3]
             assert payload["task_id"] == handle.job_id
             assert payload["is_final"] is True
         status = await sdk_http.get_file_job_http(base_url2, resume_path=recovery)

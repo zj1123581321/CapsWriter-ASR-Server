@@ -79,13 +79,22 @@ async def queue_error_and_close(
 
 
 async def fail_active_tasks(state, code: str, message: str, *, skip_key=None) -> None:
-    """给全部活动任务排 error 并等待各连接冲刷/关闭。"""
+    """给全部活动任务排 error 并等待各连接冲刷/关闭。
+
+    HTTP 任务没有连接可刷：必须先经 finalize_http_job 可靠落库 FAILED，
+    落库成功后才释放 owner/唤醒等待者；落库超时或失败不释放 owner，
+    由调用方按原语义非零退出，重启收敛兜底。
+    """
     ensure_server_runtime(state)
+    from ..http_file_runner import finalize_http_job
     closing = []
     for key, record in list(state.tasks.items()):
         if key == skip_key or record.status in {'DONE', 'FAILED'}:
             continue
-        websocket = state.sockets.get(key[1]) if key[0] == 'ws' else None
+        if key[0] == 'http':
+            await finalize_http_job(state, key, 'FAILED', code, message)
+            continue
+        websocket = state.sockets.get(key[1])
         if websocket is None:
             transition_terminal(state, key, 'FAILED')
             continue
@@ -134,13 +143,11 @@ async def ws_send(app):
         key = task_key_from_result(result)
         record = state.tasks.get(key)
         if record is None:
-            if result.owner_kind == 'http':
-                raise RuntimeError(
-                    f"HTTP 结果没有对应活动任务: task={result.task_id}"
-                )
+            # HTTP 任务在结果持久化（或可靠 FAILED）之后就会释放运行态记录，
+            # 因此无记录的 HTTP 结果按契约属于迟到结果：记账丢弃，不覆盖终态。
             logger.debug(
                 f"丢弃终态或无主迟到结果 task={result.task_id} "
-                f"socket={result.socket_id}"
+                f"socket={result.socket_id} owner_kind={result.owner_kind}"
             )
             continue
         if record.status in {'DONE', 'FAILED'}:
@@ -154,14 +161,12 @@ async def ws_send(app):
             sink = state.http_result_sink
             if sink is None:
                 raise RuntimeError('HTTP 结果持久消费者未注入')
-            await sink(result)
+            # HTTP 终态唯一收尾人是结果 sink（落库→转换→释放一体完成）；
+            # 本分支只做段确认，不得再做任何终态转换——重复转换与
+            # 两套终态责任并存的旧形态由结构约束钉死。段确认在 sink 之前：
+            # 与 WS 分支语义一致，终态释放后 pending/段名额已被清，事后确认无事可做。
             acknowledge_segment_result(state, key)
-            if result.error_code:
-                transition_terminal(
-                    state, key, 'FAILED', code=result.error_code
-                )
-            elif result.is_final:
-                transition_terminal(state, key, 'DONE')
+            await sink(result)
             logger.debug(f"已提交 HTTP 识别结果 task={result.task_id}")
             continue
 
