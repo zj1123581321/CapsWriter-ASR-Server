@@ -12,6 +12,6 @@
 ## 现场与验证环境
 
 - 独立 worktree，分支 `card/http-m6-review1-261003`；审查对象固定为派卡给定 H0，不追随后续提交。
-- Pickup：无匹配交接单；open issues 没有本卡新测试的直接修复认领。孤儿摘要为 `orphan 0 owned 0 unattributable 0 too-new 0 recent-7d 0 stale-over-7d 0 missing_ledger_repos 0`。memory 探针原文：`memory 巡检报告不可用：memory_dir_mismatch（/home/zlx/.local/state/memory-doctor/latest.json）`；恢复入口 `/home/zlx/projects/personal/agent-config/scripts/memory/memory_doctor_run.sh /home/zlx/projects/personal/agent-config`。
+- Pickup：无匹配交接单；open issues 没有本卡新测试的直接修复认领。孤儿摘要为 `orphan 0 owned 0 unattributable 0 too-new 0 recent-7d 0 stale-over-7d 0 missing_ledger_repos 0`。memory 探针报 `memory_dir_mismatch`，恢复脚本未在本轮执行。
 - Python 3.12.3、ffmpeg `/usr/bin/ffmpeg`；测试用隔离 `uv` 环境及卡面固定依赖，没有污染 main venv。systemd 单元 `codex-m6review1-systemdprobe-261004-1056421.service`，probe PID `1056442`，cgroup `/user.slice/user-1000.slice/user@1000.service/app.slice/codex-m6review1-systemdprobe-261004-1056421.service`，unit 自然成功退出。第一次探针因 `uv` 前置环境 bin 目录而对 PATH 逐字相等检查失败；调整为检查原白名单 PATH 后缀仍存在后，最终探针通过。失败的是探针判据，不是 QA 用例。
 - OCR 前置 JSON 状态为 `skipped / no_reviewable_items`，未视作 clean。基线 `gh api request failed`，继承红未能判定。
