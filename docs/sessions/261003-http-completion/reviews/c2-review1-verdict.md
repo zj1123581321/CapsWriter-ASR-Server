@@ -133,6 +133,6 @@ OCR 主腿从 start 到完成 553.789 秒；整文件测试约 1.77 秒，两个
 
 ## 下一步
 
-按卡面只提交本 verdict 与进度文件、push 当前 review 分支，并从远端核验 tip 与本地 clean status；不创建 review PR，不改 ready/merge/deploy 状态。
+本 verdict 与 progress 已按授权提交并推送到 review 分支，远端 tip 已核对与本地 HEAD 一致且工作树干净；未创建 review PR，也未改 ready、merge 或 deploy 状态。
 
 机读判据由 `本机 agent-config 中的 scripts/review/extract-failure-visibility.sh` 对本文件提取，实际 stdout 为 `p2-only`。仓库内相对路径 `scripts/review/extract-failure-visibility.sh` 不存在，已在 agent-config 中按文件名检索并调用本机脚本路径；判据未靠人读文本推断。
