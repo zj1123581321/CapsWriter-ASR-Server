@@ -38,7 +38,8 @@
 
 1. **同一次真实上传的字节链**：`submit_file_http` 真实发出的 PATCH body 序列拼接后
    == 源文件字节，且服务端 `sources/{upload_id}.bin` 的 SHA-256/长度与源文件一致。
-   反向红验：把 SDK 的 `content` 换成 JSON/Base64 包装 → 落盘 SHA 不等，AssertionError。
+   反向红验（**未实跑，记为未知**）：把 SDK 的 `content` 换成 JSON/Base64 包装应致落盘 SHA 不等；
+   本卡只实跑了红验 A–D 四条，这条不能当成已验证的反向证据。
 2. **丢响应后只识别 1 次**：commit 的真实 202 响应被丢弃后，客户端走显式恢复路径，
    实际网络请求序列 == `["GET", ...]`，SQLite 只 1 条 job，识别子进程收到的段数
    == 该 Job 一次解码的段数（不翻倍）。
@@ -52,7 +53,21 @@
 5. **末段失败不发布缺段成功**：`is_final` 那次解码抛错时，子进程已发出前几段的非 final
    Result，但 Job 必须是 `FAILED[inference_failed]`、`results` 表 0 行、`GET result` 409。
 
-## 红验记录（scratch，脚本保留在 /tmp/m6-red/ 与 tests/red_*.py，均不入库）
+## 红验记录（scratch，脚本保留在本卡 /tmp 私有目录，均不入库）
+
+保留位置（2026-10-04 实测核对过，非推断）：
+
+- `/tmp/m6-red/`：`red_a_ws_cleanup.sh`（1338 B）、`red_a2.sh`（1183 B）、`red_b_resample.sh`（1149 B）
+- `/tmp/m6-red-dlg-20261003-170302-cea070/`：本 dispatch 唯一目录，
+  `red_c_partial_publish.py`（1217 B，sha256 `7bb59214…d9fa4`）、
+  `red_d_auto_retry.py`（1374 B，sha256 `cea436c8…6b654`）。
+  两者原先放在仓库 `tests/` 下（未跟踪、越 Scope），现已**移动**到此处，未删除、未覆盖他任务脚本。
+  从新位置实跑（仓库根目录下 `/tmp/c2-review2-systemd-venv/bin/python -m pytest`，websockets 15.0.1）：
+  `2 failed`，红点仍是原来的两条——C 在 `tests/test_http_qa_e2e.py` 的
+  `assert status.state == "FAILED"` 处红（`assert 'DONE' == 'FAILED'`），D 在 `:516` 的
+  `assert len(recorder.dropped) == 1` 处红（`assert 2 == 1`，自动重发让被丢弃的 202 变成 2 个）。
+  即脚本搬走后仍能真实复现，不是「pytest 不收集所以合规」。
+  `/tmp` 非持久介质，机器重启不保证存活；证据本体仍以本文件的红验表为准。
 
 | 编号 | 注入的相反实现 | 目标用例 | 实测结果 |
 |---|---|---|---|
@@ -69,6 +84,8 @@
 
 - 真实三平台部署、真实 ASR 模型、真实字节/质量基线：本卡全部用假引擎 + 真解码，
   **不得**据此宣称 HTTP 已可用或质量达标。
-- 1 GiB / 16 GiB / 2 GiB 等物理容量按缩小常量验证类别与等值边界，未按真实上限压测。
+- 组 1 的「相反实现→红」未跑（见上），只靠绿测试约束。
+- 组 9 的 1 GiB / 16 GiB / 2 GiB 物理上限按缩小常量验证类别与等值边界，未按真实上限压测。
+- `docs/sessions/261001-http-files/qa.md` 的 12 组「当前证明」已按上表逐组回填真实测试与证据路径。
 - 原主干 `2919` 那次并发 commit 读超时的根因仍未定位，见
   `docs/sessions/261003-http-completion/fix55-merged-acceptance-evidence.md`。
