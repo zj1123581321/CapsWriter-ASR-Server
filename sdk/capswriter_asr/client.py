@@ -452,11 +452,19 @@ async def transcribe_file(
     started = time.monotonic()
     deadline = {"at": started + (120.0 if deadline_total is None else deadline_total)}
     deadline_changed = asyncio.Event()
+    # 阶段标记：本地准备（健康检查/转码/样本计数）结束后由 set_deadline 翻到远端转录，
+    # 只用于让 timeout 消息能区分卡在哪一段，不对外暴露。
+    stage = {"name": "本地准备"}
 
     def set_deadline(seconds: float) -> None:
+        stage["name"] = "远端转录"
         if deadline_total is None:
-            deadline["at"] = started + seconds
+            # 默认时限：本地准备阶段结束后重新锚定，转码耗时不再算进远端转录预算。
+            deadline["at"] = time.monotonic() + seconds
             deadline_changed.set()
+
+    def timeout_error() -> AsrError:
+        return AsrError("timeout", f"转录超过 deadline_total：{stage['name']}阶段超时")
 
     async def operation() -> Transcript:
         return await _operation(
@@ -477,12 +485,12 @@ async def transcribe_file(
         while True:
             remaining = deadline["at"] - time.monotonic()
             if remaining <= 0:
-                raise AsrError("timeout", "转录超过 deadline_total")
+                raise timeout_error()
             try:
                 await asyncio.wait_for(deadline_changed.wait(), timeout=remaining)
             except TimeoutError:
                 if deadline["at"] <= time.monotonic():
-                    raise AsrError("timeout", "转录超过 deadline_total")
+                    raise timeout_error()
             else:
                 deadline_changed.clear()
 
@@ -495,7 +503,7 @@ async def transcribe_file(
         if timer_task in done:
             timer_task.result()
         if time.monotonic() >= deadline["at"]:
-            raise AsrError("timeout", "转录超过 deadline_total")
+            raise timeout_error()
         return operation_task.result()
     finally:
         for task in (operation_task, timer_task):
