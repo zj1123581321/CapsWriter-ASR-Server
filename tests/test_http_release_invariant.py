@@ -11,7 +11,11 @@
    ``finalize_http_job``。
 3. 顺序约束：每个可能携带 http key 的调用点，源码顺序上必须先有持久化
    await（且被 ``wait_for`` 卡住上限）才有 ``transition_terminal``。
-4. ws-only 形状：其余调用点的 key 参数必须是 ws 字面量，或源自
+4. 终态责任唯一：HTTP 结果分支（ws_send 的 http 分支）不得自行终态转换；
+   成功路径由 ``HttpResultSink.__call__`` 落库→转换→释放一体完成，失败路径
+   由 ``runner.fail_job`` 完成，运行时由 ``test_http_double_terminal_eliminated``
+   直数计数（每条路径恰好一次）。
+5. ws-only 形状：其余调用点的 key 参数必须是 ws 字面量，或源自
    ``connection_tasks``——而 ``connection_tasks`` 只装 ws key 由
    ``begin_task`` 的形状约束钉死。
 
@@ -22,6 +26,7 @@
 from __future__ import annotations
 
 import ast
+import shutil
 from pathlib import Path
 
 import pytest
@@ -38,12 +43,15 @@ EXPECTED_TERMINAL_CALLS = {
         # 1 = ws 兜底（socket 已消失的 ws key）；http key 由 http 守卫 continue 掉，
         # 必须走 finalize_http_job（见 test_violating_paths_go_through_finalize）
         "fail_active_tasks": 1,
-        "ws_send": 4,
+        # ws_send 只剩 WS 路径的 2 处；HTTP 结果分支的转换责任完全移交 sink，
+        # 分支内一行转换都不许有（见 test_ws_send_http_branch_has_no_transition）
+        "ws_send": 2,
     },
     "worker/process_manager.py": {"monitor": 1},
-    # finalize_http_job 通过 runner.fail_job 落库+释放（机制只有一份，
+    # __call__ = HttpResultSink 成功路径的唯一转换（落库→转换→释放一体）；
+    # finalize_http_job 与失败路径都经 runner.fail_job 落库+释放（机制只有一份，
     # 见 test_finalize_entry_persists_before_release_with_bounded_wait 的链式断言）
-    "http_file_runner.py": {"fail_job": 1},
+    "http_file_runner.py": {"__call__": 1, "fail_job": 1},
 }
 
 
@@ -283,8 +291,15 @@ def test_violating_paths_go_through_finalize():
     assert nested_in_http, "finalize_http_job 必须位于 monitor 的 http 分支内"
 
 
-def test_ws_send_http_result_branch_sinks_before_terminal():
-    """约束 3c：ws_send 的 HTTP 结果分支先 sink 持久化，再 transition_terminal。"""
+def test_ws_send_http_branch_has_no_transition():
+    """HTTP 结果分支不得自行终态转换：终态责任唯一属于结果 sink。
+
+    旧形态（缺陷）：sink 失败路径已落库 FAILED + 转换 + 释放运行态记录，
+    ws_send 回到自己的分支后又对同一 key 转一次（重复终态）；成功路径 sink
+    只落库不转换，转换由 ws_send 补——两套终态责任并存，与
+    state.py release_terminal_task 的文档声明矛盾。本断言锁定修复形态：
+    ws_send HTTP 分支只有 sink + acknowledge，一行转换都不剩。
+    """
     ws_send = _functions(_load("connection/ws_send.py"))["ws_send"]
     http_branches = [
         node
@@ -293,18 +308,47 @@ def test_ws_send_http_result_branch_sinks_before_terminal():
     ]
     assert len(http_branches) == 1, "ws_send 只允许一个 HTTP 结果分支"
     branch = http_branches[0]
-    sinks = _awaits_of(branch, "sink")
-    assert len(sinks) == 1, "HTTP 结果分支必须经 sink 持久化"
-    branch_terminals = _terminal_calls(branch)
-    assert len(branch_terminals) == 2, "HTTP 结果分支只允许 error/final 两处释放"
-    assert all(t.lineno > sinks[0].lineno for t in branch_terminals), (
-        "R4 顺序被破坏：HTTP 终态先于结果持久化被释放"
+    assert _terminal_calls(branch) == [], (
+        "ws_send 的 HTTP 分支仍在自行终态转换；HTTP 终态唯一收尾人是结果 sink"
     )
+    sinks = _awaits_of(branch, "sink")
+    assert len(sinks) == 1, "HTTP 结果分支必须经 sink 收尾（落库→转换→释放一体）"
     assert isinstance(branch.body[-1], ast.Continue), (
         "HTTP 分支必须以 continue 收尾，之后的调用点才天然是 WS 专属"
     )
     after = [t for t in _terminal_calls(ws_send) if t.lineno > branch.end_lineno]
     assert len(after) == 2, "HTTP 分支之后只允许 WS 路径的两处释放"
+
+
+def test_sink_success_path_persists_transitions_releases_in_order():
+    """sink 成功路径补完：record_result 落库 → transition_terminal → 释放运行态记录。"""
+    http_tree = _load("http_file_runner.py")
+    sink_call = _functions(http_tree)["__call__"]  # HttpResultSink.__call__
+    terminals = _terminal_calls(sink_call)
+    assert len(terminals) == 1, (
+        "sink 成功路径必须恰好做一次终态转换（status 必须是 DONE）"
+    )
+    done_args = terminals[0].args
+    assert any(
+        isinstance(arg, ast.Constant) and arg.value == "DONE" for arg in done_args
+    ), "sink 成功路径的转换终态必须是 DONE"
+    persists = _awaits_of(sink_call, "record_result")
+    assert len(persists) == 1, "成功路径只有 record_result 一处持久化写"
+    releases = [
+        item
+        for item in ast.walk(sink_call)
+        if isinstance(item, ast.Call)
+        and _call_name(item.func) == "release_terminal_task"
+    ]
+    assert len(releases) == 1, "成功路径必须释放运行态记录（与失败路径同形态）"
+    assert persists[0].lineno < terminals[0].lineno < releases[0].lineno, (
+        "R4 顺序被破坏：成功路径必须先落库 DONE，再转换，最后释放记录"
+    )
+    # 失败路径仍经 runner.fail_job（其内部顺序由 test_runner_fail_job_persists_before_release 钉住）
+    assert len(_awaits_of(sink_call, "_fail")) == 4, (
+        "sink 的失败出口（error_code/结果校验 HttpStoreError/未知异常/落库失败）"
+        "必须都走 _fail → fail_job，且未知异常出口继续上抛"
+    )
 
 
 def test_ws_only_sites_use_ws_shaped_keys():
@@ -379,6 +423,82 @@ def test_connection_tasks_only_holds_ws_keys():
             break
         ancestor = parents.get(ancestor)
     assert guarded, "connection_tasks 赋值不在 ws 守卫之下，ws-only key 推导失效"
+
+
+# ---------------------------------------------------------------- 运行时计数探针
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None,
+    reason="本机 PATH 中没有 ffmpeg，HTTP 文件解码链无法验证",
+)
+async def test_http_double_terminal_eliminated(tmp_path, monkeypatch):
+    """重复终态直数计数：成功/失败两条路径各自恰好转换一次。
+
+    不依赖「测试通过」间接推断——用计数包装器包住全部持有
+    transition_terminal 私有引用的模块（state/ws_send/http_file_runner），
+    对 (job_id, status) 逐次计数：旧缺陷形态下失败路径会被 sink 与 ws_send
+    各转一次（计数=2），修复后两条路径都必须恰好=1。
+    """
+    pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 入口默认关闭")
+    import importlib
+
+    import core.server.state as state_module
+    from tests.test_http_file_runner import (
+        FAKE_ENGINE,
+        make_container,
+        running_runner_server,
+        submit,
+        wait_terminal,
+    )
+
+    counts: dict = {}
+    real_transition = state_module.transition_terminal
+
+    def counting_transition(state, key, status, code=None):
+        counts[(key[2], status)] = counts.get((key[2], status), 0) + 1
+        return real_transition(state, key, status, code)
+
+    # 三个模块都以 `from ..state import transition_terminal` 持有私有引用，
+    # 逐一替换才能把全部调用点都纳入计数
+    for modname in (
+        "core.server.state",
+        "core.server.connection.ws_send",
+        "core.server.http_file_runner",
+    ):
+        monkeypatch.setattr(
+            importlib.import_module(modname),
+            "transition_terminal",
+            counting_transition,
+        )
+
+    source = make_container(tmp_path, "double-term.mp3")
+
+    # 成功路径：sink 落库 DONE 后自己转换并释放，ws_send 不得再转
+    async with running_runner_server(tmp_path) as harness:
+        recovery = tmp_path / "ok.json"
+        handle = await submit(
+            harness, source, recovery, seg_duration=5.0, seg_overlap=1.0
+        )
+        assert (await wait_terminal(harness, recovery)).state == "DONE"
+        assert counts.get((handle.job_id, "DONE")) == 1, counts
+        assert counts.get((handle.job_id, "FAILED")) is None, counts
+        assert list(harness.state.active_http_jobs) == []
+        assert harness.state.tasks == {}
+
+    # 失败路径：sink 的 fail_job 已落库+转换+释放，ws_send 不得再转
+    failing = dict(FAKE_ENGINE, fail_on_call=2)
+    async with running_runner_server(tmp_path, options=failing) as harness:
+        recovery = tmp_path / "bad.json"
+        handle = await submit(
+            harness, source, recovery, seg_duration=5.0, seg_overlap=1.0
+        )
+        status = await wait_terminal(harness, recovery)
+        assert status.state == "FAILED"
+        assert counts.get((handle.job_id, "FAILED")) == 1, counts
+        assert list(harness.state.active_http_jobs) == []
+        assert harness.state.tasks == {}
 
 
 if __name__ == "__main__":  # pragma: no cover - 手动调试入口
