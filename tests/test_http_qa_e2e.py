@@ -556,3 +556,99 @@ async def test_lost_commit_response_recovers_with_exactly_one_recognition(
         after_resume = [method for method, _ in recorder.calls[before_resume + 1:]]
         assert after_resume, "恢复之后至少应有状态轮询请求"
         assert set(after_resume) == {"GET"}, after_resume
+
+
+# ---------------------------------------------------------------- 组 10：重采样后的有界 PCM
+
+
+def make_pcm_container(tmp_path: Path, name: str, *, seconds: float, rate: int, channels: int):
+    """用真实 ffmpeg 从指定采样率/声道数的原始 PCM 造容器（不是 16 kHz 的同义改写）。"""
+    count = round(seconds * rate)
+    t = np.arange(count, dtype=np.float64) / rate
+    wave = 0.2 * np.sin(2 * np.pi * 220 * t) * np.sin(2 * np.pi * 0.7 * t)
+    interleaved = np.repeat(wave, channels).astype("<f4").tobytes()
+    raw = tmp_path / f"{name}.raw"
+    raw.write_bytes(interleaved)
+    target = tmp_path / name
+    subprocess.run(
+        [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "f32le", "-ar", str(rate), "-ac", str(channels), "-i", str(raw),
+         "-c:a", "pcm_s16le", str(target)],
+        check=True, capture_output=True,
+    )
+    assert target.stat().st_size > 0
+    return target
+
+
+RESAMPLE_MATRIX = [
+    {"name": "stereo44.wav", "rate": 44100, "channels": 2},
+    {"name": "mono8k.wav", "rate": 8000, "channels": 1},
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", RESAMPLE_MATRIX)
+async def test_resampled_sources_produce_bounded_16k_mono_f32_segments(
+    tmp_path, monkeypatch, case
+):
+    """组 10：44.1 kHz 立体声 / 8 kHz 单声道经真 ffmpeg 后仍是有界 16 k mono f32 段。
+
+    关键不变式：段样本数之和等于独立跑一次真 ffmpeg 得到的样本数（真的重采样+降混，
+    不是把原始字节搬过去）；每段 `samplerate=16000`、字节数是 4 的倍数、单段有界；
+    送进 worker 的 PCM 字节明显少于源文件字节（没有把整文件交给 worker）。
+    """
+    ffmpeg_log = install_recording_ffmpeg(tmp_path, monkeypatch)
+    source = make_pcm_container(
+        tmp_path, case["name"], seconds=20.0, rate=case["rate"], channels=case["channels"],
+    )
+    source_bytes = source.stat().st_size
+    expected_samples = decoded_sample_count(source)
+    recovery = tmp_path / "resume.json"
+
+    async with running_runner_server(tmp_path) as harness:
+        handle = await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
+        status = await wait_terminal(harness, recovery)
+        assert status.state == "DONE", status
+        transcript = await get_file_result_http(harness.base_url, resume_path=recovery)
+        assert transcript.raw["task_id"] == handle.job_id
+
+        segments = harness.tasks(handle.job_id)
+        assert len(segments) >= 2, segments
+        assert all(item["owner_kind"] == "http" for item in segments)
+        assert all(item["samplerate"] == 16000 for item in segments), segments
+        assert all(item["data_bytes"] % 4 == 0 for item in segments), segments
+        assert all(item["samples"] == item["data_bytes"] // 4 for item in segments)
+        assert sum(1 for item in segments if item["is_final"]) == 1
+        assert segments[-1]["is_final"] is True
+
+        # 去掉重叠后各段正好覆盖真 ffmpeg 解出的样本数
+        covered = segments[-1]["samples"]
+        for previous, item in zip(segments, segments[1:]):
+            stride = previous["samples"] - round(previous["overlap"] * 16000)
+            assert item["offset"] == pytest.approx(
+                previous["offset"] + stride / 16000, abs=1e-6,
+            )
+            covered += stride
+        assert covered == expected_samples, (case, covered, expected_samples)
+
+        # 有界：单段样本数不超过段预算（seg_duration + seg_overlap = 6s，留 1s 余量）
+        assert max(item["samples"] for item in segments) <= 16000 * 7
+        # worker 拿到的是有界 16 k mono f32：字节数正好等于「样本数 + 各段重叠」，
+        # 没有任何一段就是整份源文件（段摘要里找不到源文件摘要）
+        delivered_samples = sum(item["samples"] for item in segments)
+        overlap_samples = sum(
+            round(item["overlap"] * 16000) for item in segments[:-1]
+        )
+        assert delivered_samples == expected_samples + overlap_samples, (
+            case, delivered_samples, expected_samples, overlap_samples,
+        )
+        source_digest = sha256(source.read_bytes()).hexdigest()[:16]
+        assert source_digest not in {item["data_sha256_prefix"] for item in segments}
+
+        # 解码 argv 仍固定为 16 kHz mono f32 管道
+        starts = read_ffmpeg_starts(ffmpeg_log)
+        assert len(starts) == 1, starts
+        assert starts[0]["argv"][-7:] == [
+            "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1",
+        ]
+        assert str(harness.data_dir / "sources" / f"{handle.upload_id}.bin") in starts[0]["argv"]
