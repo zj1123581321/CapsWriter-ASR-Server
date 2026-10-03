@@ -16,17 +16,19 @@
 
 ## 原超时停在哪
 
-原预检执行器版本来自只读 runtime release `6be78d57128687f285353687f448bb7053ec5a6e`。卡面 Verify-Command 是：
+主脑记录的旧进程实际工具命令使用 agent-config 主 checkout 中的脚本；以下路径用 `$HOME` 表示。命令明确传入 `--verify-timeout-sec 900`，并非依赖默认的 2700 秒：
 
 ```sh
-uv run --no-project --python 3.12 --with numpy --with rich --with websockets --with colorama --with pytest==9.1.1 --with soundfile --with pytest-asyncio==1.4.0 --with aiohttp==3.14.3 --with httpx==0.28.1 python -m pytest tests/ -q -p no:cacheprovider
+python3 "$HOME/projects/personal/agent-config/scripts/delegate/accept_precheck.py" \
+  --dispatch-id dlg-20261003-095625-b3602a \
+  --repo-path "$HOME/projects/oss/CapsWriter-Offline-with-AI-worktrees/lead-261003-47579f61" \
+  --commit-range e066930ef38aabe8e5051c9256463646f62a7186..6adeba5b39409964ca11634ed2ba1760a4fde56c \
+  --verify-timeout-sec 900 --timeout-sec 1200
 ```
 
-工具的 `scripts/ci/ci_evidence.py:142-150` 只把两条固定命令识别为 `ci-standard-v1`：`bash tests/all-shards.sh all` 与 `bash scripts/ci/remote-suite.sh`。本卡自定义 `uv ... pytest tests/` 命令不匹配，因此工具按普通 Verify 路径执行 `bash -c <卡面命令>`，工作目录是临时合并 worktree，子进程继承预检进程环境；`start_new_session=True`。这说明验证通道是本机完整 pytest，而不是 CI 等待通道。
+旧结果只证明总超时发生在 `verify_on_merged_main` 阶段，三项状态被记为 `unknown`；没有 Verify 退出码、子步骤耗时或完整输出。旧 PID `1846363` 已退出；只读检查未发现对应的 `accept-precheck-1846363-*` 临时树、活动测试子进程或可归因于该次执行的锁。历史根因仍未证实，现有证据不能区分测试、环境、锁或其他运行时延迟。
 
-临时树根由 `precheck_worktrees.py` 的 `precheck_worktree_root()` 决定：本机 `XDG_STATE_HOME` 未设置时默认为 `$HOME/.local/state/delegate/precheck-worktrees`，目录名含创建者 PID。原 PID `1846363` 当前已退出，未找到 `accept-precheck-1846363-*` 残留树、活动测试子进程或可归因于该次执行的锁。原结果没有保存子进程 PID、实际 cwd、环境白名单、Verify 输出或子步骤时长；因此不能证明当时是 `uv` 锁、环境、测试用例还是其他运行时延迟造成了 1200 秒耗尽。
-
-能确定的是预算边界：预检主程序用总闹钟 1200 秒；默认 Verify 单步超时为 2700 秒。原报告的 `总时限 1200s 超时，卡在步骤 verify_on_merged_main` 表示外层总闹钟先于单步 Verify 超时触发，并把三项状态统一降为 `unknown`。它不能证明 pytest 本身卡死。旧代码的 `check_verify_on_merged_main()` 在单步 `communicate()` 上捕获 `subprocess.TimeoutExpired` 时会杀子进程组，但外层 `PrecheckTimeout` 走另一条捕获路径；源代码未在该路径显式杀掉 Verify 子进程组。当前未观察到旧子进程残留，故这一点是代码路径风险，不是已观察到的旧现场残留。
+复验诊断时 `runtime/current` 指向 release `6be78d57128687f285353687f448bb7053ec5a6e`，但旧命令使用的是 agent-config 主 checkout 路径；没有归档旧 PID 的脚本版本、实际环境和 cwd。故该 runtime release 只能说明复验工具来源，不能证明旧 PID 加载了它。也没有足够的历史版本与参数证据判断旧运行中 `900` 如何被消费，不据此推测超时机制。
 
 ## 受限复验的真实命令与产物
 
@@ -40,7 +42,7 @@ XDG_STATE_HOME="$HOME/.local/state" python3 "$HOME/.local/lib/agent-config-runti
   --timeout-sec 1200 --verify-timeout-sec 2700
 ```
 
-`--repo-path` 指向本卡独立 worktree；工具按其 git common dir 定位主仓。上面的公开命令用 `$PWD`、`$HOME` 表示复验时展开的本机路径。`--commit-range` 保持原业务范围，参数没有扩大；1200 秒总上限未延长。复验临时树为 `accept-precheck-323199-k_pg2odf`，PID 323199 退出后由工具正常清理。运行环境为 Python 3.12.3、uv 0.12.10；`XDG_STATE_HOME` 显式设为 `$HOME/.local/state`。复验结果文件仍由真实 producer 写入，关键字段为：`status=green`、`head_sha=6adeba5b39409964ca11634ed2ba1760a4fde56c`、`main_sha_at_check=29194075a088dd00b8b3a3e8d8fc3a752f643f24`、scope green、Verify exit 0。
+`--repo-path` 指向本卡独立 worktree；工具按其 git common dir 定位主仓。复验时 `runtime/current` 指向上文 release；这只标识复验工具。复验保留原 `--commit-range` 和 1200 秒总上限，但将子步骤上限设为 `--verify-timeout-sec 2700`，高于旧实际命令中的 900 秒，是明确的参数偏差，不能称所有时限均不变。实际 Verify 用时 220.56 秒，低于旧命令记录的 900 秒；这保留了成功验收结果的证据，但不证明旧参数合规或旧超时根因。复验临时树为 `accept-precheck-323199-k_pg2odf`，PID 323199 退出后由工具正常清理。运行环境为 Python 3.12.3、uv 0.12.10；`XDG_STATE_HOME` 显式设为 `$HOME/.local/state`。复验结果文件仍由真实 producer 写入，关键字段为：`status=green`、`head_sha=6adeba5b39409964ca11634ed2ba1760a4fde56c`、`main_sha_at_check=29194075a088dd00b8b3a3e8d8fc3a752f643f24`、scope green、Verify exit 0。
 
 ## 独立裸 shell 全量测试
 
@@ -57,12 +59,6 @@ uv run --no-project --python 3.12 --with numpy --with rich --with websockets --w
 - **继承红**：无法判定。
 - **新红**：没有确认可复现的新红；记录一次同 SHA 的本机瞬时失败，后续正式预检和远端主干 CI 均通过。没有用这两个绿覆盖首次红的存在。
 
-## 责任仓 issue 草稿（未创建）
+## 根因状态
 
-目标仓：`agent-config`。静态代码风险，尚未用合成 fixture 复现；不跨仓改动。
-
-**标题**：`accept_precheck 总时限触发时应终止正在运行的 Verify 子进程组`
-
-**正文草稿**：
-
-`accept_precheck.py` 用 SIGALRM 抛出 `PrecheckTimeout`。当 Verify 子进程仍在 `Popen(..., start_new_session=True)` / `communicate(timeout=verify_timeout_sec)` 中运行时，若较短的 `--total-timeout-sec` 先到，异常会越过仅处理 `subprocess.TimeoutExpired` 的进程组清理分支；当前代码继续清理临时 worktree 并写总状态，但没有显式终止该 Verify 子进程组。超时 JSON 也把所有检查统一记成 unknown，未保留已经完成的 scope 状态与当前 Verify 的 argv/cwd/来源。建议加一个 sleep 子进程的负控：`--timeout-sec 2 --verify-timeout-sec 30` 后断言状态为 timeout、子进程组已退出、worktree 生命周期与报告字段一致。此次历史 PID 已退出且无残留树，故此风险未被认定为本次现场已发生的子进程泄漏。`
+原记录可证的范围仅为：总超时停在 `verify_on_merged_main`、旧 PID 已退出且未发现可归因残留；根因未证。此前基于复验时源码写出的子进程清理机制和责任仓 issue 草稿不能归因到历史 PID，本次不将它们作为现场根因或结论。
