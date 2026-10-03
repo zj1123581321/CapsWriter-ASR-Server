@@ -1231,7 +1231,10 @@ async def test_finalize_giveup_keeps_owner_when_persist_times_out(tmp_path, monk
             monkeypatch.setattr(harness.http_server, "fail_job", stuck_fail_job)
             loop = asyncio.get_running_loop()
             started = loop.time()
-            await fail_active_tasks(harness.state, "internal", "R4 超时兜底探针")
+            # 落库超时/失败的统一语义：不释放 owner，按监督路径一致语义非零退出
+            # （SystemExit 直接抛进等待方协程；旧形态是正常返回，此处会变红）
+            with pytest.raises(SystemExit):
+                await fail_active_tasks(harness.state, "internal", "R4 超时兜底探针")
             assert entered.is_set(), "fail_active_tasks 没有触发持久写，探针没打到点"
             assert loop.time() - started < 10, (
                 "finalize 没有在超时限内放弃，进程会被永久挂住"
@@ -1247,6 +1250,178 @@ async def test_finalize_giveup_keeps_owner_when_persist_times_out(tmp_path, monk
             assert any("持久失败事实未落库" in m for m in messages), messages
     finally:
         server_logger.removeHandler(capture)
+
+
+@pytest.mark.asyncio
+async def test_fail_job_persist_bounded(tmp_path, monkeypatch):
+    """F2+F3：fail_job 内部的有界期限与落库未成功的统一语义。
+
+    腿 1：持久化立即抛错 → SystemExit 非零退出、owner/记录不释放、显式日志
+    （旧形态是异常裸上抛，断言变红）；
+    腿 2：持久化卡死 → wait_for 在收紧的上限内截断（旧形态无 wait_for，
+    会在 60s 处才返回——有界性断言变红）。
+    """
+    import logging
+
+    from core.server import http_file_runner as runner_module
+    from core.server import logger as server_logger
+    from core.server.http_store import HttpStoreError
+    from core.server.state import TaskLifecycle
+
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    capture = _Capture(level=logging.ERROR)
+    server_logger.addHandler(capture)
+    monkeypatch.setattr(runner_module, "HTTP_FINALIZE_TIMEOUT", 0.3)
+    try:
+        state = ServerState()
+        state.active_http_jobs = []
+        state.tasks[make_task_key("http", "job-raise")] = TaskLifecycle()
+        state.tasks[make_task_key("http", "job-stuck")] = TaskLifecycle()
+
+        class _StubHttp:
+            def __init__(self, mode):
+                self.mode = mode
+
+            async def fail_job(self, job_id, error_code):
+                if self.mode == "raise":
+                    raise HttpStoreError("io_failed", "探针：持久化失败", status=507)
+                await asyncio.sleep(60)
+
+        runner = runner_module.HttpFileRunner(state, _StubHttp("raise"))
+        with pytest.raises(SystemExit):
+            await runner.fail_job("job-raise", "internal", "探针：落库失败语义")
+        # 不释放 owner、不转换内存记录：失败事实未落库就不得放行
+        assert "job-raise" not in list(state.active_http_jobs)
+        key_raise = make_task_key("http", "job-raise")
+        assert state.tasks[key_raise].status == "RECEIVING"
+        messages = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
+        assert any(
+            "持久失败事实未落库" in m and "job-raise" in m for m in messages
+        ), messages
+
+        # 腿 2：卡死的持久写被有界期限截断（0.3s 上限，而不是等满 60s）
+        runner.http = _StubHttp("stuck")
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(SystemExit):
+            await runner.fail_job("job-stuck", "internal", "探针：有界期限")
+        assert loop.time() - started < 5, "wait_for 上界失效，持久写挂死了进程"
+        assert state.tasks[make_task_key("http", "job-stuck")].status == "RECEIVING"
+    finally:
+        server_logger.removeHandler(capture)
+
+
+@pytest.mark.asyncio
+async def test_gate_held_when_persist_uncommitted(tmp_path, monkeypatch):
+    """F2 验收：落库未成功时闸门不放行、进程非零退出、重启收敛兜底。
+
+    触发走 runner 自己的失败路径（sink → fail_job）：基线上 fail_job 无超时
+    也无退出定论，被卡死的持久写会永远挂住进程（本用例红于「进程 30s 不退出」）；
+    修复后 wait_for 在 5s 上界截断 → 不释放 owner/闸门、SystemExit 非零退出。
+    验收判据：卡住窗口内第一个 Job 仍 RUNNING、第二个 Job 保持 QUEUED 且未
+    开始解码；退出码非零；重启后两个 Job 收敛为 FAILED[server_restarted]。
+    """
+    from tests.harness.server import ManagedHttpServerHarness
+
+    install_recording_ffmpeg(tmp_path, monkeypatch)
+    failing = dict(FAKE_ENGINE, fail_on_call=1)
+    source_a = make_container(tmp_path, "gate_a.mp3")
+    source_b = make_container(tmp_path, "gate_b.mp3")
+    marker = tmp_path / "persist-block.release"
+    entered = tmp_path / "persist-block.entered"
+    data_dir = tmp_path / "httpdata"
+    harness = await ManagedHttpServerHarness.start(
+        data_dir=data_dir, options=failing,
+        ffmpeg_shim=tmp_path / "ffmpeg-shim",
+        stderr_path=tmp_path / "server-stderr.log",
+        env={
+            "CW_TEST_PERSIST_BLOCK_MARKER": str(marker),
+            "CW_TEST_PERSIST_BLOCK_ENTERED": str(entered),
+            "CW_TEST_PERSIST_BLOCK_WAIT": "60",
+        },
+    )
+    ffmpeg_log = tmp_path / "ffmpeg-invocations.jsonl"
+    recovery_a = tmp_path / "gate_a.json"
+    recovery_b = tmp_path / "gate_b.json"
+    try:
+        handle_a = await submit(
+            harness, source_a, recovery_a, seg_duration=5.0, seg_overlap=1.0
+        )
+        handle_b = await submit(
+            harness, source_b, recovery_b, seg_duration=5.0, seg_overlap=1.0
+        )
+        job_a, job_b = handle_a.job_id, handle_b.job_id
+        assert (await wait_state(harness, recovery_a, "RUNNING")).state == "RUNNING"
+        # worker 第 1 次解码失败 → sink → fail_job → 卡在被阻塞的 FAILED 持久写
+        await _wait_path(entered, 20)
+
+        loop = asyncio.get_running_loop()
+
+        async def sample() -> dict:
+            row = harness.read_db(
+                "SELECT state, error_code FROM jobs WHERE job_id=?", (job_a,)
+            )[0]
+            row_b = harness.read_db(
+                "SELECT state FROM jobs WHERE job_id=?", (job_b,)
+            )[0]
+            return {
+                "a_db": (row["state"], row["error_code"]),
+                "b_db": row_b["state"],
+                "decode_starts": len(read_ffmpeg_starts(ffmpeg_log)),
+            }
+
+        # 卡住窗口（覆盖 fail_job 的 5s 上界）：闸门不放行、失败事实未落库
+        deadline = loop.time() + 15
+        samples = []
+        while loop.time() < deadline and harness.process.is_alive():
+            current = await sample()
+            samples.append(current)
+            assert current["a_db"] == ("RUNNING", None), (current, samples[-3:])
+            assert current["b_db"] == "QUEUED", (current, samples[-3:])
+            assert current["decode_starts"] == 1, (current, samples[-3:])
+            await asyncio.sleep(0.2)
+        assert len(samples) >= 3, "卡住窗口采样不足，验收证据不充分"
+
+        # 落库超时后按监督路径一致语义非零退出（基线：进程永远挂住，此处超时红）
+        await harness.wait_for_exit(30)
+    finally:
+        marker.write_text("release")  # 幂等：探针中途变红也要让子进程能走完
+        await harness.cleanup()
+
+    assert harness.exitcode != 0, "落库未成功也必须非零退出，不能照常放行"
+    assert len(samples) >= 3
+    row = harness.read_db(
+        "SELECT state, error_code FROM jobs WHERE job_id=?", (job_a,)
+    )[0]
+    assert (row["state"], row["error_code"]) == ("RUNNING", None), dict(row)
+    row_b = harness.read_db("SELECT state FROM jobs WHERE job_id=?", (job_b,))[0]
+    assert row_b["state"] == "QUEUED", dict(row_b)
+    assert len(read_ffmpeg_starts(ffmpeg_log)) == 1, (
+        read_ffmpeg_invocations(ffmpeg_log)
+    )
+
+    # 重启收敛兜底：QUEUED/RUNNING 收敛为 FAILED[server_restarted]，不自动重跑
+    restarted = await ManagedHttpServerHarness.start(
+        data_dir=data_dir, options=failing,
+        stderr_path=tmp_path / "server-stderr-restart.log",
+    )
+    try:
+        for job_id, recovery in ((job_a, recovery_a), (job_b, recovery_b)):
+            status = await raw_job(restarted, recovery)
+            assert status["state"] == "FAILED", (job_id, status)
+            assert status["error_code"] == "server_restarted", (job_id, status)
+        await asyncio.sleep(0.3)
+        assert list(restarted.received) == [], (
+            f"重启后不得自动重跑推理: {list(restarted.received)!r}"
+        )
+    finally:
+        await restarted.stop()
+        await restarted.cleanup()
 
 
 @pytest.mark.asyncio

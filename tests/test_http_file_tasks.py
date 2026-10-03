@@ -14,6 +14,7 @@ import threading
 from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -32,10 +33,11 @@ pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 入口�
 
 
 class _StubApp:
-    """HttpServer 只用到 app.loop（socket manager 才用），这里给出真实事件循环引用。"""
+    """HttpServer 只用到 app.loop 与 app.state（共享预算计数），这里给出真实引用。"""
 
     def __init__(self, loop):
         self.loop = loop
+        self.state = SimpleNamespace(tasks={})
 
 
 
@@ -304,6 +306,41 @@ async def test_resume_after_failed_patch_only_sends_unconfirmed_suffix(tmp_path)
             server.data_dir, "SELECT state FROM uploads WHERE upload_id=?", (stored["upload_id"],)
         )
         assert states[0]["state"] == "COMMITTED"
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 1
+
+
+@pytest.mark.asyncio
+async def test_http_admission_shares_ws_budget(tmp_path):
+    """F4：HTTP 准入与 WS 共用 max_tasks=8 的总量预算（R7 规格）。
+
+    WS 活动任务占满共享预算时 HTTP commit 必须 429 too_many_jobs（复用既有
+    口径，不发明新错误码）；7 个 WS 时同一上传必须被受理——边界随共享计数
+    移动。计数以内存 state.tasks 为准（与 ws_recv 的 overloaded 判定同一份）。
+    """
+    from core.server.state import TaskLifecycle, make_task_key
+
+    source = _source(tmp_path)
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        tasks = server._app.state.tasks
+        # 7 个 WS 活动任务：共享预算未满，HTTP 必须被受理
+        for index in range(7):
+            tasks[make_task_key("ws", f"ws-task-{index}", f"socket-{index}")] = (
+                TaskLifecycle()
+            )
+        recovery = tmp_path / "resume7.json"
+        handle = await submit_file_http(
+            source, base_url, resume_path=recovery, chunk_bytes=1024
+        )
+        assert handle.job_id, "7 个 WS + 0 个 HTTP 时共享预算未满，commit 必须受理"
+
+        # 第 8 个 WS 占满共享预算：HTTP 再收就会双向突破 max_tasks
+        tasks[make_task_key("ws", "ws-task-7", "socket-7")] = TaskLifecycle()
+        error = await _expect_error(
+            submit_file_http(source, base_url, resume_path=tmp_path / "resume8.json", chunk_bytes=1024),
+            "too_many_jobs",
+        )
+        assert error.code == "too_many_jobs"
+        # 被拒的 commit 不留 Job 行（受理失败即不建立任务）
         assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 1
 
 

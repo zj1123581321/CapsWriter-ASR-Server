@@ -320,6 +320,35 @@ def test_ws_send_http_branch_has_no_transition():
     assert len(after) == 2, "HTTP 分支之后只允许 WS 路径的两处释放"
 
 
+def test_ack_before_terminal_order():
+    """F1：HTTP 分支先段确认、后 sink 终态收尾（与 WS 分支段确认在前的语义一致）。
+
+    终态收尾会 pop pending_segments 并把 record.segment_slots 置 None，事后的
+    段确认无事可做；顺序反了只是让人误以为它还在起作用。
+    """
+    ws_send = _functions(_load("connection/ws_send.py"))["ws_send"]
+    http_branches = [
+        node
+        for node in ast.walk(ws_send)
+        if isinstance(node, ast.If) and _is_owner_kind_check(node.test, "http")
+    ]
+    assert len(http_branches) == 1, "ws_send 只允许一个 HTTP 结果分支"
+    branch = http_branches[0]
+    acks = [
+        node
+        for node in ast.walk(branch)
+        if isinstance(node, ast.Call)
+        and _call_name(node.func) == "acknowledge_segment_result"
+    ]
+    assert len(acks) == 1, "HTTP 分支必须做段确认（与 WS 分支一致）"
+    sinks = _awaits_of(branch, "sink")
+    assert len(sinks) == 1, "HTTP 分支必须经 sink 终态收尾"
+    assert acks[0].lineno < sinks[0].lineno, (
+        "F1：段确认必须在终态收尾之前；终态释放后 pending_segments 与段名额"
+        "已被清，事后的段确认无事可做"
+    )
+
+
 def test_sink_success_path_persists_transitions_releases_in_order():
     """sink 成功路径补完：record_result 落库 → transition_terminal → 释放运行态记录。"""
     http_tree = _load("http_file_runner.py")
