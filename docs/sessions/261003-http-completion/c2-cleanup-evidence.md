@@ -15,6 +15,15 @@
 - 绿输出：固定依赖下 `python -m pytest tests/test_http_cleanup.py -q -rs -p no:cacheprovider` 输出 `5 passed in 1.74s`。
 - 独立保护断言红验：临时关闭候选行的 `job_id in active_job_ids` 检查后，同一真实 runner 测试以 `AssertionError: 周期清理在 decoder.close 释放前删除了仍被 runner 引用的源` 失败；还原保护后定向套件为绿。
 
+## 全量验证
+
+- 固定版本：卡面完整命令（`websockets==15.0.1`）输出 `451 passed, 3 skipped, 149 warnings in 231.97s`。
+- 最新版本：相同全量命令改用 `--with websockets`，解析到 `websockets==17.1`，输出 `451 passed, 3 skipped, 149 warnings in 229.48s`。
+- 两次 skip 身份完全一致：`tests/test_aligner_integration.py` ForceAligner backend/model 两项；`tests/test_segmenter.py` 缺 Silero-VAD 模型或 onnxruntime 一项。pytest 未报告 HTTP runner/HTTP decode skip，HTTP tests 均收集执行。
+- 149 warnings 是既有 multiprocessing fork 与 websockets `ConnectionClosed.code/reason` deprecation warnings；无测试失败。
+- 派发基线不可用（baseline lookup: `gh api request failed`），继承红未能判定；本卡两次全量均无新红。
+- C2 分支已推送。PR #62 open/draft，base 是 C1 PR #60 的分支，5 files changed，944 additions/4 deletions。PR #60 仍 open/draft 时不将 #62 标 ready、不合并。
+
 ## 仍待验证
 
 - 全量指定验证命令、最新 aiohttp/websockets 组合、真实 collected/skip 结果和最终提交/远端状态。
