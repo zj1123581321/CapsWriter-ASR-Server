@@ -239,10 +239,13 @@ async def test_real_ws_and_http_share_one_worker_without_key_pollution(tmp_path)
             await dropped.close()
             drop_task.cancel()
             await asyncio.gather(drop_task, return_exceptions=True)
+            # TaskKey = (owner_kind, owner_id, task_id)：断连清理后 ws-drop 这个
+            # task_id 在三张表里都必须消失（key[2] 才是 task_id，owner_id 是 socket_id）
             await wait_until(
-                lambda: all(key[1] != "ws-drop" for key in harness.state.tasks),
+                lambda: all(key[2] != "ws-drop" for key in harness.state.tasks),
                 "断开的 WS 任务从 state.tasks 移除",
             )
+            assert [key for key in harness.state.tasks if key[2] == "ws-drop"] == []
             assert all(
                 key[2] != "ws-drop" for key in harness.state.connection_tasks.values()
             ), harness.state.connection_tasks
