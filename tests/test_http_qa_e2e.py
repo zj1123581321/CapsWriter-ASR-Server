@@ -652,3 +652,77 @@ async def test_resampled_sources_produce_bounded_16k_mono_f32_segments(
             "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1",
         ]
         assert str(harness.data_dir / "sources" / f"{handle.upload_id}.bin") in starts[0]["argv"]
+
+
+# ---------------------------------------------------------------- 组 11：末段失败
+
+
+@pytest.mark.asyncio
+async def test_final_segment_failure_fails_job_without_publishing_partial(tmp_path):
+    """组 11：`is_final` 那一次解码失败时，整任务失败且不发布缺段成功。
+
+    失败注入落在**最后一次**引擎调用（真实 `is_final` 段），此前各段已经真实产出
+    非 final Result——正是「前几段成功、最后一段炸掉」这种最容易被误判为成功的形态。
+    对照组用同样的源与分段参数跑一次成功解码，证明末段确实存在（失败点确实是末段）。
+    """
+    source = make_container(tmp_path, "speech.mp3", seconds=20.0)
+    options = dict(seg_duration=5.0, seg_overlap=1.0)
+
+    async with running_runner_server(tmp_path) as harness:
+        ok_recovery = tmp_path / "ok.json"
+        ok_handle = await submit(harness, source, ok_recovery, **options)
+        assert (await wait_terminal(harness, ok_recovery)).state == "DONE"
+        ok_segments = harness.tasks(ok_handle.job_id)
+        final_calls = sum(1 for item in ok_segments if item["is_final"])
+        assert final_calls == 1, ok_segments
+        segment_count = len(ok_segments)
+        assert segment_count >= 2, ok_segments
+
+    # 同样的源、同样的分段参数：最后一次引擎调用抛错
+    failing = dict(FAKE_ENGINE, fail_on_call=segment_count)
+    crash_dir = tmp_path / "crash"
+    crash_dir.mkdir()
+    source = make_container(crash_dir, "speech.mp3", seconds=20.0)
+    recovery = crash_dir / "resume.json"
+    async with running_runner_server(crash_dir, options=failing) as harness:
+        handle = await submit(harness, source, recovery, **options)
+        status = await wait_terminal(harness, recovery)
+        assert status.state == "FAILED", status
+        assert status.error_code == "inference_failed"
+        assert status.result_available is False
+
+        # 失败点确实落在 is_final 段：前 N-1 段已产出非 final 结果，末段没有
+        segments = harness.tasks(handle.job_id)
+        assert len(segments) == segment_count, segments
+        assert sum(1 for item in segments if item["is_final"]) == 1
+        assert segments[-1]["is_final"] is True
+        emitted = harness.results(handle.job_id)
+        assert len(emitted) == segment_count, emitted
+        successes = [item for item in emitted if not item["error_code"]]
+        failures = [item for item in emitted if item["error_code"]]
+        assert len(successes) == segment_count - 1, emitted
+        assert all(item["is_final"] is False and item["tokens"] for item in successes)
+        # 末段产出的是带 error_code 的空结果，绝不是带正文的 final 结果
+        assert len(failures) == 1, emitted
+        assert failures[0]["error_code"] == "inference_failed"
+        assert failures[0]["is_final"] is False
+        assert failures[0]["text"] == "" and failures[0]["tokens"] == []
+        assert not any(item["is_final"] for item in emitted), emitted
+        assert len(harness.calls) == segment_count, harness.calls
+
+        # 缺段成功绝不被发布：库里没有结果行，终态是 FAILED
+        assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 0
+        row = harness.read_db(
+            "SELECT state, error_code FROM jobs WHERE job_id=?", (handle.job_id,)
+        )[0]
+        assert (row["state"], row["error_code"]) == ("FAILED", "inference_failed")
+        response = await raw_get(harness, recovery, "/result")
+        assert response.status_code == 409
+        body = response.json()
+        assert body["code"] == "job_failed"
+        assert body["error_code"] == "inference_failed"
+        assert "text" not in body and "tokens" not in body
+        # 终态收尾：owner 与闸门都已释放，事件循环仍健康
+        assert list(harness.state.active_http_jobs) == []
+        assert harness.state.tasks == {}
+        assert harness.http_server.fatal is None
