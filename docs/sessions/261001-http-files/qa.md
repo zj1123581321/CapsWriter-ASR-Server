@@ -35,7 +35,7 @@
    当前证明：未测。取消不释放未完 I/O，无自动重跑。
 
 9. **重复 final 与资源边界**  
-   待测：两次 final、旧 offset、超前 offset、不同源文件、空文件、块超限、队列/磁盘额度边界都产生明确错误，旧数据不覆写。R7 全单位：1 GiB 文件、1 MiB PATCH、64 KiB read、16 handler、2 同时 body、32 未完成上传、HTTP 运行 1、全局活动 8、每任务 4 段、64 MiB 结果、16 GiB source 预留、2 GiB DB+WAL+SHM、2 GiB 实际剩余。  
+   待测：两次 final、旧 offset、超前 offset、不同源文件、空文件、块超限、队列/磁盘额度边界都产生明确错误，旧数据不覆写。R7 全单位：1 GiB 文件、1 MiB PATCH、64 KiB read、16 handler、2 同时 body、32 未完成上传、HTTP 运行 1、共享活动总量 8（跨内存 `state.tasks` 与 SQLite `jobs` 表的 `QUEUED`+`RUNNING`，同一 Job 只数一次；其中 2 个名额恒定预留给 WS，HTTP 最多占 6，超限时 HTTP 报 429 `too_many_jobs`、WS 报 `overloaded`）、每任务 4 段、64 MiB 结果、16 GiB source 预留、2 GiB DB+WAL+SHM、2 GiB 实际剩余。  
    当前证明：未测物理容量；旧整数默认 WS 分段与背压仍由既有测试覆盖。
 
 10. **解码与 PCM producer**  

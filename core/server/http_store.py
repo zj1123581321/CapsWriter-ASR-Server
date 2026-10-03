@@ -40,7 +40,7 @@ MAX_JSON_BYTES = 16 * 1024                        # 16 KiB 小 JSON
 MAX_HANDLERS = 16                                 # 16 并发 handler
 MAX_BODY_CONCURRENCY = 2                          # 同时 body 操作 2
 MAX_OPEN_UPLOADS = 32                             # 32 个未完成上传会话
-MAX_HTTP_JOBS = 8                                 # 最多 8 个 QUEUED+RUNNING
+MAX_HTTP_JOBS = 8                                 # 存储侧粗上限兜底，不是共享预算（见 _check_job_admission）
 IO_MAILBOX = 32                                   # I/O mailbox 32 有界操作
 SOURCE_RESERVE_BYTES = 16 * 1024 * 1024 * 1024   # 16 GiB source 声明长度总预留
 DB_GUARD_BYTES = 2 * 1024 * 1024 * 1024           # 2 GiB DB+WAL+SHM/结果整体 guard
@@ -405,11 +405,22 @@ class HttpStore:
         if self._free_bytes() < FREE_SPACE_MARGIN_BYTES:
             raise HttpStoreError("disk_guard_full", "实际剩余文件系统低于安全余量", status=507)
 
+    def active_job_ids(self) -> set:
+        """QUEUED+RUNNING 的 Job id 集合：共享预算的 DB 侧计数来源。
+
+        必须在受监督的单 I/O worker 线程里调用（SQLite 连接绑定该线程）。
+        """
+        rows = self.conn.execute(
+            "SELECT job_id FROM jobs WHERE state IN (?, ?)", (JOB_QUEUED, JOB_RUNNING)
+        ).fetchall()
+        return {row["job_id"] for row in rows}
+
     def _check_job_admission(self) -> None:
-        active = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE state IN (?, ?)", (JOB_QUEUED, JOB_RUNNING)
-        ).fetchone()["n"]
-        if active >= MAX_HTTP_JOBS:
+        # 注意：这不是共享预算的判定，只是存储侧的粗上限兜底（恒松于
+        # max_tasks - WS_RESERVED_SLOTS，因此正常路径下不会先触发）。
+        # 真正的准入判定只有一处：core/server/state.py 的 count_active_tasks，
+        # 它跨内存 state.tasks 与本表并按 job_id 去重。
+        if len(self.active_job_ids()) >= MAX_HTTP_JOBS:
             raise HttpStoreError("too_many_jobs", "HTTP 任务准入已满", status=429)
 
     # ---------------- 对外操作 ----------------

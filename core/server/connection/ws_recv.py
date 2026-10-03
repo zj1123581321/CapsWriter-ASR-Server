@@ -557,7 +557,10 @@ async def ws_recv(websocket, app) -> None:
                 return
 
             if active is None:
-                active_count = count_active_tasks(state)
+                # R7：WS 准入与 HTTP commit 共用同一原语与同一总量口径
+                # （内存非终态 + DB 里 QUEUED+RUNNING 的 HTTP Job，按 job_id 去重）。
+                # 排队中的 HTTP Job 在 WS 侧同样占名额。WS 口径仍是 overloaded。
+                active_count = await count_active_tasks(state)
                 if active_count >= Config.max_tasks:
                     await queue_error_and_close(
                         state, websocket, socket_id, msg.task_id, 'overloaded',

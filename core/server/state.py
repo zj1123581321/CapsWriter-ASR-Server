@@ -23,6 +23,13 @@ from core.tools.build_info import get_git_sha
 
 OWNER_KINDS = frozenset({'ws', 'http'})
 TaskKey = tuple[str, str, str]
+TERMINAL_STATUSES = frozenset({'DONE', 'FAILED'})
+
+# R7：共享上限里固定留给 WS 的名额。HTTP 文件任务是可选功能，不得挤掉既有默认的
+# 实时语音入口（design.md 保留清单含「mic 优先不变」），因此 max_tasks 中恒定
+# 预留 WS_RESERVED_SLOTS 个名额只给 WS；HTTP 准入最多把共享总量用到
+# max_tasks - WS_RESERVED_SLOTS。默认 max_tasks=8 → HTTP 最多同时占 6 个名额。
+WS_RESERVED_SLOTS = 2
 
 
 def derive_owner_id(owner_kind: str, task_id: str, socket_id: str = '') -> str:
@@ -57,17 +64,38 @@ def task_key_from_result(result: Result) -> TaskKey:
     return make_task_key(result.owner_kind, result.task_id, result.socket_id)
 
 
-def count_active_tasks(state, exclude_key: TaskKey | None = None) -> int:
-    """活动任务总量：state.tasks 中非终态记录，HTTP 与 WS 一并计入。
+async def count_active_tasks(state, exclude_key: TaskKey | None = None) -> int:
+    """共享活动任务总量：WS 与 HTTP 准入判定的唯一原语。
 
-    准入判定的唯一原语。exclude_key 供调用方排除自身已占位的 key。
+    总量 = 内存 ``state.tasks`` 中的非终态记录（WS 与已登记的运行中 HTTP）
+    **加上** SQLite ``jobs`` 表中 QUEUED+RUNNING 的 HTTP Job。这两处的并集才是
+    「服务端此刻真正在忙的任务数」：排队中的 HTTP Job 只存在于 SQLite（运行闸门
+    未放行，``begin_task`` 尚未执行），已放行的运行中 HTTP Job 两处都有。
+
+    去重规则（必须显式，不可省）：一个 HTTP Job 在其被 ``mark_running`` 置为
+    RUNNING 之后、转入终态之前，**同时**存在于内存 ``state.tasks`` 与 DB 的
+    QUEUED+RUNNING 集合中——这不是瞬态，而是整个识别期间的常态。因此以内存记录
+    为准，从 DB 集合里扣除已在内存登记的 job_id，只数一次。反向的窗口不存在：
+    ``begin_task`` 在 ``mark_running`` 之后同步执行（其间无 await），DB 转 RUNNING
+    到内存登记之间不可能被别的协程观测到。
+
+    DB 计数来源是 ``state.http_active_job_counter``（零参协程），由 HttpServer 注入
+    并强制走受监督的单 I/O worker 线程——SQLite 连接绑定该线程，跨线程直接用会抛
+    ``sqlite3.ProgrammingError``。WS 未启用 HTTP 时为 None，此时总量退化为纯内存口径。
+
+    exclude_key 供调用方排除自身已占位的 key。
     """
     ensure_server_runtime(state)
-    return sum(
-        1
+    memory_keys = [
+        key
         for key, record in state.tasks.items()
-        if key != exclude_key and record.status not in {"DONE", "FAILED"}
-    )
+        if key != exclude_key and record.status not in TERMINAL_STATUSES
+    ]
+    counter = state.http_active_job_counter
+    db_job_ids = set(await counter()) if counter is not None else set()
+    # 已登记的运行中 HTTP 由内存侧计入，DB 侧不再重复计数
+    registered_http = {key[2] for key in memory_keys if key[0] == 'http'}
+    return len(memory_keys) + len(db_job_ids - registered_http)
 
 
 @dataclass
@@ -134,6 +162,9 @@ class ServerState:
     active_http_jobs: Optional[ListProxy] = None
     # E3 注入持久结果消费者；E1 不实现其存储语义。
     http_result_sink: object = None
+    # R7：共享预算的 DB 侧计数来源（零参协程，返回 QUEUED+RUNNING 的 job_id 集合）。
+    # 由 HttpServer 注入，内部走受监督的单 I/O worker 线程；未启用 HTTP 时为 None。
+    http_active_job_counter: object = None
 
 
 
@@ -211,6 +242,7 @@ def ensure_server_runtime(state) -> None:
         'pending_segments': {},
         'active_http_jobs': None,
         'http_result_sink': None,
+        'http_active_job_counter': None,
     }
     for name, value in defaults.items():
         if not hasattr(state, name):

@@ -28,7 +28,7 @@ from typing import Callable, Optional
 
 from config_server import ServerConfig
 from core.server.http_file_runner import RunnerUnavailable
-from core.server.state import count_active_tasks
+from core.server.state import WS_RESERVED_SLOTS, count_active_tasks, ensure_server_runtime
 from core.server.http_store import (
     IO_MAILBOX,
     MAX_BODY_CONCURRENCY,
@@ -46,6 +46,14 @@ logger = logging.getLogger("server")
 
 class HttpServerError(Exception):
     """HTTP 装配/监督失败：调用方必须以非零退出，不得吞掉。"""
+
+
+def http_job_budget(max_tasks: int) -> int:
+    """共享上限里 HTTP 可占的名额：max_tasks - WS_RESERVED_SLOTS。
+
+    预留的 WS_RESERVED_SLOTS 个名额恒定留给 WS（既有默认的实时语音入口）。
+    """
+    return max_tasks - WS_RESERVED_SLOTS
 
 
 def _import_aiohttp():
@@ -154,6 +162,11 @@ class HttpServer:
         except (OSError, RuntimeError) as exc:
             self._worker.close()
             raise HttpServerError(f"HTTP 存储初始化失败：{exc}") from exc
+        # R7：把共享预算的 DB 侧计数来源注入共享 state，使 ws_recv 与本 listener
+        # 走同一个跨存储计数原语。计数必须经受监督的单 I/O worker 线程取：
+        # SQLite 连接绑定该线程，跨线程直接用会抛 sqlite3.ProgrammingError。
+        ensure_server_runtime(self._app.state)
+        self._app.state.http_active_job_counter = self.active_http_job_ids
         application = self._web.Application()
         self._add_routes(application)
         # 半开 body 超时后必须能写完 408 再结束连接：lingering drain 会把未完成
@@ -198,6 +211,13 @@ class HttpServer:
 
     async def fail_job(self, job_id: str, error_code: str) -> bool:
         return await self._worker.run(self._store.fail_job, job_id, error_code)
+
+    async def active_http_job_ids(self) -> set:
+        """QUEUED+RUNNING 的 HTTP Job id：共享预算的 DB 侧计数来源。
+
+        排队中的 Job（未拿到运行闸门、内存里尚无记录）只在这里可见。
+        """
+        return await self._worker.run(self._store.active_job_ids)
 
     def _add_routes(self, application) -> None:
         web = self._web
@@ -246,6 +266,8 @@ class HttpServer:
             self._worker.close()
             self._worker = None
         self._store = None
+        # 存储已关：共享预算的 DB 计数来源必须同时失效，否则 WS 准入会撞上已关闭的 worker
+        self._app.state.http_active_job_counter = None
         logger.info("HTTP 文件任务 listener 已停止")
 
     # ---------------- 请求基础设施 ----------------
@@ -445,14 +467,15 @@ class HttpServer:
     async def _commit_upload(self, request):
         token = self._token(request)
         self._reject_encoding(request)
-        # R7：HTTP 准入与 WS 共用 max_tasks 的总量预算。计数走唯一原语
-        # count_active_tasks（活动 = state.tasks 非终态，HTTP 与 WS 一并计入）；
-        # HTTP 自己的表内计数由 store._check_job_admission 在事务里兜底。
-        # 与 WS 判定同为内存侧建议性计数（TOCTOU 窗口相同），不发明新错误码。
-        if count_active_tasks(self._app.state) >= ServerConfig.max_tasks:
+        # R7：HTTP 与 WS 共用 max_tasks 的共享总量预算，且 WS 恒定预留
+        # WS_RESERVED_SLOTS 个名额。总量走唯一原语 count_active_tasks（内存
+        # state.tasks 非终态 + DB 里 QUEUED+RUNNING 的 HTTP Job，按 job_id 去重），
+        # 排队中的 HTTP Job 也在其中。同一 TOCTOU 窗口，不发明新错误码。
+        if await count_active_tasks(self._app.state) >= http_job_budget(ServerConfig.max_tasks):
             raise HttpStoreError(
                 "too_many_jobs",
-                f"服务端活动任务已达共享上限 {ServerConfig.max_tasks}",
+                f"HTTP 可用名额已满（共享上限 {ServerConfig.max_tasks} 扣除为 WS 预留 "
+                f"{WS_RESERVED_SLOTS} 个名额后，HTTP 最多 {http_job_budget(ServerConfig.max_tasks)} 个）",
                 status=429,
             )
         length = self._content_length(request)

@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 SERVER_DIR = Path(__file__).resolve().parents[1] / "core" / "server"
+SESSION_DIR = Path(__file__).resolve().parents[1] / "docs" / "sessions" / "261001-http-files"
 
 # 位置表：每个文件里各函数允许出现的 transition_terminal 调用数（修复后基线）。
 # 新增释放路径 = 清单失配 = CI 红；改之前必须先把该行写进主脑位置表并补对应
@@ -172,8 +173,8 @@ def _is_owner_kind_check(test: ast.expr, kind: str) -> bool:
 def test_admission_callers_share_one_primitive():
     """两个准入判定必须经过 count_active_tasks，禁止就地内联求和。
 
-    同一形态已第三次出现：HTTP 先只数自己的表、上一卡只数 WS。根因是
-    「活动任务总量」在 ws_recv 与 _commit_upload 各写一遍。本约束让下次
+    同一形态已第四次出现：HTTP 先只数自己的表、再只数内存、上一卡只数 WS。
+    根因是「活动任务总量」在 ws_recv 与 _commit_upload 各写一遍。本约束让下次
     有人想在调用方改算式时，CI 在行为测试变红之前就先红。
     """
     state_funcs = _functions(_load("state.py"))
@@ -181,6 +182,9 @@ def test_admission_callers_share_one_primitive():
         "活动任务总量必须在 core/server/state.py 提供唯一原语 count_active_tasks"
     )
     primitive = state_funcs["count_active_tasks"]
+    assert isinstance(primitive, ast.AsyncFunctionDef), (
+        "count_active_tasks 必须能 await DB 侧计数来源（SQLite 连接绑定 I/O 线程）"
+    )
     ws_filters = [
         node
         for node in ast.walk(primitive)
@@ -188,6 +192,13 @@ def test_admission_callers_share_one_primitive():
     ]
     assert not ws_filters, (
         "count_active_tasks 不得只数 WS；HTTP 与 WS 必须一并计入"
+    )
+    # 跨存储去重：必须显式从 DB 集合里扣除已在内存登记的 HTTP job_id
+    assert "http_active_job_counter" in ast.unparse(primitive), (
+        "count_active_tasks 必须读 state.http_active_job_counter（DB 侧 QUEUED+RUNNING）"
+    )
+    assert "registered_http" in ast.unparse(primitive), (
+        "count_active_tasks 必须按 job_id 去重：已在内存登记的 HTTP 不得在 DB 侧重复计数"
     )
 
     ws_recv = _functions(_load("connection/ws_recv.py"))["ws_recv"]
@@ -207,6 +218,36 @@ def test_admission_callers_share_one_primitive():
         assert not inline_sums, (
             f"{label} 不得就地内联求和；活动任务总量必须走 count_active_tasks"
         )
+
+
+def test_r7_spec_single_reading():
+    """R7 规格必须只有一种读法：跨两个存储的总量 + WS 预留名额 + 错误码口径。
+
+    历史根因：design 的前半句「最多 8 个 QUEUED+RUNNING」可读成「HTTP 自己 8 个」，
+    后半句「与 WS 共用 max_tasks=8」可读成「与 WS 共用 8 个」，两次历史修复各对上
+    其中一句。本测试把逐句要素钉在文档里，规格退回到歧义写法时直接变红。
+    """
+    design = (
+        SESSION_DIR / "design.md"
+    ).read_text(encoding="utf-8")
+    row = next(
+        line for line in design.splitlines() if line.startswith("| HTTP Job 准入 / 运行 |")
+    )
+    for required in ("state.tasks", "jobs", "QUEUED", "RUNNING", "max_tasks", "too_many_jobs",
+                     "overloaded"):
+        assert required in row, f"R7 design 行缺少要素 {required!r}：{row}"
+    assert "只数一次" in row, f"R7 design 行必须写明同一 Job 的去重口径：{row}"
+    # 预留名额必须是可核对的数字，而不是「预留几个」这种无约束措辞
+    assert "预留 2 个名额" in row, f"R7 design 行必须写明 WS 预留名额数：{row}"
+    # 旧的歧义写法不得复活
+    assert "最多 8 个 QUEUED+RUNNING" not in row, f"R7 design 行退回歧义写法：{row}"
+
+    qa = (SESSION_DIR / "qa.md").read_text(encoding="utf-8")
+    assert "共享活动总量 8" in qa, "qa.md 必须与 design 同源：共享活动总量 8"
+    assert "全局活动 8" not in qa, "qa.md 退回与 design 不同源的「全局活动 8」"
+    assert "too_many_jobs" in qa and "overloaded" in qa, (
+        "qa.md 必须写明两侧超限时的错误码口径"
+    )
 
 
 def test_release_position_table_is_exact():

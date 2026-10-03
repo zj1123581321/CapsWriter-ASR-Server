@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import multiprocessing
 import sqlite3
 import sys
 import threading
@@ -18,6 +20,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import websockets
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "sdk"))
@@ -26,8 +29,16 @@ from capswriter_asr import AsrError, resume_file_http, submit_file_http  # noqa:
 from capswriter_asr import http_client as sdk_http  # noqa: E402
 
 from config_server import ServerConfig  # noqa: E402
+from core.server.connection.ws_recv import ws_recv  # noqa: E402
 from core.server.http_server import HttpServer  # noqa: E402
 from core.server.http_store import HttpStoreError  # noqa: E402
+from core.server.state import (  # noqa: E402
+    ServerState,
+    begin_task,
+    count_active_tasks,
+    make_task_key,
+    register_http_job,
+)
 # HTTP listener 默认关闭，aiohttp 只在显式启用时安装：缺它就跳过，不假装通过
 pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 入口默认关闭")
 
@@ -311,32 +322,32 @@ async def test_resume_after_failed_patch_only_sends_unconfirmed_suffix(tmp_path)
 
 @pytest.mark.asyncio
 async def test_http_admission_shares_ws_budget(tmp_path):
-    """F4：HTTP 准入与 WS 共用 max_tasks=8 的总量预算（R7 规格）。
+    """R7：HTTP 准入与 WS 共用 max_tasks=8 的共享总量，且恒定预留 2 个名额给 WS。
 
-    WS 活动任务占满共享预算时 HTTP commit 必须 429 too_many_jobs（复用既有
-    口径，不发明新错误码）；7 个 WS 时同一上传必须被受理——边界随共享计数
-    移动。计数以内存 state.tasks 为准（与 ws_recv 的 overloaded 判定同一份）。
+    HTTP 最多只能把共享总量用到 max_tasks - WS_RESERVED_SLOTS（默认 6）：因此
+    5 个 WS 时 HTTP 仍被受理，第 6 个 WS 一出现 HTTP 名额就满，commit 必须
+    429 too_many_jobs（沿用既有口径，不发明新错误码）且不留 Job 行。
     """
-    from core.server.state import TaskLifecycle, make_task_key
+    from core.server.state import TaskLifecycle
 
     source = _source(tmp_path)
     async with running_server(tmp_path, inference=True) as (server, base_url):
         tasks = server._app.state.tasks
-        # 7 个 WS 活动任务：共享预算未满，HTTP 必须被受理
-        for index in range(7):
+        # 5 个 WS 活动任务：HTTP 侧仍有 6 - 5 = 1 个名额，必须被受理
+        for index in range(5):
             tasks[make_task_key("ws", f"ws-task-{index}", f"socket-{index}")] = (
                 TaskLifecycle()
             )
-        recovery = tmp_path / "resume7.json"
+        recovery = tmp_path / "resume5.json"
         handle = await submit_file_http(
             source, base_url, resume_path=recovery, chunk_bytes=1024
         )
-        assert handle.job_id, "7 个 WS + 0 个 HTTP 时共享预算未满，commit 必须受理"
+        assert handle.job_id, "5 个 WS + 0 个 HTTP 时 HTTP 名额未满，commit 必须受理"
 
-        # 第 8 个 WS 占满共享预算：HTTP 再收就会双向突破 max_tasks
-        tasks[make_task_key("ws", "ws-task-7", "socket-7")] = TaskLifecycle()
+        # 第 6 个 WS 出现：共享总量 6 = HTTP 名额上限，再收 HTTP 就会挤掉 WS 预留名额
+        tasks[make_task_key("ws", "ws-task-5", "socket-5")] = TaskLifecycle()
         error = await _expect_error(
-            submit_file_http(source, base_url, resume_path=tmp_path / "resume8.json", chunk_bytes=1024),
+            submit_file_http(source, base_url, resume_path=tmp_path / "resume6.json", chunk_bytes=1024),
             "too_many_jobs",
         )
         assert error.code == "too_many_jobs"
@@ -345,14 +356,32 @@ async def test_http_admission_shares_ws_budget(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_shared_budget_counts_http_occupancy(tmp_path):
-    """7 WS + 1 已受理 HTTP = 活动总量 8 = max_tasks 时，第 9 个任务必须被拒。
+async def test_seven_ws_tasks_still_refuse_http_commit(tmp_path):
+    """既有边界不回退：7 个 WS 活动任务时 HTTP commit 必须被拒（共享上限 8 已无 HTTP 名额）。"""
+    from core.server.state import TaskLifecycle
 
-    主脑探针实测：上一卡只数 key[0]=='ws'，此场景仍会把第 9 个 accepted。
+    source = _source(tmp_path)
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        tasks = server._app.state.tasks
+        for index in range(7):
+            tasks[make_task_key("ws", f"ws-task-{index}", f"socket-{index}")] = (
+                TaskLifecycle()
+            )
+        await _expect_error(
+            submit_file_http(source, base_url, resume_path=tmp_path / "resume7.json", chunk_bytes=1024),
+            "too_many_jobs",
+        )
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 0
+
+
+@pytest.mark.asyncio
+async def test_shared_budget_counts_http_occupancy(tmp_path):
+    """7 WS + 1 已受理 HTTP（内存运行态记录）= 8 时，第 9 个任务必须被拒。
+
     活动占用落在 state.tasks 非终态记录上（与唯一判定原语同一口径）；
     被拒必须是 429 too_many_jobs，且不留下 Job 行。
     """
-    from core.server.state import TaskLifecycle, make_task_key
+    from core.server.state import TaskLifecycle
 
     source = _source(tmp_path)
     recovery = tmp_path / "resume9.json"
@@ -1116,3 +1145,221 @@ async def test_slow_chunks_succeed_when_each_gap_is_below_idle(tmp_path, monkeyp
                 assert sha256(disk).hexdigest() == row["sha256"]
                 assert row["confirmed_offset"] == len(payload)
         assert server.fatal is None
+
+
+# --------------------------------------------------------------------------
+# R7 共享上限：跨 SQLite（排队中的 HTTP Job）与内存 state.tasks 的同一个总量
+# --------------------------------------------------------------------------
+
+HTTP_BUDGET = ServerConfig.max_tasks - 2  # R7 规格（design.md）：固定为 WS 预留 2 个名额
+
+
+def test_ws_reserved_slots_constant_matches_spec():
+    """R7 规格把「为 WS 预留 2 个名额」钉在文档上；实现里的常量不得偏离它。"""
+    import core.server.state as state_module
+
+    assert getattr(state_module, "WS_RESERVED_SLOTS", None) == 2, (
+        "core/server/state.py 必须提供模块级常量 WS_RESERVED_SLOTS = 2（design.md R7 行）"
+    )
+
+
+@asynccontextmanager
+async def running_server_with_ws(tmp_path: Path, inference: bool = True):
+    """真实 HTTP listener + 真实 ws_recv，共用同一份 state（即跨存储计量的两端）。
+
+    不挂 file runner：commit 之后 Job 永远停在 QUEUED，于是 DB 里有行、内存
+    state.tasks 里没有记录——这正是被测的「排队中 HTTP」形态。
+    """
+    loop = asyncio.get_running_loop()
+    state = ServerState(
+        queue_in=multiprocessing.Queue(), queue_out=multiprocessing.Queue()
+    )
+    state.sockets_id = []
+    state.active_http_jobs = []
+    app = SimpleNamespace(state=state, loop=loop)
+    server = HttpServer(app, "127.0.0.1", 0, tmp_path / "httpdata")
+    server.inference_available = inference
+    server.prepare()
+    await server._runner.setup()
+    site = server._web.TCPSite(server._runner, "127.0.0.1", 0)
+    await site.start()
+    server._site = site
+    http_port = site._server.sockets[0].getsockname()[1]
+    ws_server = await websockets.serve(
+        functools.partial(ws_recv, app=app),
+        "127.0.0.1",
+        0,
+        max_size=None,
+        ping_interval=None,
+    )
+    ws_port = ws_server.sockets[0].getsockname()[1]
+    try:
+        yield server, f"http://127.0.0.1:{http_port}", f"ws://127.0.0.1:{ws_port}", state
+    finally:
+        ws_server.close()
+        await asyncio.wait_for(ws_server.wait_closed(), 5)
+        await server.stop()
+        for queue in (state.queue_in, state.queue_out):
+            queue.close()
+
+
+def _ws_first_frame(task_id: str) -> str:
+    """真实 WS 首帧：空音频、非 final，任务被受理后停在等待更多音频的状态。"""
+    return json.dumps({
+        "task_id": task_id,
+        "source": "mic",
+        "data": "",
+        "is_final": False,
+        "time_start": 0.0,
+        "seg_duration": 15.0,
+        "seg_overlap": 0.0,
+    })
+
+
+async def _ws_try_start(ws_url: str, task_id: str, settle: float = 1.0):
+    """发真实 WS 首帧；返回 None 表示被受理，返回 dict 表示被拒（错误消息）。"""
+    connection = await websockets.connect(ws_url, max_size=None, ping_interval=None)
+    await connection.send(_ws_first_frame(task_id))
+    try:
+        raw = await asyncio.wait_for(connection.recv(), timeout=settle)
+    except asyncio.TimeoutError:
+        return connection, None
+    return connection, json.loads(raw)
+
+
+async def _submit_queued_jobs(tmp_path: Path, base_url: str, count: int, tag: str):
+    """只用真实 SDK 造出 count 个 QUEUED Job（无 runner → 永不到达内存登记）。"""
+    handles = []
+    for index in range(count):
+        source = _source(tmp_path, name=f"{tag}-{index}.wav")
+        handles.append(await submit_file_http(
+            source, base_url, resume_path=tmp_path / f"{tag}-{index}.json", chunk_bytes=1024
+        ))
+    return handles
+
+
+@pytest.mark.asyncio
+async def test_queued_http_counts_against_shared_budget(tmp_path):
+    """排队中的 HTTP Job 只存在于 SQLite，也必须计入共享总量并把 HTTP 推到上限。
+
+    判据直接表达不变式：内存侧全空（证明计数不可能来自内存），6 个真实 QUEUED 行
+    之后，第 7 个 commit 必须是 429 too_many_jobs 且不留下 Job 行。
+    """
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        state = server._app.state
+        assert state.tasks == {}, "未挂 runner 时内存里不应有 HTTP 运行态记录"
+        await _submit_queued_jobs(tmp_path, base_url, HTTP_BUDGET, "queued")
+        assert state.tasks == {}, "排队中的 HTTP Job 仍只在 SQLite 里"
+        queued = _read_db(server.data_dir, "SELECT job_id FROM jobs WHERE state='QUEUED'")
+        assert len(queued) == HTTP_BUDGET, len(queued)
+
+        await _expect_error(
+            submit_file_http(
+                _source(tmp_path, "over.wav"), base_url,
+                resume_path=tmp_path / "over.json", chunk_bytes=1024,
+            ),
+            "too_many_jobs",
+        )
+        # 被拒的 commit 不落任何 Job 行
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == HTTP_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_ws_reserved_slots_enforced(tmp_path):
+    """0 WS + 6 个排队 HTTP：第 7 个 HTTP 被拒，但 WS 预留的 2 个名额仍能进 2 个任务。"""
+    async with running_server_with_ws(tmp_path) as (server, base_url, ws_url, state):
+        await _submit_queued_jobs(tmp_path, base_url, HTTP_BUDGET, "queued")
+        assert state.tasks == {}
+
+        await _expect_error(
+            submit_file_http(
+                _source(tmp_path, "over.wav"), base_url,
+                resume_path=tmp_path / "over.json", chunk_bytes=1024,
+            ),
+            "too_many_jobs",
+        )
+
+        accepted = []
+        for index in range(2):
+            connection, rejection = await _ws_try_start(ws_url, f"ws-{index}")
+            assert rejection is None, f"WS 预留名额内的第 {index + 1} 个任务被拒：{rejection}"
+            accepted.append(connection)
+        assert await count_active_tasks(state) == HTTP_BUDGET + 2
+        for connection in accepted:
+            await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ws_admission_sees_db_queued_http(tmp_path):
+    """6 个排队 HTTP + 2 个 WS = 8（共享上限）后，第 3 个 WS 必须被拒 overloaded。
+
+    若 WS 侧看不见 DB 里排队中的 HTTP，总量只算到 2，第 3 个 WS 会被放行。
+    """
+    async with running_server_with_ws(tmp_path) as (server, base_url, ws_url, state):
+        await _submit_queued_jobs(tmp_path, base_url, HTTP_BUDGET, "queued")
+        accepted = []
+        for index in range(2):
+            connection, rejection = await _ws_try_start(ws_url, f"ws-{index}")
+            assert rejection is None, f"第 {index + 1} 个 WS 必须被受理：{rejection}"
+            accepted.append(connection)
+
+        connection, rejection = await _ws_try_start(ws_url, "ws-overload")
+        assert rejection is not None, "共享总量已达 8，第 3 个 WS 必须被拒"
+        assert rejection["code"] == "overloaded", rejection
+        with pytest.raises(websockets.ConnectionClosed):
+            await asyncio.wait_for(connection.recv(), 5)
+        # 总量封顶在 max_tasks
+        assert await count_active_tasks(state) == ServerConfig.max_tasks
+        for connection in accepted:
+            await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_no_double_count_of_same_http_job(tmp_path):
+    """同一 HTTP Job 同时在 DB（RUNNING）与内存登记时，共享总量里只数一次。
+
+    这是运行中 HTTP 的常态而非瞬态：``mark_running`` 之后、转入终态之前，
+    该 job_id 两处都在。构造方式照抄 ``HttpFileRunner._run_under_gate`` 的真实
+    顺序（DB 转移 → register_http_job → begin_task），两侧都由生产函数产生。
+    若被数成两次，5 个这样的 Job 会让总量变成 10，第 6 个 commit 就会被误拒。
+    """
+    async with running_server_with_ws(tmp_path) as (server, base_url, _ws_url, state):
+        handles = await _submit_queued_jobs(tmp_path, base_url, 5, "running")
+        for handle in handles:
+            assert await server._worker.run(server._store.mark_running, handle.job_id)
+            register_http_job(state, handle.job_id)
+            begin_task(state, make_task_key("http", handle.job_id))
+
+        db_ids = await server._worker.run(server._store.active_job_ids)
+        assert len(db_ids) == 5, db_ids
+
+        # 第 6 个 HTTP 仍必须被受理：共享总量是 5，不是 10
+        handle = await submit_file_http(
+            _source(tmp_path, "sixth.wav"), base_url,
+            resume_path=tmp_path / "sixth.json", chunk_bytes=1024,
+        )
+        assert handle.job_id
+        assert await count_active_tasks(state) == 6
+
+
+@pytest.mark.asyncio
+async def test_five_ws_plus_queued_http_refuses_http(tmp_path):
+    """5 WS + 1 排队 HTTP = 共享总量 6，已达 HTTP 名额上限，第 2 个 HTTP 必须被拒。"""
+    async with running_server_with_ws(tmp_path) as (server, base_url, ws_url, state):
+        await _submit_queued_jobs(tmp_path, base_url, 1, "queued")
+        accepted = []
+        for index in range(5):
+            connection, rejection = await _ws_try_start(ws_url, f"ws-{index}")
+            assert rejection is None, f"第 {index + 1} 个 WS 必须被受理：{rejection}"
+            accepted.append(connection)
+        await _expect_error(
+            submit_file_http(
+                _source(tmp_path, "second.wav"), base_url,
+                resume_path=tmp_path / "second.json", chunk_bytes=1024,
+            ),
+            "too_many_jobs",
+        )
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 1
+        assert await count_active_tasks(state) == 6
+        for connection in accepted:
+            await connection.close()
