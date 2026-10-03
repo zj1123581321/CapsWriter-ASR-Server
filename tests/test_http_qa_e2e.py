@@ -139,7 +139,6 @@ async def test_real_ws_and_http_share_one_worker_without_key_pollution(tmp_path)
 
             # ---- 2. WS 慢速推流期间提交 HTTP，两者同时在跑 ---------------------
             live = await websockets.connect(ws_url, max_size=None, ping_interval=None)
-            stop_stream = asyncio.Event()
             messages: list[dict] = []
 
             async def reader():
@@ -171,15 +170,20 @@ async def test_real_ws_and_http_share_one_worker_without_key_pollution(tmp_path)
             handle_b = await submit(harness, source, recovery_b, seg_duration=5.0, seg_overlap=1.0)
             job_b = handle_b.job_id
 
-            # 抓「两类 key 同时存在于 state.tasks」的窗口：HTTP Job 存活期间轮询
+            # 抓「两类 key 同时存在于 state.tasks」的窗口：HTTP Job 先在 SQLite 排队，
+            # 进入内存 state.tasks 之后才算在场；轮询到两类 key 同时在场或该 Job 已离场
             both_seen = False
-            for _ in range(4000):
+            http_seen = False
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 30
+            while loop.time() < deadline:
                 keys = set(harness.state.tasks)
                 if ("http", job_b, job_b) in keys:
+                    http_seen = True
                     if any(key[0] == "ws" for key in keys):
                         both_seen = True
                         break
-                elif both_seen:
+                elif http_seen:
                     break
                 await asyncio.sleep(0.005)
             assert both_seen, (
@@ -213,7 +217,7 @@ async def test_real_ws_and_http_share_one_worker_without_key_pollution(tmp_path)
             assert {item["task_id"] for item in messages} == {"ws-live"}
             finals = [item for item in messages if item.get("is_final")]
             assert len(finals) == 1, messages
-            assert any(item.get("type") == "error" for item in messages) is False, messages
+            assert not any(item.get("type") == "error" for item in messages), messages
             result_rows = harness.read_db("SELECT job_id, payload FROM results")
             assert {row["job_id"] for row in result_rows} == {handle_a.job_id, job_b}
             for row in result_rows:
@@ -271,8 +275,6 @@ async def test_real_ws_and_http_share_one_worker_without_key_pollution(tmp_path)
         finally:
             ws_server.close()
             await asyncio.wait_for(ws_server.wait_closed(), timeout=5)
-
-
 
 
 # ---------------------------------------------------------------- 组 1：真实线缆字节
@@ -566,6 +568,7 @@ async def test_lost_commit_response_recovers_with_exactly_one_recognition(
 
 def make_pcm_container(tmp_path: Path, name: str, *, seconds: float, rate: int, channels: int):
     """用真实 ffmpeg 从指定采样率/声道数的原始 PCM 造容器（不是 16 kHz 的同义改写）。"""
+    assert FFMPEG, "本机 PATH 中没有 ffmpeg，HTTP 解码矩阵无法验证（本文件不做 skip 冒充通过）"
     count = round(seconds * rate)
     t = np.arange(count, dtype=np.float64) / rate
     wave = 0.2 * np.sin(2 * np.pi * 220 * t) * np.sin(2 * np.pi * 0.7 * t)
