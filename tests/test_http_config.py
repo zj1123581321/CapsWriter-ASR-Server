@@ -185,10 +185,12 @@ def test_subprocess_consumes_constructed_env_and_argv(tmp_path, monkeypatch):
     assert payload["executable"] == sys.executable
     assert payload["cwd"] == str(tmp_path)
     assert payload["home"] == str(tmp_path)
-    # 依赖可见性：仓库与真实解释器的依赖目录都真的被子进程 import 到了
+    # 依赖可见性：仓库真的被子进程 import 到；websockets 必须解析到与父进程
+    # 同一个文件（hosted runner 把依赖装在 stdlib 树内的 site-packages，
+    # 不能断言它落在被排除标准库之后的 _dependency_paths 里）
     assert payload["pythonpath"].split(os.pathsep) == [str(REPO_ROOT), *_dependency_paths()]
     assert Path(payload["config_server"]).is_relative_to(REPO_ROOT)
-    dependency_roots = [Path(p).resolve() for p in _dependency_paths()]
-    assert any(Path(payload["websockets"]).resolve().is_relative_to(root) for root in dependency_roots)
+    import websockets
+    assert Path(payload["websockets"]).resolve() == Path(websockets.__file__).resolve()
     # 裸环境：父进程的 PI/DELEGATE/CW 变量一个都没漏进来
     assert payload["env_keys"] == ["HOME", "LANG", "PATH", "PYTHONPATH"]
