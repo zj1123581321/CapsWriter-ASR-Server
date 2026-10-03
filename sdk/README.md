@@ -47,7 +47,7 @@ asyncio.run(main())
 
 `transcribe_file` 和同步入口还接受 `encoding`（`flac`、`ogg_opus`、`f32le`、`s16le`）、`language`、`context`、`seg_duration`、`seg_overlap`、`deadline_total`、`idle_timeout`、`model` 与 `on_progress(result_dict)`。异步接口会并发上传和接收结果；失败时抛出 `AsrError`。识别结果的字段见[服务协议](../docs/reference/protocol.md)。
 
-`deadline_total` 不传时是自动预算，分两段计时：本地准备阶段（`/health` 检查、转码、样本计数）受入口的 120 秒上限约束，转码耗时不算进转录预算；本地阶段结束后，远端转录的预算 `max(120 秒, 音频时长 + 60 秒)` 从那一刻起算。显式传入 `deadline_total` 则是整个调用的墙钟上限（含本地准备阶段），从进入函数起算，超时按同一条预算裁决。两种情况的超时消息会写明卡在「本地准备」还是「远端转录」阶段。
+`deadline_total` 不传时是自动预算，分两段计时：本地准备阶段（`/health` 检查、转码、样本计数）受入口的 120 秒上限约束，转码耗时不算进转录预算；本地阶段结束后，远端转录的预算 `max(120 秒, 音频时长 + 60 秒)` 从那一刻起算。显式传入 `deadline_total` 则是整个调用的墙钟上限（含本地准备阶段），从进入函数起算，超时按同一条预算裁决。超时消息按路径如实点明被超过的预算（默认路径写「自动预算」，显式传参写 `deadline_total`），并写明卡在「本地准备」还是「远端转录」阶段。
 
 SDK 也提供命令行字幕导出，默认写入 SRT：
 

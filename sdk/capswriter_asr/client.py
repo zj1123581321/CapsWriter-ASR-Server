@@ -464,7 +464,10 @@ async def transcribe_file(
             deadline_changed.set()
 
     def timeout_error() -> AsrError:
-        return AsrError("timeout", f"转录超过 deadline_total：{stage['name']}阶段超时")
+        # 默认路径下调用方从未传过 deadline_total，被超过的是自动预算；写错名字会让人
+        # 误以为自己把预算设太紧了。
+        budget = "自动预算" if deadline_total is None else "deadline_total"
+        return AsrError("timeout", f"转录超过{budget}：{stage['name']}阶段超时")
 
     async def operation() -> Transcript:
         return await _operation(

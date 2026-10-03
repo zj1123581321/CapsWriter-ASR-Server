@@ -174,7 +174,33 @@ async def test_explicit_deadline_total_still_covers_local_stage(tmp_path, monkey
 
     assert caught.value.code == "timeout"
     # 显式传参下 set_deadline 不重新锚定：本地阶段吃掉 100 秒后预算已耗尽。
-    assert "deadline_total" in caught.value.message
+    assert "转录超过deadline_total" in caught.value.message
+
+
+@pytest.mark.asyncio
+async def test_default_path_timeout_names_auto_budget(tmp_path, monkeypatch):
+    """默认路径下用户没传过 deadline_total，消息不得把它写成被超过的预算。"""
+    audio = _write_stub_audio(tmp_path)
+    clock = _install_fake_clock(monkeypatch)
+
+    async def fast_transcode(*_args):
+        return b"\0" * 32000
+
+    monkeypatch.setattr(sdk_client, "_transcode", fast_transcode)
+
+    async def handler(ws):
+        await ws.recv()
+        clock.advance(200.0)  # 远超重锚定后的 max(120 秒, 1 + 60)
+        await ws.send(_final_payload())
+
+    async with fake_v2_server(handler) as url:
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(audio, url, encoding="s16le", idle_timeout=5)
+
+    assert caught.value.code == "timeout"
+    assert "自动预算" in caught.value.message
+    assert "远端转录" in caught.value.message
+    assert "deadline_total" not in caught.value.message
 
 
 @pytest.mark.asyncio
